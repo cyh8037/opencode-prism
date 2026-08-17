@@ -812,7 +812,6 @@ export class BackgroundManager {
   async shutdown(): Promise<void> {
     if (this.shutdownTriggered) return
     this.shutdownTriggered = true
-    this.logger("[prism] shutting down BackgroundManager")
     this.stopPolling()
 
     const aborts = Array.from(this.tasks.values())
@@ -834,6 +833,5 @@ export class BackgroundManager {
     this.pendingByParent.clear()
     this.notificationQueueByParent.clear()
     this.terminalListeners.clear()
-    this.logger("[prism] shutdown complete")
   }
 }

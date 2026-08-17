@@ -81,12 +81,5 @@ export function loadConfig(startDir: string, env: Record<string, string | undefi
     return prismConfigSchema.parse({})
   }
 
-  if (Object.keys(merged).length > 0) {
-    log("config loaded", {
-      user: userPath,
-      project: projectPath,
-    })
-  }
-
   return result.data
 }

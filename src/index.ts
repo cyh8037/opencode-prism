@@ -14,7 +14,7 @@ import { createEventHook } from "./hooks/event"
 import { createCommandExecuteBeforeHook } from "./hooks/command-execute-before"
 import { createBgTools } from "./tools/bg"
 import { createVisionLookTool } from "./tools/vision-look"
-import { BG_COMMAND, SPLIT_COMMAND } from "./commands/templates"
+import { BG_COMMAND, SPLIT_COMMAND, type PrismCommandDefinition } from "./commands/templates"
 import { log } from "./shared/log"
 
 function modelFromRecord(value: unknown): ResolvedModel | undefined {
@@ -140,22 +140,22 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
   return {
     config: async (configInput: unknown) => {
       // Capture opencode's default model for the session-model fallback tier.
-      const rawConfig = (configInput as { config?: { model?: unknown } } | undefined)?.config
-      opencodeDefaultModel = modelFromRecord(rawConfig?.model) ?? opencodeDefaultModel
+      // The hook receives the resolved config itself (not { config }), and the
+      // top-level model is a "provider/model" string.
+      const rawModel = (configInput as { model?: unknown } | undefined)?.model
+      if (typeof rawModel === "string" && rawModel.trim()) {
+        opencodeDefaultModel = parseModelRef(rawModel) ?? opencodeDefaultModel
+      }
 
-      return {
-        command: {
-          bg: {
-            description: BG_COMMAND.description,
-            template: BG_COMMAND.template,
-            argumentHint: BG_COMMAND.argumentHint,
-          },
-          split: {
-            description: SPLIT_COMMAND.description,
-            template: SPLIT_COMMAND.template,
-            argumentHint: SPLIT_COMMAND.argumentHint,
-          },
-        },
+      // Register slash commands by mutating the config in place. The 1.18
+      // plugin API discards the hook's return value (the signature is
+      // `(config) => Promise<void>`), so in-place mutation is the only way
+      // commands reach the config that the TUI slash menu reads.
+      const cfg = configInput as { command?: Record<string, PrismCommandDefinition> }
+      cfg.command = {
+        ...(cfg.command ?? {}),
+        bg: BG_COMMAND,
+        split: SPLIT_COMMAND,
       }
     },
     tool: {
