@@ -41,6 +41,17 @@ export function runSplit(manager: BackgroundManager, options: SplitRunOptions): 
     return undefined
   }
 
+  const onTaskTerminal = (task: BgTask): void => {
+    const planID = planForTask(task)
+    if (planID) terminalPlanIDs.add(planID)
+    launchReady()
+    checkSettled()
+  }
+  manager.onTaskTerminal(onTaskTerminal)
+  // Remove the listener once the run settles: runs happen on the shared
+  // manager and the listeners would otherwise accumulate across /split calls.
+  const removeListener = (): void => manager.offTaskTerminal(onTaskTerminal)
+
   const checkSettled = (): void => {
     // Settled only when EVERY plan is terminal: launched-and-finished, or
     // marked terminal by a launch failure. Not-yet-launched plans keep the
@@ -50,7 +61,10 @@ export function runSplit(manager: BackgroundManager, options: SplitRunOptions): 
       const task = tasksByPlanID.get(plan.id)
       return task !== undefined && TERMINAL.has(task.status)
     })
-    if (allTerminal) resolveDone()
+    if (allTerminal) {
+      removeListener()
+      resolveDone()
+    }
   }
 
   const launchReady = (): void => {
@@ -89,15 +103,11 @@ export function runSplit(manager: BackgroundManager, options: SplitRunOptions): 
     }
   }
 
-  manager.onTaskTerminal((task) => {
-    const planID = planForTask(task)
-    if (planID) terminalPlanIDs.add(planID)
-    launchReady()
-    checkSettled()
-  })
-
   launchReady()
-  if (plans.length === 0) resolveDone()
+  if (plans.length === 0) {
+    removeListener()
+    resolveDone()
+  }
 
   return {
     tasksByPlanID,

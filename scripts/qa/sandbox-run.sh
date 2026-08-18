@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Isolated XDG sandbox: load prism from the local path and run one opencode
-# session, printing prism's init logs. Never touches the real opencode state.
+# session, printing prism's logs (written to the sandbox log file, never the
+# console). Never touches the real opencode state.
 set -euo pipefail
 
 PLUGIN_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -19,5 +20,6 @@ cat > "$XDG_CONFIG_HOME/opencode/opencode.json" <<EOF
 EOF
 
 echo "sandbox: $SANDBOX"
-opencode run "say hi" --format json 2>&1 | grep --line-buffered -E "\[prism\]" || true
+opencode run "say hi" --format json >/dev/null 2>&1
+grep -E "\[prism\]" "$XDG_DATA_HOME/opencode/log/prism.log" || true
 echo "sandbox kept at: $SANDBOX"

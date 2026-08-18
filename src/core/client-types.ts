@@ -7,7 +7,7 @@ export interface PrismSession {
       id?: string
       directory?: string
       status?: string
-      model?: { id?: string; modelID?: string; providerID?: string; variant?: string }
+      model?: { id?: string; modelID?: string; providerID?: string }
     }
     error?: unknown
   }>

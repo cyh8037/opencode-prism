@@ -46,14 +46,21 @@ export class SplitService {
       }
     }
 
-    const plans = await planSplit({
-      client: this.deps.client,
-      directory: this.deps.directory,
-      parentSessionID: request.sessionID,
-      task: request.task,
-      model: plannerModel,
-      maxSubtasks: request.maxSubtasks,
-    })
+    // planSplit never throws in practice, but a network rejection must not
+    // escape the command hook — degrade to the same planner-failed outcome.
+    let plans: Awaited<ReturnType<typeof planSplit>> = null
+    try {
+      plans = await planSplit({
+        client: this.deps.client,
+        directory: this.deps.directory,
+        parentSessionID: request.sessionID,
+        task: request.task,
+        model: plannerModel,
+        maxSubtasks: request.maxSubtasks,
+      })
+    } catch (error) {
+      this.logger("[prism] split: planner threw", { error })
+    }
 
     if (!plans) {
       return {

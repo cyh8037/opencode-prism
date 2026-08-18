@@ -1,20 +1,19 @@
 import { z } from "zod"
-import { VARIANT_VALUES } from "./constants"
 
-// Explicit vision model reference: "provider/model" with an optional variant
-// suffix. Empty string disables the vision feature.
+// Explicit vision model reference: "provider/model". Empty string disables
+// the vision feature: automatic triggers skip interpretation and vision_look
+// reports the model as unavailable.
 export const visionModelSchema = z
   .string()
   .refine((value) => {
     if (value.trim().length === 0) return true // empty = disabled
-    const tokens = value.trim().split(/\s+/)
-    const maybeVariant = tokens[tokens.length - 1]
-    if (tokens.length >= 2 && !VARIANT_VALUES.includes(maybeVariant as (typeof VARIANT_VALUES)[number])) {
-      return false
-    }
-    const core = tokens[0] ?? ""
-    return core.includes("/") && !core.startsWith("/") && !core.endsWith("/")
-  }, 'vision model must be "provider/model" with an optional variant suffix (off|low|medium|high|xhigh|max), or empty to disable')
+    const core = value.trim()
+    // whitespace is rejected: a variant suffix like "provider/model max" is
+    // not supported
+    return (
+      !/\s/.test(core) && core.includes("/") && !core.startsWith("/") && !core.endsWith("/")
+    )
+  }, 'vision model must be "provider/model", or empty to disable')
 
 export const prismConfigSchema = z.object({
   vision: z
@@ -25,7 +24,7 @@ export const prismConfigSchema = z.object({
       chatImages: z.boolean(),
     })
     .default({
-      model: "anthropic/claude-fable-5 xhigh",
+      model: "",
       mode: "sync",
       chatImages: true,
     }),

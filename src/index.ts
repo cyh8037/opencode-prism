@@ -1,21 +1,24 @@
 import type { PluginInput } from "@opencode-ai/plugin"
 import { loadConfig } from "./config/load"
-import { StaticModelCapabilities, parseModelRef } from "./models"
+import { parseModelRef } from "./models"
 import type { ResolvedModel } from "./models"
 import { PromptGate } from "./core/prompt-gate"
 import type { PrismClient } from "./core/client-types"
 import { BackgroundManager, type ResolveModelFn } from "./core/background/manager"
-import { VisionPipeline } from "./core/vision/pipeline"
+import { VisionPipeline, type GetVisionModelFn } from "./core/vision/pipeline"
+import { CurrentModelTracker } from "./core/vision/model-tracker"
 import { SplitService } from "./core/split/service"
 import { TmuxManager } from "./tmux/manager"
 import { createToolExecuteAfterHook } from "./hooks/tool-execute-after"
 import { createChatMessageHook } from "./hooks/chat-message"
+import { createChatParamsHook } from "./hooks/chat-params"
 import { createEventHook } from "./hooks/event"
 import { createCommandExecuteBeforeHook } from "./hooks/command-execute-before"
 import { createBgTools } from "./tools/bg"
 import { createVisionLookTool } from "./tools/vision-look"
 import { BG_COMMAND, SPLIT_COMMAND, type PrismCommandDefinition } from "./commands/templates"
 import { log } from "./shared/log"
+import { guardHook } from "./shared/hook-guard"
 
 function modelFromRecord(value: unknown): ResolvedModel | undefined {
   if (typeof value !== "object" || value === null) return undefined
@@ -71,25 +74,36 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
   const client = input.client as unknown as PrismClient
   const serverUrl = (input as unknown as { serverUrl?: string }).serverUrl
 
-  const config = loadConfig(directory)
-  const capabilities = new StaticModelCapabilities()
+  const { config, warnings } = loadConfig(directory)
+  if (warnings.length > 0) {
+    const toast = client.tui.showToast?.({
+      body: {
+        title: "Prism config",
+        message: `${warnings.length} 处配置问题，已回退到默认值（详见插件日志）`,
+        variant: "warning",
+        duration: 6000,
+      },
+    })
+    if (toast) void toast.catch(() => {})
+  }
 
-  // Vision model: single explicit "provider/model" reference from config.
-  // Empty string disables the vision feature entirely.
+  // Vision model: explicit "provider/model" reference from config; empty
+  // string inherits the session's current model when it is image-capable
+  // (tracker fed by chat.params); an invalid reference stays permanently off.
+  // No hardcoded default — an unconfigured plugin must never silently depend
+  // on a specific vendor's model.
   const visionRef = config.vision.model.trim()
   let visionModel: ResolvedModel | undefined
+  let visionRefInvalid = false
   if (visionRef === "") {
-    log("[prism] vision feature disabled (empty vision.model)")
+    log("[prism] vision: vision.model empty, inheriting the session model when image-capable")
   } else {
     const parsed = parseModelRef(visionRef)
     if (!parsed) {
+      visionRefInvalid = true
       log(`[prism] warning: invalid vision.model reference, vision feature disabled: ${visionRef}`)
     } else {
       visionModel = parsed
-      const capable = capabilities.isVisionCapable(parsed.modelID)
-      if (capable === false) {
-        log(`[prism] warning: configured vision model is marked non-vision in the capability snapshot: ${parsed.modelID}`)
-      }
     }
   }
 
@@ -119,13 +133,51 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
     },
   })
 
+  // Per-session model tracker: chat.params fires before every LLM call with
+  // the resolved model and its capabilities — the same signal opencode's
+  // runtime uses to accept image parts.
+  const modelTracker = new CurrentModelTracker()
+
+  // Explicit model wins; otherwise inherit the session's current model when
+  // it accepts images; an invalid vision.model stays permanently off.
+  const getVisionModel: GetVisionModelFn = (sessionID) => {
+    if (visionModel) return visionModel
+    if (visionRefInvalid) return undefined
+    const snapshot = modelTracker.get(sessionID)
+    return snapshot?.visionCapable ? snapshot.model : undefined
+  }
+
+  const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
+  // Same decision, but waits for the session's capability snapshot: chat.
+  // message (trigger B) fires BEFORE the session's first chat.params, so a
+  // fresh session has no known capability when an image arrives (e.g. a
+  // message recalled from another session's history). The LLM call for the
+  // just-submitted message is imminent, so the wait is short and bounded.
+  const waitForVisionModel = async (
+    sessionID: string,
+    timeoutMs: number,
+  ): Promise<ResolvedModel | undefined> => {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const snapshot = modelTracker.get(sessionID)
+      if (snapshot?.capabilityKnown) {
+        return snapshot.visionCapable ? snapshot.model : undefined
+      }
+      await sleep(50)
+    }
+    const snapshot = modelTracker.get(sessionID)
+    return snapshot?.visionCapable ? snapshot.model : undefined
+  }
+
   const vision = new VisionPipeline({
     client,
     directory,
     config,
     gate,
     background: manager,
-    resolveVisionModel: () => visionModel,
+    getVisionModel,
+    waitForVisionModel,
   })
 
   const splitService = new SplitService({
@@ -162,14 +214,25 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
       ...createBgTools(manager),
       vision_look: createVisionLookTool(vision),
     },
-    "tool.execute.after": createToolExecuteAfterHook({ config, pipeline: vision }),
-    "chat.message": createChatMessageHook({ config, pipeline: vision }),
-    "command.execute.before": createCommandExecuteBeforeHook({ manager, splitService, client }),
-    event: createEventHook(manager),
+    // Every hook is guarded: a throwing plugin hook is published by opencode
+    // as Session.Event.Error and rendered as an error in the TUI, so Prism
+    // swallows its own failures into the file log instead.
+    "tool.execute.after": guardHook("tool.execute.after", createToolExecuteAfterHook({ config, pipeline: vision })),
+    "chat.message": guardHook("chat.message", createChatMessageHook({ config, pipeline: vision, tracker: modelTracker })),
+    "chat.params": guardHook("chat.params", createChatParamsHook(modelTracker)),
+    "command.execute.before": guardHook(
+      "command.execute.before",
+      createCommandExecuteBeforeHook({ manager, splitService, client }),
+    ),
+    event: guardHook("event", createEventHook(manager, modelTracker)),
     dispose: async () => {
-      await manager.shutdown()
-      await tmux.sweep()
-      gate.clearAll()
+      try {
+        await manager.shutdown()
+        await tmux.sweep()
+        gate.clearAll()
+      } catch (error) {
+        log("[prism] dispose failed (swallowed)", { error })
+      }
     },
   }
 }

@@ -1,6 +1,8 @@
 import { MAX_SUBTASKS, PLANNER_SYNC_TIMEOUT_MS } from "../../config/constants"
 import type { ResolvedModel } from "../../models"
+import { errorInfoFromResult } from "../../shared/api-result"
 import { log } from "../../shared/log"
+import { lastAssistantText } from "../assistant-text"
 import type { PrismClient } from "../client-types"
 import { subTaskPlanArraySchema, type SubTaskPlan } from "./plan-schema"
 
@@ -18,27 +20,6 @@ export const PLANNER_PROMPT = (task: string, maxSubtasks: number): string => [
   "",
   `任务: ${task}`,
 ].join("\n")
-
-interface SessionMessage {
-  info?: { role?: string }
-  parts?: Array<{ type?: string; text?: string; state?: { status?: string } }>
-}
-
-function lastAssistantText(messages: unknown): string | null {
-  if (!Array.isArray(messages)) return null
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i] as SessionMessage
-    if (message.info?.role !== "assistant") continue
-    const parts = message.parts ?? []
-    for (let j = parts.length - 1; j >= 0; j--) {
-      const part = parts[j]
-      if (part?.type === "text" && part.state?.status === "completed" && part.text?.trim()) {
-        return part.text
-      }
-    }
-  }
-  return null
-}
 
 // Extract the first JSON array from a model reply that may wrap it in fences
 // or stray prose.
@@ -71,14 +52,22 @@ async function runPlannerOnce(args: {
 }): Promise<SubTaskPlan[] | null> {
   const { client, directory, parentSessionID, task, model, timeoutMs, maxSubtasks } = args
 
-  const createResult = await client.session.create({
-    body: {
-      parentID: parentSessionID,
-      title: "prism split planner",
-      model: { id: model.modelID, providerID: model.providerID, ...(model.variant ? { variant: model.variant } : {}) },
-    },
-    query: { directory },
-  })
+  // The client resolves 4xx/5xx with { error }; network failures reject, so
+  // both shapes are handled here (a rejection must never escape the hook).
+  let createResult: { error?: unknown; data?: { id?: string } }
+  try {
+    createResult = await client.session.create({
+      body: {
+        parentID: parentSessionID,
+        title: "prism split planner",
+        model: { id: model.modelID, providerID: model.providerID },
+      },
+      query: { directory },
+    })
+  } catch (error) {
+    log("[prism] split: failed to create planner session", { error })
+    return null
+  }
   if (createResult.error || !createResult.data?.id) {
     log("[prism] split: failed to create planner session", { error: createResult.error })
     return null
@@ -86,14 +75,16 @@ async function runPlannerOnce(args: {
   const sessionID = createResult.data.id
 
   try {
+    // The client resolves 4xx/5xx with { error } instead of rejecting, so
+    // both the resolved error field and rejections are checked.
     const promptError = await client.session
       .promptAsync({
         path: { id: sessionID },
         body: { parts: [{ type: "text", text: PLANNER_PROMPT(task, maxSubtasks), synthetic: true }] },
         query: { directory },
       })
-      .then(() => null)
-      .catch((error) => error)
+      .then((result) => errorInfoFromResult(result)?.message ?? null)
+      .catch((error) => (error instanceof Error ? error.message : String(error)))
     if (promptError) {
       log("[prism] split: planner prompt failed", { sessionID, error: promptError })
       return null

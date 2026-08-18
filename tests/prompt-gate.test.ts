@@ -20,7 +20,8 @@ function createMockClient(): {
         state.dispatched.push(JSON.stringify(body))
       },
       messages: async () => ({ data: [] }),
-      status: async () => ({ data: { parent: { type: state.busy ? "active" : "idle" } } }),
+      // the status map only contains non-idle sessions: busy → entry, idle → absent
+      status: async () => ({ data: state.busy ? { parent: { type: "busy" } } : {} }),
     },
     tui: {
       showToast: async () => {},
@@ -84,5 +85,35 @@ describe("PromptGate", () => {
     await gate.dispatch({ sessionID: "parent", source: "a", text: "task bg_1 done" })
     await gate.dispatch({ sessionID: "parent", source: "b", text: "task bg_2 done" })
     expect(state.dispatched).toHaveLength(2)
+  })
+
+  test("concurrent dispatches serialize instead of dropping the second", async () => {
+    const { client, state } = createMockClient()
+    const gate = new PromptGate(client, { idlePollMs: 10, idleSettleMs: 500 })
+    state.busy = true
+    const results: string[] = []
+    void gate.dispatch({ sessionID: "parent", source: "a", text: "first" }).then((r) => results.push(r.status))
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    void gate.dispatch({ sessionID: "parent", source: "b", text: "second" }).then((r) => results.push(r.status))
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(state.dispatched).toHaveLength(0) // both waiting for idle
+    state.busy = false
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(results).toEqual(["dispatched", "dispatched"])
+    expect(state.dispatched).toHaveLength(2)
+  })
+
+  test("a queued dispatch is still deduped against the first one", async () => {
+    const { client, state } = createMockClient()
+    const gate = new PromptGate(client, { idlePollMs: 10, idleSettleMs: 500, semanticDedupeMs: 60_000 })
+    state.busy = true
+    const results: string[] = []
+    void gate.dispatch({ sessionID: "parent", source: "a", text: "same" }).then((r) => results.push(r.status))
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    void gate.dispatch({ sessionID: "parent", source: "b", text: "same" }).then((r) => results.push(r.status))
+    state.busy = false
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(results).toEqual(["dispatched", "duplicate"])
+    expect(state.dispatched).toHaveLength(1)
   })
 })

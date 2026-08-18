@@ -5,12 +5,19 @@ import { parseConfig } from "../src/config/load"
 import type { PrismClient } from "../src/core/client-types"
 import type { ResolvedModel } from "../src/models"
 
-// Mock client simulating OpenCode sessions in memory.
-function createMockClient(): {
+// Mock client simulating OpenCode sessions in memory. statusData is a live
+// object: tests mutate it to drive the polling path.
+function createMockClient(
+  statusData: Record<string, { type?: string }> = {},
+  noToast = false,
+): {
   client: PrismClient
   childSessions: Map<string, { parentID: string; prompts: unknown[]; aborted: boolean }>
+  statusData: Record<string, { type?: string }>
+  toasts: Array<{ title: string; message: string; variant: string }>
 } {
   const childSessions = new Map<string, { parentID: string; prompts: unknown[]; aborted: boolean }>()
+  const toasts: Array<{ title: string; message: string; variant: string }> = []
   let childCounter = 0
   const client: PrismClient = {
     session: {
@@ -46,19 +53,31 @@ function createMockClient(): {
           },
         ],
       }),
-      status: async () => ({ data: {} }),
+      status: async () => ({ data: statusData }),
     },
-    tui: {
-      showToast: async () => {},
-    },
+    tui: noToast
+      ? ({} as PrismClient["tui"])
+      : {
+          showToast: async (params: { body: { title: string; message: string; variant: string } }) => {
+            toasts.push(params.body)
+          },
+        },
   }
-  return { client, childSessions }
+  return { client, childSessions, statusData, toasts }
 }
 
 const SESSION_MODEL: ResolvedModel = { providerID: "openai", modelID: "gpt-5.6-sol" }
 
-function createManager(overrides: { concurrency?: number; pollingIntervalMs?: number; model?: ResolvedModel } = {}) {
-  const { client, childSessions } = createMockClient()
+function createManager(
+  overrides: {
+    concurrency?: number
+    pollingIntervalMs?: number
+    model?: ResolvedModel
+    statusData?: Record<string, { type?: string }>
+    noToast?: boolean
+  } = {},
+) {
+  const { client, childSessions, statusData, toasts } = createMockClient(overrides.statusData ?? {}, overrides.noToast ?? false)
   const config = parseConfig({
     background: { concurrency: overrides.concurrency ?? 5 },
   })
@@ -71,8 +90,12 @@ function createManager(overrides: { concurrency?: number; pollingIntervalMs?: nu
     resolveModel: async () => overrides.model ?? SESSION_MODEL,
     pollingIntervalMs: overrides.pollingIntervalMs ?? 60_000,
   })
-  return { manager, gate, client, childSessions }
+  return { manager, gate, client, childSessions, statusData, toasts }
 }
+
+// Drive the polling loop directly (it normally runs on an interval).
+const poll = (manager: BackgroundManager): Promise<void> =>
+  (manager as unknown as { pollRunningTasks(): Promise<void> }).pollRunningTasks()
 
 describe("BackgroundManager", () => {
   test("launch creates a child session with the resolved session model and fires the prompt", async () => {
@@ -93,7 +116,7 @@ describe("BackgroundManager", () => {
     const session = childSessions.get(task.sessionId!)
     expect(session?.parentID).toBe("parent")
     const promptBody = session?.prompts[0] as Record<string, unknown>
-    expect(promptBody?.model).toEqual({ id: "gpt-5.6-sol", providerID: "openai" })
+    expect(promptBody?.model).toEqual({ providerID: "openai", modelID: "gpt-5.6-sol" })
   })
 
   test("session.idle with output completes the task and wakes the parent", async () => {
@@ -111,6 +134,126 @@ describe("BackgroundManager", () => {
 
     expect(task.status).toBe("completed")
     expect(gate.hasRecentDispatch("parent")).toBe(true)
+  })
+
+  // opencode part data carries no role/state fields (role lives on the
+  // message), so the result must be captured from the message history.
+  test("completion captures the final assistant text from the message history", async () => {
+    const { manager, gate, client } = createManager()
+    client.session.messages = async () => ({
+      data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: "完整的图片解读结果" }] }],
+    })
+    const task = await manager.launch({
+      description: "解读图片",
+      prompt: "用 vision_look 读图",
+      parentSessionId: "parent",
+    })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(task.status).toBe("running")
+
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: task.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    expect(task.status).toBe("completed")
+    expect(task.resultText).toBe("完整的图片解读结果")
+    expect(gate.hasRecentDispatch("parent")).toBe(true)
+  })
+
+  test("injects the FULL result into the parent notification for a single completed task", async () => {
+    const { manager, client } = createManager()
+    const fullResult = `图片解读结果: ${"很长的内容".repeat(300)}` // far beyond the 200-char preview
+    client.session.messages = async () => ({
+      data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: fullResult }] }],
+    })
+    const wakes: Array<Record<string, unknown>> = []
+    const originalPromptAsync = client.session.promptAsync.bind(client.session)
+    client.session.promptAsync = async (...args: Parameters<PrismClient["session"]["promptAsync"]>) => {
+      if (args[0].path.id === "parent") wakes.push(args[0].body as Record<string, unknown>)
+      return originalPromptAsync(...args)
+    }
+
+    const task = await manager.launch({ description: "解读图片", prompt: "用 vision_look 读图", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: task.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    expect(task.status).toBe("completed")
+    expect(wakes.length).toBe(1)
+    const text = (wakes[0]?.parts as Array<{ text?: string }> | undefined)?.map((part) => part.text ?? "").join("") ?? ""
+    expect(text).toContain("完整结果:")
+    expect(text).toContain(fullResult) // not the 200-char preview
+  })
+
+  test("caps an oversized single-task result and points to bg_output", async () => {
+    const { manager, client } = createManager()
+    const oversized = "x".repeat(25_000) // above MAX_NOTIFICATION_RESULT_CHARS
+    client.session.messages = async () => ({
+      data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: oversized }] }],
+    })
+    const wakes: Array<Record<string, unknown>> = []
+    const originalPromptAsync = client.session.promptAsync.bind(client.session)
+    client.session.promptAsync = async (...args: Parameters<PrismClient["session"]["promptAsync"]>) => {
+      if (args[0].path.id === "parent") wakes.push(args[0].body as Record<string, unknown>)
+      return originalPromptAsync(...args)
+    }
+
+    const task = await manager.launch({ description: "大结果", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: task.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    const text = (wakes[0]?.parts as Array<{ text?: string }> | undefined)?.map((part) => part.text ?? "").join("") ?? ""
+    expect(text).toContain("（结果过长已截断")
+    expect(text).toContain('bg_output("')
+    expect(text).not.toContain(oversized)
+  })
+
+  test("multi-task batches keep the preview table instead of full results", async () => {
+    const { manager, client } = createManager()
+    const wakes: Array<Record<string, unknown>> = []
+    const originalPromptAsync = client.session.promptAsync.bind(client.session)
+    client.session.promptAsync = async (...args: Parameters<PrismClient["session"]["promptAsync"]>) => {
+      if (args[0].path.id === "parent") wakes.push(args[0].body as Record<string, unknown>)
+      return originalPromptAsync(...args)
+    }
+
+    const taskA = await manager.launch({ description: "A", prompt: "a", parentSessionId: "parent" })
+    const taskB = await manager.launch({ description: "B", prompt: "b", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: taskA.sessionId } })
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: taskB.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    expect(taskA.status).toBe("completed")
+    expect(taskB.status).toBe("completed")
+    const text = (wakes[0]?.parts as Array<{ text?: string }> | undefined)?.map((part) => part.text ?? "").join("") ?? ""
+    expect(text).not.toContain("完整结果:")
+    expect(text).toContain("bg_output(task_id)")
+  })
+
+  test("part.updated captures assistant text and ignores synthetic prompt parts", async () => {
+    const { manager } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(task.status).toBe("running")
+
+    manager.handleEvent({
+      type: "message.part.updated",
+      properties: {
+        sessionID: task.sessionId,
+        part: { id: "prompt-part", type: "text", text: "work", synthetic: true },
+      },
+    })
+    expect(task.resultText).toBeUndefined()
+
+    manager.handleEvent({
+      type: "message.part.updated",
+      properties: {
+        sessionID: task.sessionId,
+        part: { id: "assistant-part", type: "text", text: "完整的解读结果" },
+      },
+    })
+    expect(task.resultText).toBe("完整的解读结果")
   })
 
   test("two sibling tasks wake the parent once", async () => {
@@ -213,5 +356,121 @@ describe("BackgroundManager", () => {
     await expect(
       manager.launch({ description: "x", prompt: "y", parentSessionId: "parent" }),
     ).rejects.toThrow("无法确定主会话")
+  })
+
+  test("polling skips streaming sessions instead of completing them", async () => {
+    const { manager, statusData } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    statusData[task.sessionId!] = { type: "streaming" }
+    await poll(manager)
+    expect(task.status).toBe("running")
+  })
+
+  test("polling marks error-status sessions as error, not completed", async () => {
+    const { manager, statusData } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    statusData[task.sessionId!] = { type: "error" }
+    await poll(manager)
+    expect(task.status).toBe("error")
+    expect(task.error).toBeDefined()
+  })
+
+  test("polling cancels sessions deleted server-side", async () => {
+    const { manager, statusData } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    statusData[task.sessionId!] = { type: "deleted" }
+    await poll(manager)
+    expect(task.status).toBe("cancelled")
+  })
+
+  test("polling completes idle sessions that produced output", async () => {
+    const { manager, statusData } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    statusData[task.sessionId!] = { type: "idle" }
+    await poll(manager)
+    expect(task.status).toBe("completed")
+  })
+
+  test("counts each tool part once across repeated part.updated events", async () => {
+    const { manager } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const sessionID = task.sessionId!
+    const emit = (id: string, tool: string) =>
+      manager.handleEvent({ type: "message.part.updated", properties: { sessionID, part: { id, type: "tool", tool } } })
+    emit("p1", "read")
+    emit("p1", "read") // same part, repeated update
+    emit("p2", "write")
+    expect(task.progress?.toolCalls).toBe(2)
+    expect(task.progress?.lastTool).toBe("write")
+  })
+
+  test("falls back to counting every update when the part has no id", async () => {
+    const { manager } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const sessionID = task.sessionId!
+    manager.handleEvent({
+      type: "message.part.updated",
+      properties: { sessionID, part: { type: "tool", tool: "read" } },
+    })
+    manager.handleEvent({
+      type: "message.part.updated",
+      properties: { sessionID, part: { type: "tool", tool: "read" } },
+    })
+    expect(task.progress?.toolCalls).toBe(2)
+  })
+
+  test("task lifecycle works without a toast API (no crash, no error status)", async () => {
+    const { manager } = createManager({ noToast: true })
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(task.status).toBe("running")
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: task.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(task.status).toBe("completed")
+  })
+
+  test("a batch shows one start toast and one terminal toast", async () => {
+    const { manager, toasts } = createManager()
+    const taskA = await manager.launch({ description: "A", prompt: "a", parentSessionId: "parent" })
+    const taskB = await manager.launch({ description: "B", prompt: "b", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: taskA.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    // A alone finishing must not toast (B still running)
+    expect(toasts.filter((t) => t.message.includes("COMPLETED"))).toHaveLength(0)
+
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: taskB.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    const messages = toasts.map((t) => t.message)
+    expect(messages.filter((m) => m.includes("Started"))).toHaveLength(1)
+    expect(messages.filter((m) => m.includes("COMPLETED"))).toHaveLength(1)
+  })
+
+  test("cancel toast uses the warning variant", async () => {
+    const { manager, toasts } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await manager.cancelTask(task.id)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const cancelToast = toasts.find((t) => t.message.includes("CANCELLED"))
+    expect(cancelToast?.variant).toBe("warning")
+  })
+
+  test("cancel clears the session link so late session.deleted events are no-ops", async () => {
+    const { manager } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const sessionID = task.sessionId!
+    await manager.cancelTask(task.id)
+    expect(task.sessionId).toBeUndefined()
+    manager.handleEvent({ type: "session.deleted", properties: { sessionID } })
+    expect(task.status).toBe("cancelled")
   })
 })

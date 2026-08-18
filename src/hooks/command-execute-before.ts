@@ -1,3 +1,4 @@
+import { MAX_SUBTASKS } from "../config/constants"
 import type { BackgroundManager } from "../core/background/manager"
 import type { SplitService } from "../core/split/service"
 import type { PrismClient } from "../core/client-types"
@@ -38,7 +39,7 @@ function formatTaskOutput(manager: BackgroundManager, taskID: string, fullSessio
   return lines.join("\n")
 }
 
-const FLAG_PATTERN = /--(dry-run|sequential)\b|--max\s+(\d+)/g
+const FLAG_PATTERN = /--(dry-run|sequential)\b|--max(?:\s+|=)(\d+)/g
 
 function parseSplitArgs(argumentsText: string): {
   task: string
@@ -53,7 +54,12 @@ function parseSplitArgs(argumentsText: string): {
   for (const match of argumentsText.matchAll(FLAG_PATTERN)) {
     if (match[1] === "dry-run") dryRun = true
     if (match[1] === "sequential") sequential = true
-    if (match[2]) max = Number(match[2])
+    if (match[2]) {
+      // Clamp to the planner bounds; garbage values are ignored. The planner
+      // prompt promises "2 到 N" subtasks, so 0/1 would contradict it.
+      const parsedMax = Number(match[2])
+      if (Number.isInteger(parsedMax)) max = Math.min(Math.max(parsedMax, 2), MAX_SUBTASKS)
+    }
     task = task.replace(match[0], "")
   }
   return { task: task.trim(), dryRun, sequential, max }

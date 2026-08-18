@@ -4,6 +4,8 @@ export type BgTaskStatus = "pending" | "running" | "completed" | "error" | "canc
 
 export interface TaskProgress {
   toolCalls: number
+  /** Distinct tool part ids already counted (part.updated fires repeatedly). */
+  toolPartIds?: Set<string>
   lastTool?: string
   lastUpdate: Date
 }
@@ -12,6 +14,8 @@ export interface BgTask {
   id: string
   parentSessionId: string
   sessionId?: string
+  /** Working directory of the child session (may differ from the plugin's). */
+  directory?: string
   description: string
   prompt: string
   /** Prompt parts override (e.g. vision tasks sending images). */
@@ -46,6 +50,8 @@ export interface LaunchInput {
   parentSessionId: string
   agent?: string
   suppressTmux?: boolean
+  /** Pin the child session's model (e.g. the gate-checked vision model). Default: resolve the parent session's current model. */
+  model?: ResolvedModel
 }
 
 export interface QueueItem {

@@ -7,7 +7,7 @@ export function createBgTools(manager: BackgroundManager): Record<string, ToolDe
   return {
     bg_spawn: tool({
       description:
-        "启动一个后台子任务（独立会话并行执行）。适合探索、研究、并行实现等可以异步进行的工作。任务结束后父会话会收到汇总通知。",
+        "启动一个后台子任务（独立会话并行执行）。适合探索、研究、并行实现等可以异步进行的工作。任务结束后父会话会收到汇总通知。涉及图片时：子会话收不到附件，请在 prompt 中包含图片的本地路径/URL，并让子任务使用 vision_look 工具读图。",
       args: {
         description: tool.schema.string().describe("任务简述，用于通知和状态展示"),
         prompt: tool.schema.string().describe("子任务的完整指令"),

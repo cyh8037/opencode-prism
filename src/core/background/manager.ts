@@ -1,6 +1,7 @@
 import {
   ABORT_TIMEOUT_MS,
   DEFAULT_CONCURRENCY,
+  MAX_NOTIFICATION_RESULT_CHARS,
   MAX_RETRIES,
   MAX_TOOL_CALLS,
   POLLING_INTERVAL_MS,
@@ -8,8 +9,10 @@ import {
 } from "../../config/constants"
 import type { PrismConfig } from "../../config/schema"
 import type { ResolvedModel } from "../../models"
-import { isAgentNotFoundError, shouldRetryError } from "../../models"
+import { isAgentNotFoundError, shouldRetryError, type ErrorInfo } from "../../models"
+import { errorInfoFromResult } from "../../shared/api-result"
 import { log } from "../../shared/log"
+import { lastAssistantText } from "../assistant-text"
 import type { PrismClient } from "../client-types"
 import type { PromptGate } from "../prompt-gate"
 import { ConcurrencyManager } from "./concurrency"
@@ -65,12 +68,14 @@ function formatDuration(startedAt: Date | undefined, completedAt: Date | undefin
   return `${minutes}m${seconds % 60}s`
 }
 
-function buildTaskTable(tasks: BgTask[]): string {
+// includeResults=false omits the per-row result preview — used when the full
+// result is injected separately so it is not duplicated.
+function buildTaskTable(tasks: BgTask[], includeResults = true): string {
   const rows = tasks
     .map((task) => {
       const error = task.error ? ` - ${task.error.slice(0, 120)}` : ""
       const attempts = task.retries > 0 ? ` (${task.retries + 1} attempts)` : ""
-      const result = task.resultText ? `\n   结果: ${task.resultText.slice(0, 200)}` : ""
+      const result = includeResults && task.resultText ? `\n   结果: ${task.resultText.slice(0, 200)}` : ""
       return (
         `- \`${task.id}\` ${task.description}: ${task.status.toUpperCase()} ` +
         `(${formatDuration(task.startedAt, task.completedAt)})${attempts}${error}${result}`
@@ -103,6 +108,10 @@ export class BackgroundManager {
     this.terminalListeners.add(listener)
   }
 
+  offTaskTerminal(listener: (task: BgTask) => void): void {
+    this.terminalListeners.delete(listener)
+  }
+
   getTask(id: string): BgTask | undefined {
     return this.tasks.get(id)
   }
@@ -116,12 +125,6 @@ export class BackgroundManager {
       if (task) tasks.push(task)
     }
     return tasks
-  }
-
-  hasActiveChildTasks(sessionID: string): boolean {
-    return this.getTasksByParentSession(sessionID).some(
-      (task) => task.status === "running" || task.status === "pending",
-    )
   }
 
   private addTask(task: BgTask): void {
@@ -143,7 +146,10 @@ export class BackgroundManager {
   }
 
   async launch(input: LaunchInput): Promise<BgTask> {
-    const model = await this.deps.resolveModel(input.parentSessionId)
+    // A pinned model (vision interpretation) skips resolution entirely so the
+    // child uses exactly the model the gate checked; everything else resolves
+    // the parent session's current model at launch time.
+    const model = input.model ?? (await this.deps.resolveModel(input.parentSessionId))
     if (!model) {
       throw new Error("无法确定主会话的当前模型，无法启动后台任务")
     }
@@ -165,6 +171,12 @@ export class BackgroundManager {
     }
 
     this.addTask(task)
+
+    // Toast only the first task of a parent session: batches (/split,
+    // --parallel) would otherwise flood the TUI with N "Started" toasts.
+    if (this.getTasksByParentSession(input.parentSessionId).length === 1) {
+      this.showToast("Prism background task", `Started: ${task.description} (${task.id})`, "info", 4000)
+    }
 
     if (input.parentSessionId) {
       const pending = this.pendingByParent.get(input.parentSessionId) ?? new Set<string>()
@@ -234,6 +246,7 @@ export class BackgroundManager {
       .get({ path: { id: input.parentSessionId }, query: { directory: this.deps.directory } })
       .catch(() => null)
     const parentDirectory = parentSession?.data?.directory ?? this.deps.directory
+    task.directory = parentDirectory
 
     const createResult = await this.deps.client.session.create({
       body: {
@@ -242,7 +255,6 @@ export class BackgroundManager {
         model: {
           id: model.modelID,
           providerID: model.providerID,
-          ...(model.variant ? { variant: model.variant } : {}),
         },
       },
       query: { directory: parentDirectory },
@@ -277,11 +289,13 @@ export class BackgroundManager {
 
     this.startPolling()
 
+    // The prompt API's model reference is { providerID, modelID } — the
+    // { id, providerID } shape session.create accepts is rejected here with
+    // 400 (Missing key ["model"]["modelID"]).
     const promptBody: Record<string, unknown> = {
       model: {
-        id: model.modelID,
         providerID: model.providerID,
-        ...(model.variant ? { variant: model.variant } : {}),
+        modelID: model.modelID,
       },
       tools: {
         bg_spawn: false,
@@ -297,33 +311,49 @@ export class BackgroundManager {
 
     this.logger("[prism] launching background task", { taskId: task.id, sessionID, model })
 
-    // Fire-and-forget; failures surface via the catch below.
+    // Fire-and-forget; the client resolves 4xx/5xx with { error } instead of
+    // rejecting, so both the resolved error field and rejections are checked.
     this.deps.client.session
       .promptAsync({ path: { id: sessionID }, body: promptBody, query: { directory: parentDirectory } })
-      .catch(async (error) => {
-        const errorInfo = this.classifyError(error)
-        if (isAgentNotFoundError(errorInfo) && input.agent) {
-          this.finalizeTask(
-            task,
-            "error",
-            `agent "${input.agent}" not found. Register it in your opencode config or omit the agent parameter.`,
-          )
-          this.notifyParent(task).catch(() => {})
-          return
-        }
-        if (await this.tryRetry(task, errorInfo)) return
-        this.finalizeTask(task, "error", errorInfo.message ?? String(error))
-        this.notifyParent(task).catch(() => {})
+      .then((result) => {
+        void this.handlePromptFailure(task, errorInfoFromResult(result))
+      })
+      .catch((error) => {
+        void this.handlePromptFailure(task, this.classifyError(error))
       })
 
-    await this.deps.client.tui.showToast({
-      body: {
-        title: "Prism background task",
-        message: `Started: ${task.description} (${task.id})`,
-        variant: "info",
-        duration: 4000,
-      },
-    }).catch(() => {})
+  }
+
+  // Shared failure path for a child prompt: agent-not-found short-circuits,
+  // retryable errors relaunch, everything else finalizes the task. undefined
+  // errorInfo means the call succeeded.
+  private async handlePromptFailure(task: BgTask, errorInfo: ErrorInfo | undefined): Promise<void> {
+    if (!errorInfo) return
+    if (isAgentNotFoundError(errorInfo) && task.agent) {
+      this.finalizeTask(
+        task,
+        "error",
+        `agent "${task.agent}" not found. Register it in your opencode config or omit the agent parameter.`,
+      )
+      this.notifyParent(task).catch(() => {})
+      return
+    }
+    if (await this.tryRetry(task, errorInfo)) return
+    this.finalizeTask(task, "error", errorInfo.message ?? JSON.stringify(errorInfo))
+    this.notifyParent(task).catch(() => {})
+  }
+
+  // Best-effort toast: never block the flow on it and never throw when the
+  // TUI is unavailable (missing API or non-TUI mode). The optional call is
+  // essential — a missing showToast would otherwise throw a sync TypeError
+  // that .catch() cannot catch.
+  private showToast(title: string, message: string, variant: string, duration: number): void {
+    const toast = this.deps.client.tui.showToast?.({ body: { title, message, variant, duration } })
+    if (toast) {
+      void toast.catch((error) => {
+        this.logger("[prism] toast failed", { error })
+      })
+    }
   }
 
   private classifyError(error: unknown): { name?: string; message?: string; statusCode?: number } {
@@ -361,9 +391,18 @@ export class BackgroundManager {
 
     const previousSessionID = task.sessionId
     if (previousSessionID) {
+      // Clear the session link BEFORE aborting: the abort may emit
+      // session.deleted, which would otherwise re-enter cancellation for a
+      // task the manager itself is retiring.
+      task.sessionId = undefined
+      task.status = "pending"
       await this.abortSession(previousSessionID, "same-model retry")
       this.deps.onSessionDeleted?.({ sessionID: previousSessionID })
     }
+
+    // The task may have been cancelled while the abort was in flight; let the
+    // cancellation stand instead of relaunching it.
+    if (TERMINAL_STATUSES.has(task.status)) return true
 
     if (task.concurrencyKey) {
       this.concurrency.release(task.concurrencyKey)
@@ -371,8 +410,6 @@ export class BackgroundManager {
     }
 
     task.retries += 1
-    task.sessionId = undefined
-    task.status = "pending"
     task.queuedAt = new Date()
 
     const key = this.concurrencyKeyFor(model)
@@ -393,14 +430,12 @@ export class BackgroundManager {
     this.queuesByKey.set(key, queue)
     void this.processKey(key)
 
-    await this.deps.client.tui.showToast({
-      body: {
-        title: "Prism retry",
-        message: `${task.description}: 同模型重试 (${model.providerID}/${model.modelID})`,
-        variant: "warning",
-        duration: 4000,
-      },
-    }).catch(() => {})
+    this.showToast(
+      "Prism retry",
+      `${task.description}: 同模型重试 (${model.providerID}/${model.modelID})`,
+      "warning",
+      4000,
+    )
     return true
   }
 
@@ -428,15 +463,35 @@ export class BackgroundManager {
           task.progress = task.progress ?? { toolCalls: 0, lastUpdate: new Date() }
           task.progress.lastUpdate = new Date()
           if (record.type === "tool" || record.tool) {
+            // Count each tool part once: part.updated fires repeatedly per
+            // part (state transitions), and counting every update would
+            // inflate the circuit-breaker budget.
+            const partID =
+              typeof record.id === "string" ? record.id : typeof record.callID === "string" ? record.callID : undefined
+            if (partID) {
+              task.progress.toolPartIds = task.progress.toolPartIds ?? new Set<string>()
+              if (task.progress.toolPartIds.has(partID)) {
+                if (typeof record.tool === "string") task.progress.lastTool = record.tool
+                return
+              }
+              task.progress.toolPartIds.add(partID)
+            }
             task.progress.toolCalls += 1
             if (typeof record.tool === "string") task.progress.lastTool = record.tool
             this.checkCircuitBreaker(task)
           }
-          if (record.type === "text" && record.role === "assistant") {
-            const state = record.state as Record<string, unknown> | undefined
-            if (state?.status === "completed" && typeof record.text === "string" && record.text.trim().length > 0) {
-              task.resultText = record.text
-            }
+          // Text parts carry no role/state fields (role lives on the message),
+          // so assistant text is identified by exclusion: plugin-sent prompts
+          // are marked synthetic, everything else text in a task session is
+          // the model's reply. Best-effort only — the authoritative capture
+          // happens via the messages API in validateSessionHasOutput.
+          if (
+            record.type === "text" &&
+            record.synthetic !== true &&
+            typeof record.text === "string" &&
+            record.text.trim().length > 0
+          ) {
+            task.resultText = record.text
           }
         }
       }
@@ -446,7 +501,9 @@ export class BackgroundManager {
     if (event.type === "session.idle" && sessionID) {
       const task = this.findBySession(sessionID)
       if (task && task.status === "running") {
-        void this.validateAndComplete(task, "session.idle event")
+        void this.validateAndComplete(task, "session.idle event").catch((error) => {
+          this.logger("[prism] validateAndComplete failed", { taskId: task.id, error })
+        })
       }
       return
     }
@@ -459,12 +516,16 @@ export class BackgroundManager {
           name: error?.name,
           message: error?.message ?? (typeof properties?.error === "string" ? properties.error : undefined),
         }
-        void this.tryRetry(task, errorInfo).then((retried) => {
-          if (!retried) {
-            this.finalizeTask(task, "error", errorInfo.message ?? "session error")
-            this.notifyParent(task).catch(() => {})
-          }
-        })
+        void this.tryRetry(task, errorInfo)
+          .then((retried) => {
+            if (!retried) {
+              this.finalizeTask(task, "error", errorInfo.message ?? "session error")
+              this.notifyParent(task).catch(() => {})
+            }
+          })
+          .catch((error) => {
+            this.logger("[prism] session.error handling failed", { taskId: task.id, error })
+          })
       }
       return
     }
@@ -472,7 +533,9 @@ export class BackgroundManager {
     if (event.type === "session.deleted" && sessionID) {
       const task = this.findBySession(sessionID)
       if (task && (task.status === "running" || task.status === "pending")) {
-        void this.cancelTask(task.id, { source: "session.deleted" })
+        void this.cancelTask(task.id, { source: "session.deleted" }).catch((error) => {
+          this.logger("[prism] session.deleted handling failed", { taskId: task.id, error })
+        })
       }
       return
     }
@@ -481,12 +544,16 @@ export class BackgroundManager {
       const status = properties?.status as { type?: string; message?: string } | undefined
       const task = this.findBySession(sessionID)
       if (task && task.status === "running" && status?.type === "retry") {
-        void this.tryRetry(task, { message: status.message }).then((retried) => {
-          if (!retried) {
-            this.finalizeTask(task, "error", status.message ?? "session retry failed")
-            this.notifyParent(task).catch(() => {})
-          }
-        })
+        void this.tryRetry(task, { message: status.message })
+          .then((retried) => {
+            if (!retried) {
+              this.finalizeTask(task, "error", status.message ?? "session retry failed")
+              this.notifyParent(task).catch(() => {})
+            }
+          })
+          .catch((error) => {
+            this.logger("[prism] session.status handling failed", { taskId: task.id, error })
+          })
       }
       return
     }
@@ -504,7 +571,7 @@ export class BackgroundManager {
     }
   }
 
-  private async validateSessionHasOutput(sessionID: string): Promise<boolean> {
+  private async validateSessionHasOutput(sessionID: string, task?: BgTask): Promise<boolean> {
     try {
       const response = await this.deps.client.session.messages({
         path: { id: sessionID },
@@ -512,6 +579,15 @@ export class BackgroundManager {
       })
       const messages = response.data
       if (!Array.isArray(messages)) return false
+
+      // Authoritative result capture: part-level events carry no role/state
+      // (role lives on the message), so the final assistant text is read from
+      // the message history right before the task completes.
+      if (task && !task.resultText) {
+        const text = lastAssistantText(messages)
+        if (text) task.resultText = text
+      }
+
       return messages.some((message) => {
         const info = (message as { info?: { role?: string } }).info
         if (info?.role !== "assistant" && info?.role !== "tool") return false
@@ -531,7 +607,7 @@ export class BackgroundManager {
 
   private async validateAndComplete(task: BgTask, source: string): Promise<void> {
     if (task.status !== "running" || !task.sessionId) return
-    const hasOutput = await this.validateSessionHasOutput(task.sessionId)
+    const hasOutput = await this.validateSessionHasOutput(task.sessionId, task)
     if (!hasOutput) {
       this.logger("[prism] session idle but no output yet, waiting", { taskId: task.id })
       return
@@ -597,8 +673,12 @@ export class BackgroundManager {
     }
 
     if (task.status === "running" && task.sessionId) {
-      await this.abortSession(task.sessionId, `task cancellation (${source})`)
-      this.deps.onSessionDeleted?.({ sessionID: task.sessionId })
+      const sessionID = task.sessionId
+      // Clear the link before aborting so a session.deleted event cannot
+      // re-enter cancellation for the same task.
+      task.sessionId = undefined
+      await this.abortSession(sessionID, `task cancellation (${source})`)
+      this.deps.onSessionDeleted?.({ sessionID })
     }
 
     this.finalizeTask(task, "cancelled", options?.reason)
@@ -609,13 +689,6 @@ export class BackgroundManager {
       })
     }
     return true
-  }
-
-  // Cancel a pending task without aborting any session or notifying.
-  async cancelPendingTask(taskId: string): Promise<boolean> {
-    const task = this.tasks.get(taskId)
-    if (!task || task.status !== "pending") return false
-    return this.cancelTask(taskId, { source: "cancelPendingTask", skipNotification: true })
   }
 
   async resume(taskId: string, prompt: string): Promise<BgTask> {
@@ -633,7 +706,11 @@ export class BackgroundManager {
     task.completedAt = undefined
     task.error = undefined
     task.startedAt = new Date()
-    task.progress = { toolCalls: task.progress?.toolCalls ?? 0, lastUpdate: new Date() }
+    task.progress = {
+      toolCalls: task.progress?.toolCalls ?? 0,
+      toolPartIds: task.progress?.toolPartIds,
+      lastUpdate: new Date(),
+    }
 
     this.startPolling()
 
@@ -644,19 +721,22 @@ export class BackgroundManager {
     if (task.agent) promptBody.agent = task.agent
     if (task.model) {
       promptBody.model = {
-        id: task.model.modelID,
         providerID: task.model.providerID,
-        ...(task.model.variant ? { variant: task.model.variant } : {}),
+        modelID: task.model.modelID,
       }
     }
 
     this.deps.client.session
-      .promptAsync({ path: { id: task.sessionId }, body: promptBody, query: { directory: this.deps.directory } })
-      .catch(async (error) => {
-        const errorInfo = this.classifyError(error)
-        if (await this.tryRetry(task, errorInfo)) return
-        this.finalizeTask(task, "error", errorInfo.message ?? String(error))
-        this.notifyParent(task).catch(() => {})
+      .promptAsync({
+        path: { id: task.sessionId },
+        body: promptBody,
+        query: { directory: task.directory ?? this.deps.directory },
+      })
+      .then((result) => {
+        void this.handlePromptFailure(task, errorInfoFromResult(result))
+      })
+      .catch((error) => {
+        void this.handlePromptFailure(task, this.classifyError(error))
       })
 
     return task
@@ -675,39 +755,52 @@ export class BackgroundManager {
       const allComplete = remaining === 0
       const isFailure = task.status === "error" || task.status === "cancelled"
 
-      const variant = task.status === "completed" ? "success" : "error"
-      await this.deps.client.tui
-        .showToast({
-          body: {
-            title: "Prism background task",
-            message: `${task.status.toUpperCase()}: ${task.description} (${task.id})`,
-            variant,
-            duration: 5000,
-          },
-        })
-        .catch(() => {})
-
       // Wake the parent only when the whole batch settled or a task failed;
-      // otherwise a batch of N tasks would wake the parent N times.
+      // otherwise a batch of N tasks would wake the parent N times. The toast
+      // joins the same condition: one terminal toast per task would flood the
+      // TUI on batches (/split, --parallel).
       if (allComplete || isFailure) {
+        const variant = task.status === "completed" ? "success" : task.status === "cancelled" ? "warning" : "error"
+        this.showToast(
+          "Prism background task",
+          `${task.status.toUpperCase()}: ${task.description} (${task.id})`,
+          variant,
+          5000,
+        )
         const siblingTasks = this.getTasksByParentSession(task.parentSessionId)
-        const notification = [
+
+        // Single completed task: inject the FULL result into the parent
+        // conversation — a truncated preview leaves the model reporting
+        // "完整结果没有注入到本次对话中". Batches keep the per-task
+        // previews plus the bg_output pointer instead.
+        const singleCompleted = allComplete && siblingTasks.length === 1 && task.status === "completed"
+        const resultText = (task.resultText ?? "").trim()
+        const fullResult = singleCompleted && resultText.length > 0
+        const truncated = resultText.length > MAX_NOTIFICATION_RESULT_CHARS
+
+        const lines = [
           "<system-reminder>",
           "[PRISM BACKGROUND TASKS]",
           allComplete ? `全部后台任务已结束 (${siblingTasks.length} 个):` : "后台任务状态更新:",
           "",
-          buildTaskTable(siblingTasks),
-          allComplete ? "" : `仍有 ${remaining} 个任务运行中。`,
-          "如果需要，可用 bg_output(task_id) 查看完整结果。",
-          "</system-reminder>",
+          buildTaskTable(siblingTasks, !fullResult),
         ]
-          .filter((line) => line !== "")
-          .join("\n")
+        if (fullResult) {
+          lines.push("", "完整结果:", truncated ? resultText.slice(0, MAX_NOTIFICATION_RESULT_CHARS) : resultText)
+          if (truncated) {
+            lines.push("", `（结果过长已截断，用 bg_output("${task.id}") 查看完整结果）`)
+          }
+        } else if (allComplete) {
+          lines.push("", "如果需要，可用 bg_output(task_id) 查看完整结果。")
+        } else {
+          lines.push("", `仍有 ${remaining} 个任务运行中。`, "如果需要，可用 bg_output(task_id) 查看完整结果。")
+        }
+        lines.push("</system-reminder>")
 
         await this.deps.gate.dispatch({
           sessionID: task.parentSessionId,
           source: "background-notification",
-          text: notification,
+          text: lines.join("\n"),
         })
       }
     })
@@ -779,15 +872,35 @@ export class BackgroundManager {
       for (const task of this.tasks.values()) {
         if (task.status !== "running" || !task.sessionId) continue
 
+        // The status map only contains non-idle sessions (idle entries are
+        // removed when they settle), so an absent entry IS the idle state.
         const sessionStatus = allStatuses?.[task.sessionId]?.type
-        if (sessionStatus === "active" || sessionStatus === "running" || sessionStatus === "busy") {
+        if (sessionStatus === "busy" || sessionStatus === "retry") {
           continue
         }
 
-        const hasOutput = await this.validateSessionHasOutput(task.sessionId)
+        // Terminal failure states: never mark a failed session "completed".
+        if (sessionStatus === "error") {
+          this.logger("[prism] session errored (polled status)", { taskId: task.id, sessionID: task.sessionId })
+          this.finalizeTask(task, "error", "child session errored (polled as error status)")
+          this.notifyParent(task).catch((notifyError) => {
+            this.logger("[prism] failed to notify on polled error", { taskId: task.id, error: notifyError })
+          })
+          continue
+        }
+        if (sessionStatus === "deleted") {
+          await this.cancelTask(task.id, { source: "polling (session deleted)" })
+          continue
+        }
+
+        // Idle (or an unavailable status map) is a completion candidate;
+        // unknown future statuses are skipped rather than assumed done.
+        if (sessionStatus !== undefined && sessionStatus !== "idle") continue
+
+        const hasOutput = await this.validateSessionHasOutput(task.sessionId, task)
         if (!hasOutput) continue
 
-        await this.completeTask(task, sessionStatus === "idle" ? "polling (idle)" : "polling")
+        await this.completeTask(task, "polling (idle)")
       }
     } finally {
       this.pollingInFlight = false

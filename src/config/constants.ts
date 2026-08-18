@@ -15,12 +15,13 @@ export const DEFAULT_PROVIDER_PRIORITY = [
   "vercel",
 ]
 
-export const VARIANT_VALUES = ["off", "low", "medium", "high", "xhigh", "max"] as const
-
 // vision
 export const MAX_IMAGES_PER_BATCH = 4
-export const DEDUPE_WINDOW_MS = 3000
 export const VISION_SYNC_TIMEOUT_MS = 120_000
+// Bounded wait for the session's first chat.params snapshot: chat.message
+// (trigger B) fires before the session's first LLM call, so a fresh session
+// has no capability snapshot yet when an image arrives.
+export const VISION_SNAPSHOT_WAIT_MS = 3000
 export const VISION_IMAGE_MAX_BYTES = 8 * 1024 * 1024
 export const VISION_CATEGORY = "vision"
 export const SUPPORTED_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"])
@@ -31,9 +32,11 @@ export const MAX_RETRIES = 1
 export const TASK_TTL_MS = 30 * 60 * 1000
 export const POLLING_INTERVAL_MS = 3000
 export const ABORT_TIMEOUT_MS = 10_000
-export const SESSION_GONE_MIN_POLLS = 3
 export const MAX_TOOL_CALLS = 4000
-export const CIRCUIT_BREAKER_CONSECUTIVE_THRESHOLD = 20
+// Cap for a single task's result injected into the parent notification.
+// Vision interpretations and normal task outputs fit comfortably; the cap
+// only guards against pathological output blowing up the injected message.
+export const MAX_NOTIFICATION_RESULT_CHARS = 20_000
 
 // split
 export const MAX_SUBTASKS = 12

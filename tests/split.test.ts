@@ -128,6 +128,25 @@ describe("runSplit", () => {
     expect(result.tasksByPlanID.size).toBe(2)
   })
 
+  test("removes its terminal listener once the run settles", async () => {
+    const { manager } = createManager()
+    const listenerCount = () =>
+      (manager as unknown as { terminalListeners: Set<unknown> }).terminalListeners.size
+    const before = listenerCount()
+
+    const result = runSplit(manager, {
+      parentSessionId: "parent",
+      plans: [{ id: "s1", title: "only", description: "work", dependsOn: [] }],
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const s1 = result.tasksByPlanID.get("s1")!
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: s1.sessionId } })
+    await result.done
+
+    expect(listenerCount()).toBe(before)
+  })
+
   test("buildSplitReport lists every plan with status", () => {
     const plans = [
       { id: "s1", title: "one", description: "", dependsOn: [] },
