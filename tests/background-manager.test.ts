@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test"
 import { BackgroundManager } from "../src/core/background/manager"
 import { PromptGate } from "../src/core/prompt-gate"
+import { TERMINAL_TASK_RETENTION_MS } from "../src/config/constants"
 import { parseConfig } from "../src/config/load"
 import type { PrismClient } from "../src/core/client-types"
+import type { BgTask } from "../src/core/background/types"
 import type { ResolvedModel } from "../src/models"
 
 // Mock client simulating OpenCode sessions in memory. statusData is a live
@@ -461,6 +463,199 @@ describe("BackgroundManager", () => {
     await new Promise((resolve) => setTimeout(resolve, 50))
     const cancelToast = toasts.find((t) => t.message.includes("CANCELLED"))
     expect(cancelToast?.variant).toBe("warning")
+  })
+
+  // Regression: startTask throwing before it claims the slot (e.g. a network
+  // rejection from session.create) used to leak the acquired slot forever —
+  // with concurrency 1 the key would never run another task.
+  test("a session.create failure releases the concurrency slot", async () => {
+    const { manager, client } = createManager({ concurrency: 1 })
+    let createCalls = 0
+    const originalCreate = client.session.create.bind(client.session)
+    client.session.create = async (...args: Parameters<PrismClient["session"]["create"]>) => {
+      createCalls++
+      if (createCalls === 1) throw new Error("network down")
+      return originalCreate(...args)
+    }
+
+    const first = await manager.launch({ description: "doomed", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(first.status).toBe("error")
+
+    // A leaked slot would leave this task pending forever.
+    const second = await manager.launch({ description: "next", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(second.status).toBe("running")
+    await manager.shutdown()
+  })
+
+  // Regression: after shutdown cleared the maps, an in-flight processKey loop
+  // still held its queue array reference and could start NEW sessions (the
+  // cleared semaphore handed out slots again).
+  test("shutdown prevents queued tasks from starting", async () => {
+    const { manager, childSessions } = createManager({ concurrency: 1 })
+    await manager.launch({ description: "blocker", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(childSessions.size).toBe(1)
+
+    // Queued behind the single slot; the loop sits in acquire() for it.
+    await manager.launch({ description: "queued", prompt: "work", parentSessionId: "parent" })
+    await manager.shutdown()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    expect(childSessions.size).toBe(1) // no session created post-shutdown
+  })
+
+  test("launch rejects after shutdown", async () => {
+    const { manager } = createManager()
+    await manager.shutdown()
+    await expect(
+      manager.launch({ description: "late", prompt: "work", parentSessionId: "parent" }),
+    ).rejects.toThrow("shutting down")
+  })
+
+  // Regression: shutdown's abort snapshot runs while session.create is in
+  // flight, so the just-created session is not in it — startTask must retire
+  // it itself or it would run orphaned with no manager oversight.
+  test("shutdown aborts a session created while shutdown was in flight", async () => {
+    const { manager, client, childSessions } = createManager({ concurrency: 1 })
+    let releaseCreate!: () => void
+    let createBlocked!: () => void
+    const blocked = new Promise<void>((resolve) => (createBlocked = resolve))
+    const releasePromise = new Promise<void>((resolve) => (releaseCreate = resolve))
+    const originalCreate = client.session.create.bind(client.session)
+    client.session.create = async (...args: Parameters<PrismClient["session"]["create"]>) => {
+      createBlocked()
+      await releasePromise
+      return originalCreate(...args)
+    }
+
+    const task = await manager.launch({ description: "doomed", prompt: "work", parentSessionId: "parent" })
+    await blocked // startTask is now inside session.create
+    await manager.shutdown()
+    releaseCreate()
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(task.status).toBe("cancelled")
+    expect(childSessions.size).toBe(1)
+    expect(Array.from(childSessions.values())[0]?.aborted).toBe(true)
+  })
+
+  // Terminal tasks used to accumulate forever (resultText, toolPartIds,
+  // multi-MB image parts) — the maps must stay bounded over a long session.
+  test("finalize drops the run's heavy payloads", async () => {
+    const { manager } = createManager()
+    const task = await manager.launch({
+      description: "t",
+      prompt: "work",
+      parts: [{ type: "file", mime: "image/png", url: "data:image/png;base64,AAAA" }],
+      parentSessionId: "parent",
+    })
+    task.progress = { toolCalls: 3, toolPartIds: new Set(["p1", "p2"]), lastUpdate: new Date() }
+    ;(manager as unknown as { finalizeTask(t: BgTask, s: BgTask["status"], e?: string): void }).finalizeTask(
+      task,
+      "completed",
+    )
+    expect(task.status).toBe("completed")
+    expect(task.parts).toBeUndefined()
+    expect(task.progress?.toolPartIds).toBeUndefined()
+  })
+
+  test("terminal tasks are pruned after the retention window", async () => {
+    const { manager } = createManager()
+    const fresh = await manager.launch({ description: "fresh", prompt: "work", parentSessionId: "parent" })
+    const stale = await manager.launch({ description: "stale", prompt: "work", parentSessionId: "parent" })
+    const internals = manager as unknown as {
+      finalizeTask(t: BgTask, s: BgTask["status"], e?: string): void
+      pruneStaleTasks(): void
+    }
+    internals.finalizeTask(fresh, "completed")
+    internals.finalizeTask(stale, "completed")
+    stale.completedAt = new Date(Date.now() - TERMINAL_TASK_RETENTION_MS - 1000)
+
+    internals.pruneStaleTasks()
+
+    expect(manager.getTask(stale.id)).toBeUndefined()
+    expect(manager.getTask(fresh.id)).toBeDefined()
+    expect(manager.getTasksByParentSession("parent").map((t) => t.id)).toEqual([fresh.id])
+  })
+
+  // Regression: an unreachable status map or message history used to be
+  // treated as "idle" / "has output", falsely completing every running task
+  // and aborting child sessions that were still working server-side.
+  test("an API outage does not falsely complete running tasks", async () => {
+    const { manager, client, childSessions } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(task.status).toBe("running")
+    expect(task.sessionId).toBeDefined()
+
+    // Full outage: the status map itself is unreachable — the sweep must skip.
+    client.session.status = async () => {
+      throw new Error("server down")
+    }
+    client.session.messages = async () => {
+      throw new Error("server down")
+    }
+    await poll(manager)
+    expect(task.status).toBe("running")
+
+    // Status map reachable but message history unreachable: still fail-closed.
+    client.session.status = async () => ({ data: { [task.sessionId!]: { type: "idle" } } })
+    await poll(manager)
+    expect(task.status).toBe("running")
+
+    const child = Array.from(childSessions.values())[0]
+    expect(child?.aborted).toBe(false)
+    await manager.shutdown()
+  })
+
+  // Error-terminal tasks used to leave their tmux placeholder panes running
+  // forever (only the complete/cancel paths closed panes).
+  test("finalize closes the pane on error-terminal tasks", async () => {
+    const { client } = createMockClient()
+    const deleted: Array<{ sessionID: string }> = []
+    const manager = new BackgroundManager({
+      client,
+      directory: "/work",
+      config: parseConfig({ background: { concurrency: 1 } }),
+      gate: new PromptGate(client, { idlePollMs: 10 }),
+      resolveModel: async () => SESSION_MODEL,
+      onSessionCreated: () => {},
+      onSessionDeleted: (event) => {
+        deleted.push(event)
+      },
+      pollingIntervalMs: 60_000,
+    })
+    const task = await manager.launch({ description: "doomed", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    if (!task.sessionId) throw new Error("task never claimed a session")
+    const sessionID = task.sessionId
+
+    ;(manager as unknown as { finalizeTask(t: BgTask, s: BgTask["status"], e?: string): void }).finalizeTask(
+      task,
+      "error",
+      "agent not found",
+    )
+    expect(deleted).toEqual([{ sessionID }])
+    await manager.shutdown()
+  })
+
+  test("cancelAllByParentSession retires every task of a parent session without waking it", async () => {
+    const { manager, gate } = createManager()
+    const a = await manager.launch({ description: "a", prompt: "work", parentSessionId: "parent" })
+    const b = await manager.launch({ description: "b", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(a.status).toBe("running")
+    expect(b.status).toBe("running")
+
+    await manager.cancelAllByParentSession("parent", "parent session deleted")
+
+    expect(a.status).toBe("cancelled")
+    expect(b.status).toBe("cancelled")
+    // skipNotification: true — no wake dispatched to the deleted parent
+    expect(gate.hasRecentDispatch("parent")).toBe(false)
+    await manager.shutdown()
   })
 
   test("cancel clears the session link so late session.deleted events are no-ops", async () => {

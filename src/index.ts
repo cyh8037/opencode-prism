@@ -6,17 +6,19 @@ import { PromptGate } from "./core/prompt-gate"
 import type { PrismClient } from "./core/client-types"
 import { BackgroundManager, type ResolveModelFn } from "./core/background/manager"
 import { VisionPipeline, type GetVisionModelFn } from "./core/vision/pipeline"
-import { CurrentModelTracker } from "./core/vision/model-tracker"
+import { CurrentModelTracker, waitForVisionModel as waitForVisionModelResolved } from "./core/vision/model-tracker"
 import { SplitService } from "./core/split/service"
 import { TmuxManager } from "./tmux/manager"
 import { createToolExecuteAfterHook } from "./hooks/tool-execute-after"
 import { createChatMessageHook } from "./hooks/chat-message"
 import { createChatParamsHook } from "./hooks/chat-params"
 import { createEventHook } from "./hooks/event"
+import { createMessagesTransformHook } from "./hooks/messages-transform"
 import { createCommandExecuteBeforeHook } from "./hooks/command-execute-before"
 import { createBgTools } from "./tools/bg"
 import { createVisionLookTool } from "./tools/vision-look"
 import { BG_COMMAND, SPLIT_COMMAND, type PrismCommandDefinition } from "./commands/templates"
+import { resolveServerUrl } from "./tmux/env"
 import { log } from "./shared/log"
 import { guardHook } from "./shared/hook-guard"
 
@@ -113,7 +115,11 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
 
   const gate = new PromptGate(client)
 
-  const tmux = new TmuxManager({ client, directory, config, serverUrl })
+  // Resolve once so the tmux panes and the /bg output --full hint print the
+  // same attach URL (port-0 fallback, OPENCODE_PORT, config).
+  const attachServerUrl = resolveServerUrl(serverUrl, process.env, log)
+
+  const tmux = new TmuxManager({ client, directory, config, serverUrl: attachServerUrl })
   await tmux.init()
 
   const resolveModel: ResolveModelFn = (parentSessionID) =>
@@ -147,28 +153,14 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
     return snapshot?.visionCapable ? snapshot.model : undefined
   }
 
-  const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
-
-  // Same decision, but waits for the session's capability snapshot: chat.
-  // message (trigger B) fires BEFORE the session's first chat.params, so a
-  // fresh session has no known capability when an image arrives (e.g. a
-  // message recalled from another session's history). The LLM call for the
-  // just-submitted message is imminent, so the wait is short and bounded.
-  const waitForVisionModel = async (
-    sessionID: string,
-    timeoutMs: number,
-  ): Promise<ResolvedModel | undefined> => {
-    const deadline = Date.now() + timeoutMs
-    while (Date.now() < deadline) {
-      const snapshot = modelTracker.get(sessionID)
-      if (snapshot?.capabilityKnown) {
-        return snapshot.visionCapable ? snapshot.model : undefined
-      }
-      await sleep(50)
-    }
-    const snapshot = modelTracker.get(sessionID)
-    return snapshot?.visionCapable ? snapshot.model : undefined
-  }
+  const waitForVisionModel = (sessionID: string, timeoutMs: number): Promise<ResolvedModel | undefined> =>
+    waitForVisionModelResolved({
+      visionModel,
+      visionRefInvalid,
+      tracker: modelTracker,
+      sessionID,
+      timeoutMs,
+    })
 
   const vision = new VisionPipeline({
     client,
@@ -219,12 +211,16 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
     // swallows its own failures into the file log instead.
     "tool.execute.after": guardHook("tool.execute.after", createToolExecuteAfterHook({ config, pipeline: vision })),
     "chat.message": guardHook("chat.message", createChatMessageHook({ config, pipeline: vision, tracker: modelTracker })),
+    "experimental.chat.messages.transform": guardHook(
+      "experimental.chat.messages.transform",
+      createMessagesTransformHook({ pipeline: vision }),
+    ),
     "chat.params": guardHook("chat.params", createChatParamsHook(modelTracker)),
     "command.execute.before": guardHook(
       "command.execute.before",
-      createCommandExecuteBeforeHook({ manager, splitService, client }),
+      createCommandExecuteBeforeHook({ manager, splitService, client, serverUrl: attachServerUrl }),
     ),
-    event: guardHook("event", createEventHook(manager, modelTracker)),
+    event: guardHook("event", createEventHook(manager, modelTracker, gate)),
     dispose: async () => {
       try {
         await manager.shutdown()

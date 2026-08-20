@@ -47,14 +47,28 @@ describe("PromptGate", () => {
     expect(state.dispatched).toHaveLength(1)
   })
 
-  test("reservation blocks dispatch from other sources", async () => {
+  test("a dispatch racing a reservation waits for the release instead of being dropped", async () => {
     const { client, state } = createMockClient()
-    const gate = new PromptGate(client, { idlePollMs: 10 })
+    const gate = new PromptGate(client, { idlePollMs: 10, reservationPollMs: 10 })
     gate.reserve("parent", "completion-path")
-    const result = await gate.dispatch({ sessionID: "parent", source: "other", text: "wake" })
-    expect(result.status).toBe("reserved")
-    expect(result.reservedBy).toBe("completion-path")
-    expect(state.dispatched).toHaveLength(0)
+    const pending = gate.dispatch({ sessionID: "parent", source: "other", text: "wake" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(state.dispatched).toHaveLength(0) // still waiting out the reservation
+    gate.release("parent", "completion-path")
+    const result = await pending
+    expect(result.status).toBe("dispatched")
+    expect(state.dispatched).toHaveLength(1)
+  })
+
+  test("release only clears a reservation with a matching source", async () => {
+    const { client } = createMockClient()
+    const gate = new PromptGate(client, { idlePollMs: 10 })
+    gate.reserve("parent", "background-completion:bg_a")
+    gate.reserve("parent", "background-completion:bg_b") // overlapping holder takes over
+    gate.release("parent", "background-completion:bg_a") // stale release must be a no-op
+    expect(gate.isReserved("parent")).toBe(true)
+    gate.release("parent", "background-completion:bg_b")
+    expect(gate.isReserved("parent")).toBe(false)
   })
 
   test("release clears the reservation", async () => {
@@ -64,6 +78,38 @@ describe("PromptGate", () => {
     gate.release("parent")
     const result = await gate.dispatch({ sessionID: "parent", source: "other", text: "wake" })
     expect(result.status).toBe("dispatched")
+  })
+
+  test("a failed dispatch is retried instead of dropped", async () => {
+    const { client, state } = createMockClient()
+    let failures = 0
+    const original = client.session.promptAsync.bind(client.session)
+    client.session.promptAsync = async (...args: Parameters<PrismClient["session"]["promptAsync"]>) => {
+      if (failures < 2) {
+        failures++
+        return { error: { message: "session busy" }, response: { status: 503 } }
+      }
+      return original(...args)
+    }
+    const gate = new PromptGate(client, { idlePollMs: 10, dispatchRetryDelayMs: 10 })
+    const result = await gate.dispatch({ sessionID: "parent", source: "test", text: "wake" })
+    expect(result.status).toBe("dispatched")
+    expect(failures).toBe(2)
+    expect(state.dispatched).toHaveLength(1)
+  })
+
+  test("a thrown dispatch error is not retried (the request may have been delivered)", async () => {
+    const { client, state } = createMockClient()
+    let calls = 0
+    client.session.promptAsync = async () => {
+      calls++
+      throw new Error("network down")
+    }
+    const gate = new PromptGate(client, { idlePollMs: 10, dispatchRetryDelayMs: 10 })
+    const result = await gate.dispatch({ sessionID: "parent", source: "test", text: "wake" })
+    expect(result.status).toBe("failed")
+    expect(calls).toBe(1) // no retry: a retry could inject a duplicate wake
+    expect(state.dispatched).toHaveLength(0)
   })
 
   test("waits for a busy session to settle before dispatching", async () => {

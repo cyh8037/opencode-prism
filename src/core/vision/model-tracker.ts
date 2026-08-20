@@ -1,5 +1,7 @@
 import type { ResolvedModel } from "../../models"
 
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+
 // Per-session snapshot of the parent session's current model, fed by the
 // chat.params hook (fires before every LLM call with the resolved Model).
 // capabilities.input.image is the same signal opencode's runtime uses to
@@ -59,4 +61,35 @@ export class CurrentModelTracker {
   clear(sessionID: string): void {
     this.bySession.delete(sessionID)
   }
+}
+
+// Resolve the model a vision interpretation should use for a session, waiting
+// up to timeoutMs for the first capability snapshot when no explicit model is
+// configured. Mirrors the config-first order of the sync getVisionModel: an
+// explicit vision.model wins immediately (the session snapshot is irrelevant
+// to it), an invalid reference stays permanently off, and the snapshot gate
+// only applies to the inherit-session-model fallback. chat.message (trigger B)
+// fires BEFORE the session's first chat.params, so a fresh session has no
+// known capability when an image arrives — the wait is short and bounded
+// because the LLM call for the just-submitted message is imminent.
+export async function waitForVisionModel(args: {
+  visionModel?: ResolvedModel
+  visionRefInvalid: boolean
+  tracker: CurrentModelTracker
+  sessionID: string
+  timeoutMs: number
+}): Promise<ResolvedModel | undefined> {
+  const { visionModel, visionRefInvalid, tracker, sessionID, timeoutMs } = args
+  if (visionModel) return visionModel
+  if (visionRefInvalid) return undefined
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const snapshot = tracker.get(sessionID)
+    if (snapshot?.capabilityKnown) {
+      return snapshot.visionCapable ? snapshot.model : undefined
+    }
+    await sleep(50)
+  }
+  const snapshot = tracker.get(sessionID)
+  return snapshot?.visionCapable ? snapshot.model : undefined
 }

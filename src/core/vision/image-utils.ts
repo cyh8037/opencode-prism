@@ -8,9 +8,10 @@ import type { ImageAttachment } from "./detector"
 const FETCH_TIMEOUT_MS = 10_000
 
 // Detect bare local filesystem paths (as opposed to URLs): absolute POSIX,
-// relative, dotfiles, home-relative, Windows drive paths, and UNC. file://
-// URLs are not matched here: they go through fetch, which Bun supports
-// natively.
+// relative, dotfiles, home-relative, Windows drive paths, UNC, and bare
+// relative filenames with a supported image extension ("shot.png",
+// "assets/shot.PNG"). file:// URLs are not matched here: they go through
+// fetch, which Bun supports natively.
 function isLocalPath(url: string): boolean {
   return (
     url.startsWith("/") ||
@@ -19,7 +20,11 @@ function isLocalPath(url: string): boolean {
     url.startsWith("~/") ||
     /^\.[^/]/.test(url) || // dotfiles like .screenshot.png
     url.startsWith("\\\\") || // Windows UNC
-    /^[A-Za-z]:[\\/]/.test(url)
+    /^[A-Za-z]:[\\/]/.test(url) ||
+    // Fallback: bare filenames and unprefixed relative paths ending in a
+    // supported image extension. The ":" ban keeps scheme-bearing URLs
+    // (https://, file://) out; drive paths carry ":" but match above.
+    /^[^:]+\.(png|jpe?g|gif|webp)$/i.test(url)
   )
 }
 

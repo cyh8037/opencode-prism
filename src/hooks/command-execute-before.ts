@@ -1,5 +1,6 @@
 import { MAX_SUBTASKS } from "../config/constants"
 import type { BackgroundManager } from "../core/background/manager"
+import type { BgTask } from "../core/background/types"
 import type { SplitService } from "../core/split/service"
 import type { PrismClient } from "../core/client-types"
 
@@ -23,7 +24,7 @@ function formatTaskTable(manager: BackgroundManager, sessionID: string): string 
   return `| task_id | 描述 | 状态 | 模型 | 工具调用 |\n|---|---|---|---|---|\n${rows}`
 }
 
-function formatTaskOutput(manager: BackgroundManager, taskID: string, fullSession: boolean): string {
+function formatTaskOutput(manager: BackgroundManager, taskID: string, fullSession: boolean, serverUrl: string): string {
   const task = manager.getTask(taskID)
   if (!task) return `任务不存在: ${taskID}`
   const lines = [
@@ -34,9 +35,24 @@ function formatTaskOutput(manager: BackgroundManager, taskID: string, fullSessio
   if (task.model) lines.push(`模型: ${task.model.providerID}/${task.model.modelID}${task.retries > 0 ? ` (重试 ${task.retries} 次)` : ""}`)
   if (task.resultText) lines.push(`\n结果:\n${task.resultText.slice(0, 2000)}`)
   if (fullSession && task.sessionId) {
-    lines.push(`\n完整会话: opencode attach http://localhost:4096 --session ${task.sessionId}`)
+    lines.push(`\n完整会话: opencode attach ${serverUrl} --session ${task.sessionId}`)
   }
   return lines.join("\n")
+}
+
+// Tasks are owned by the session that spawned them: a /bg or /split command
+// typed in another session (e.g. a child pane) must not read or cancel them.
+function checkTaskOwnership(
+  manager: BackgroundManager,
+  sessionID: string,
+  taskID: string,
+): { ok: true; task: BgTask } | { ok: false; error: string } {
+  const task = manager.getTask(taskID)
+  if (!task) return { ok: false, error: `任务不存在: ${taskID}` }
+  if (task.parentSessionId !== sessionID) {
+    return { ok: false, error: `无权操作其他会话的任务: ${taskID}` }
+  }
+  return { ok: true, task }
 }
 
 const FLAG_PATTERN = /--(dry-run|sequential)\b|--max(?:\s+|=)(\d+)/g
@@ -72,6 +88,7 @@ export function createCommandExecuteBeforeHook(args: {
   manager: BackgroundManager
   splitService: SplitService
   client: PrismClient
+  serverUrl: string
 }) {
   return async (input: CommandInput, output: CommandOutput): Promise<void> => {
     const argumentsText = input.arguments.trim()
@@ -84,14 +101,29 @@ export function createCommandExecuteBeforeHook(args: {
       const outputMatch = argumentsText.match(/^(?:output|get)\s+(\S+)(\s+--full)?$/)
       if (outputMatch) {
         const taskID = outputMatch[1]!
-        pushText(output, formatTaskOutput(args.manager, taskID, outputMatch[2] !== undefined))
+        const owned = checkTaskOwnership(args.manager, input.sessionID, taskID)
+        if (!owned.ok) {
+          pushText(output, owned.error)
+          return
+        }
+        pushText(output, formatTaskOutput(args.manager, taskID, outputMatch[2] !== undefined, args.serverUrl))
         return
       }
       const cancelMatch = argumentsText.match(/^(?:cancel)\s+(\S+)$/)
       if (cancelMatch) {
         const taskID = cancelMatch[1]!
+        const owned = checkTaskOwnership(args.manager, input.sessionID, taskID)
+        if (!owned.ok) {
+          pushText(output, owned.error)
+          return
+        }
         const cancelled = await args.manager.cancelTask(taskID, { source: "/bg cancel" })
         pushText(output, cancelled ? `已取消任务 \`${taskID}\`` : `取消失败: 任务不存在或已结束 (${taskID})`)
+        return
+      }
+      if (argumentsText === "cancel") {
+        await args.manager.cancelAllByParentSession(input.sessionID, "/bg cancel")
+        pushText(output, "已取消当前会话的全部后台任务")
         return
       }
       return
@@ -104,13 +136,30 @@ export function createCommandExecuteBeforeHook(args: {
       }
       const outputMatch = argumentsText.match(/^(?:output|get)\s+(\S+)$/)
       if (outputMatch) {
-        pushText(output, formatTaskOutput(args.manager, outputMatch[1]!, false))
+        const taskID = outputMatch[1]!
+        const owned = checkTaskOwnership(args.manager, input.sessionID, taskID)
+        if (!owned.ok) {
+          pushText(output, owned.error)
+          return
+        }
+        pushText(output, formatTaskOutput(args.manager, taskID, false, args.serverUrl))
         return
       }
       const cancelMatch = argumentsText.match(/^(?:cancel)\s+(\S+)$/)
       if (cancelMatch) {
-        const cancelled = await args.manager.cancelTask(cancelMatch[1]!, { source: "/split cancel" })
-        pushText(output, cancelled ? `已取消任务 \`${cancelMatch[1]}\`` : "取消失败: 任务不存在或已结束")
+        const taskID = cancelMatch[1]!
+        const owned = checkTaskOwnership(args.manager, input.sessionID, taskID)
+        if (!owned.ok) {
+          pushText(output, owned.error)
+          return
+        }
+        const cancelled = await args.manager.cancelTask(taskID, { source: "/split cancel" })
+        pushText(output, cancelled ? `已取消任务 \`${taskID}\`` : "取消失败: 任务不存在或已结束")
+        return
+      }
+      if (argumentsText === "cancel") {
+        await args.manager.cancelAllByParentSession(input.sessionID, "/split cancel")
+        pushText(output, "已取消当前会话的全部后台任务")
         return
       }
 

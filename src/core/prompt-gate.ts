@@ -1,4 +1,8 @@
 import {
+  GATE_DISPATCH_ATTEMPTS,
+  GATE_DISPATCH_RETRY_DELAY_MS,
+  GATE_RESERVATION_POLL_MS,
+  GATE_RESERVATION_WAIT_MS,
   PARENT_WAKE_DEDUPE_MS,
   SESSION_IDLE_SETTLE_MS,
 } from "../config/constants"
@@ -10,13 +14,15 @@ export interface PromptGateOptions {
   semanticDedupeMs?: number
   idleSettleMs?: number
   idlePollMs?: number
+  reservationWaitMs?: number
+  reservationPollMs?: number
+  dispatchRetryDelayMs?: number
 }
 
-export type GateDispatchStatus = "dispatched" | "reserved" | "duplicate" | "failed"
+export type GateDispatchStatus = "dispatched" | "duplicate" | "failed"
 
 export interface GateDispatchResult {
   status: GateDispatchStatus
-  reservedBy?: string
   error?: unknown
 }
 
@@ -72,15 +78,22 @@ export class PromptGate {
   }
 
   // Reserve the session before any status-flip/callback work that will later
-  // queue a wake. Blocks other sources from dispatching meanwhile.
+  // queue a wake. Blocks other sources from dispatching meanwhile. When two
+  // holders overlap, the later reservation subsumes the earlier one (the
+  // combined window stays covered), and release is scoped to the caller's own
+  // source so an earlier holder's release cannot clear a later holder's
+  // reservation. A sourceless release clears unconditionally.
   reserve(sessionID: string, source: string): void {
     const state = this.getState(sessionID)
     state.reservation = { source }
   }
 
-  release(sessionID: string): void {
+  release(sessionID: string, source?: string): void {
     const state = this.state.get(sessionID)
-    if (state) state.reservation = undefined
+    if (!state?.reservation) return
+    if (source === undefined || state.reservation.source === source) {
+      state.reservation = undefined
+    }
   }
 
   isReserved(sessionID: string): boolean {
@@ -119,9 +132,28 @@ export class PromptGate {
     return !(await this.isSessionBusy(sessionID))
   }
 
+  // A reservation only lives for the holder's status-flip + child-abort
+  // window (bounded by ABORT_TIMEOUT_MS), so waiting it out almost always
+  // succeeds; on timeout the dispatch proceeds rather than being dropped.
+  private async waitForReservation(state: SessionState): Promise<boolean> {
+    const waitMs = this.options.reservationWaitMs ?? GATE_RESERVATION_WAIT_MS
+    const pollMs = this.options.reservationPollMs ?? GATE_RESERVATION_POLL_MS
+    const deadline = Date.now() + waitMs
+    while (Date.now() < deadline) {
+      if (!state.reservation) return true
+      await sleep(pollMs)
+    }
+    return !state.reservation
+  }
+
   // Wait-for-idle, dedupe, and the actual prompt dispatch. Run behind the
   // per-session chain so concurrent callers queue instead of dropping; the
   // reservation/dedupe checks are re-evaluated here at actual dispatch time.
+  // A racing reservation is waited out, and a server-confirmed rejection
+  // (resolved { error }) is retried a bounded number of times — a completion
+  // notification or split report that was dropped here would be lost forever
+  // (callers do not re-enqueue). Thrown errors are NOT retried: the request
+  // may have been delivered, and a duplicate wake is worse than a lost one.
   private async dispatchNow(args: {
     sessionID: string
     source: string
@@ -135,14 +167,6 @@ export class PromptGate {
   }): Promise<GateDispatchResult> {
     const { sessionID, source, state, text, parts, mode, queueBehavior, dedupeKey, dedupeMs } = args
 
-    if (state.reservation) {
-      return { status: "reserved", reservedBy: state.reservation.source }
-    }
-
-    if (state.recent && state.recent.dedupeKey === dedupeKey && Date.now() < state.recent.heldUntil) {
-      return { status: "duplicate" }
-    }
-
     const body = parts
       ? { parts }
       : { parts: [{ type: "text", text, synthetic: true }] }
@@ -154,33 +178,66 @@ export class PromptGate {
       return this.client.session.promptAsync({ path: { id: sessionID }, body })
     }
 
-    try {
-      if (queueBehavior === "defer") {
-        const idle = await this.waitForIdle(sessionID)
-        if (!idle) {
-          log(`[prism] gate: session still busy after settle, dispatching anyway`, { sessionID, source })
+    const retryDelayMs = this.options.dispatchRetryDelayMs ?? GATE_DISPATCH_RETRY_DELAY_MS
+    let lastError: unknown
+
+    for (let attempt = 1; attempt <= GATE_DISPATCH_ATTEMPTS; attempt++) {
+      if (state.reservation) {
+        const cleared = await this.waitForReservation(state)
+        if (!cleared && state.reservation) {
+          log(`[prism] gate: reservation still held after wait, dispatching anyway`, {
+            sessionID,
+            source,
+            reservedBy: state.reservation.source,
+          })
         }
       }
 
-      const result = await dispatch()
-
-      // The client resolves 4xx/5xx with { error } instead of rejecting; a
-      // resolved-but-rejected request must not count as dispatched.
-      const resultError = errorInfoFromResult(result as unknown)
-      if (resultError) {
-        log(`[prism] gate: prompt dispatch failed`, { sessionID, source, error: resultError })
-        return { status: "failed", error: resultError }
+      if (state.recent && state.recent.dedupeKey === dedupeKey && Date.now() < state.recent.heldUntil) {
+        return { status: "duplicate" }
       }
 
-      // Recent-dispatch hold: the same notification text re-sent within the
-      // dedupe window collapses into "duplicate" instead of waking the parent
-      // twice for the same event.
-      state.recent = { dedupeKey, heldUntil: Date.now() + dedupeMs }
-      return { status: "dispatched" }
-    } catch (error) {
-      log(`[prism] gate: prompt dispatch failed`, { sessionID, source, error })
-      return { status: "failed", error }
+      try {
+        if (queueBehavior === "defer") {
+          const idle = await this.waitForIdle(sessionID)
+          if (!idle) {
+            log(`[prism] gate: session still busy after settle, dispatching anyway`, { sessionID, source })
+          }
+        }
+
+        const result = await dispatch()
+
+        // The client resolves 4xx/5xx with { error } instead of rejecting; a
+        // resolved-but-rejected request must not count as dispatched. A
+        // resolved rejection is also server-confirmed NOT delivered, so it is
+        // the only failure class safe to retry.
+        const resultError = errorInfoFromResult(result as unknown)
+        if (resultError) {
+          lastError = resultError
+          log(`[prism] gate: prompt dispatch failed`, { sessionID, source, attempt, error: resultError })
+          if (attempt < GATE_DISPATCH_ATTEMPTS) {
+            await sleep(retryDelayMs)
+            continue
+          }
+          return { status: "failed", error: resultError }
+        }
+
+        // Recent-dispatch hold: the same notification text re-sent within the
+        // dedupe window collapses into "duplicate" instead of waking the parent
+        // twice for the same event.
+        state.recent = { dedupeKey, heldUntil: Date.now() + dedupeMs }
+        return { status: "dispatched" }
+      } catch (error) {
+        // A thrown error means the request MAY have reached the server —
+        // retrying could inject the same notification twice into the parent
+        // conversation. Only server-confirmed rejections are retried above.
+        lastError = error
+        log(`[prism] gate: prompt dispatch failed`, { sessionID, source, attempt, error })
+        return { status: "failed", error }
+      }
     }
+
+    return { status: "failed", error: lastError }
   }
 
   async dispatch(args: {
@@ -197,16 +254,14 @@ export class PromptGate {
     const dedupeKey = hashText(text)
     const dedupeMs = this.options.semanticDedupeMs ?? PARENT_WAKE_DEDUPE_MS
 
-    if (state.reservation) {
-      return { status: "reserved", reservedBy: state.reservation.source }
-    }
-
+    // Fast-path dedupe only. A racing reservation is NOT a drop reason: it is
+    // waited out inside dispatchNow at actual dispatch time.
     if (state.recent && state.recent.dedupeKey === dedupeKey && Date.now() < state.recent.heldUntil) {
       return { status: "duplicate" }
     }
 
     // Serialize behind any in-flight dispatch: a second source would
-    // previously be dropped ("reserved"), silently losing a wake.
+    // previously be dropped, silently losing a wake.
     const run = state.dispatchChain
       .catch(() => undefined) // a failed dispatch must not block the queue
       .then(() =>

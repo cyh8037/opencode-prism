@@ -18,6 +18,7 @@ export function createChatMessageHook(args: {
   return async (
     input: {
       sessionID: string
+      messageID?: string
       model?: { providerID?: string; modelID?: string }
     },
     output: { message?: unknown; parts?: unknown },
@@ -26,6 +27,15 @@ export function createChatMessageHook(args: {
     if (!args.config.vision.chatImages) return
     const images = extractImageParts(output.parts)
     if (images.length === 0) return
-    await args.pipeline.onChatImages(input.sessionID, images)
+    // messageID ties the background interpretation to the message that the
+    // messages.transform hook will find in the outgoing LLM context.
+    //
+    // input.messageID is OPTIONAL — when the client does not generate one,
+    // opencode commits the message under a freshly generated id and the hook
+    // input never learns it. output.message is the info object opencode
+    // commits, whose id is always final and identical to the id the
+    // messages.transform hook sees on the message in the LLM context.
+    const messageID = (output.message as { id?: string } | undefined)?.id ?? input.messageID
+    await args.pipeline.onChatImages(input.sessionID, images, messageID)
   }
 }

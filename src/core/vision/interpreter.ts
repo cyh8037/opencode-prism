@@ -1,4 +1,4 @@
-import { VISION_SYNC_TIMEOUT_MS } from "../../config/constants"
+import { VISION_INTERPRET_POLL_MS, VISION_SYNC_TIMEOUT_MS } from "../../config/constants"
 import type { ResolvedModel } from "../../models"
 import { errorInfoFromResult } from "../../shared/api-result"
 import { log } from "../../shared/log"
@@ -41,6 +41,10 @@ export async function runVisionInterpretation(args: {
   model: ResolvedModel
   instruction?: string
   timeoutMs?: number
+  /** Fired with the child session id right after creation — the caller uses
+   *  it to guard against the child's own injected prompt re-triggering an
+   *  interpretation (which would recurse unboundedly). */
+  onSessionCreated?: (sessionID: string) => void
 }): Promise<string | null> {
   const {
     client,
@@ -82,6 +86,7 @@ export async function runVisionInterpretation(args: {
     return null
   }
   const sessionID = createResult.data.id
+  args.onSessionCreated?.(sessionID)
 
   try {
     const parts: Array<Record<string, unknown>> = [
@@ -127,19 +132,23 @@ export async function runVisionInterpretation(args: {
       const status = statusMap?.[sessionID]?.type
       if (status === "busy" || status === "retry") {
         observedBusy = true
-        await sleep(500)
+        await sleep(VISION_INTERPRET_POLL_MS)
         continue
       }
       if (observedBusy && (status === undefined || status === "idle")) {
         // settled without assistant text: model produced nothing usable
         return null
       }
-      await sleep(500)
+      await sleep(VISION_INTERPRET_POLL_MS)
     }
 
     log("[prism] vision: interpretation timed out", { sessionID, timeoutMs })
     return null
   } finally {
-    await client.session.abort({ path: { id: sessionID } }).catch(() => {})
+    // Fire-and-forget cleanup: the caller (chat.message hook) blocks the
+    // message pipeline while this runs, so the abort must not add its own
+    // latency to the hook's return. The server tears the session down
+    // regardless of whether this promise settles first.
+    client.session.abort({ path: { id: sessionID } }).catch(() => {})
   }
 }

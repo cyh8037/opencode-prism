@@ -21,10 +21,13 @@ export function buildTmuxAttachCommand(serverUrl: string, sessionID: string, dir
 }
 
 // Placeholder shown while waiting for the session to become attachable;
-// prevents an empty blinking pane.
+// prevents an empty blinking pane. The description can be LLM-generated
+// (bg_spawn), so it goes through the same nested-shell quoting as the attach
+// command — escaping only `"` would let $(...) or backticks execute in the
+// pane shell.
 export function buildTmuxPlaceholderCommand(description: string): string {
-  const escapedDescription = description.replaceAll('"', '\\"')
-  return `${TMUX_COMMAND_SHELL} -c "printf '%s\\n%s\\n' \\"prism subagent pane ready: ${escapedDescription}\\" \\"Waiting for session...\\"; while :; do sleep 86400; done"`
+  const escapedLabel = shellQuoteForNestedCommand(`prism subagent pane ready: ${description}`)
+  return `${TMUX_COMMAND_SHELL} -c "printf '%s\\n%s\\n' ${escapedLabel} \\"Waiting for session...\\"; while :; do sleep 86400; done"`
 }
 
 // Auth env prefix for the attach command when the OpenCode server requires

@@ -34,9 +34,15 @@ export function createBgTools(manager: BackgroundManager): Record<string, ToolDe
       args: {
         taskId: tool.schema.string().describe("任务 id（bg_ 前缀）"),
       },
-      async execute(args: { taskId: string }) {
+      async execute(args: { taskId: string }, ctx: { sessionID: string }) {
         const task = manager.getTask(args.taskId)
-        if (!task) return `任务不存在: ${args.taskId}`
+        if (!task) return `任务不存在或已过期: ${args.taskId}`
+        // Tasks are owned by the session that spawned them; another session
+        // (e.g. a child subagent) must not read a sibling's or the parent's
+        // task results.
+        if (task.parentSessionId !== ctx.sessionID) {
+          return `无权访问其他会话的任务: ${args.taskId}`
+        }
         const lines = [`任务 \`${task.id}\`: ${task.description}`, `状态: ${task.status}`]
         if (task.error) lines.push(`错误: ${task.error}`)
         if (task.status === "running" || task.status === "pending") {
@@ -53,7 +59,11 @@ export function createBgTools(manager: BackgroundManager): Record<string, ToolDe
       args: {
         taskId: tool.schema.string().describe("任务 id（bg_ 前缀）"),
       },
-      async execute(args: { taskId: string }) {
+      async execute(args: { taskId: string }, ctx: { sessionID: string }) {
+        const task = manager.getTask(args.taskId)
+        if (task && task.parentSessionId !== ctx.sessionID) {
+          return `无权取消其他会话的任务: ${args.taskId}`
+        }
         const cancelled = await manager.cancelTask(args.taskId, { source: "bg_cancel" })
         return cancelled ? `已取消任务 \`${args.taskId}\`` : `取消失败: 任务不存在或已结束 (${args.taskId})`
       },

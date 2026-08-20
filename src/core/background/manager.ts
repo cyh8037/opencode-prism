@@ -6,6 +6,7 @@ import {
   MAX_TOOL_CALLS,
   POLLING_INTERVAL_MS,
   TASK_TTL_MS,
+  TERMINAL_TASK_RETENTION_MS,
 } from "../../config/constants"
 import type { PrismConfig } from "../../config/schema"
 import type { ResolvedModel } from "../../models"
@@ -141,15 +142,33 @@ export class BackgroundManager {
     return undefined
   }
 
+  /** Whether this session is a prism-managed child (bg task / vision
+   *  interpretation): auto-triggers must not fire for them — their own
+   *  injected prompts carry images that would otherwise recurse. */
+  isChildSession(sessionID: string): boolean {
+    return this.findBySession(sessionID) !== undefined
+  }
+
   private concurrencyKeyFor(model: ResolvedModel | undefined): string {
     return model ? `${model.providerID}/${model.modelID}` : ""
   }
 
   async launch(input: LaunchInput): Promise<BgTask> {
+    // Shutdown clears the queues but an in-flight processKey loop still holds
+    // its array reference; refusing new work here keeps dispose a hard stop.
+    if (this.shutdownTriggered) {
+      throw new Error("background manager is shutting down, cannot launch tasks")
+    }
+
     // A pinned model (vision interpretation) skips resolution entirely so the
     // child uses exactly the model the gate checked; everything else resolves
     // the parent session's current model at launch time.
     const model = input.model ?? (await this.deps.resolveModel(input.parentSessionId))
+    // resolveModel is a network call: shutdown may have landed while we
+    // waited, and it clears the maps — the task must not be added afterwards.
+    if (this.shutdownTriggered) {
+      throw new Error("background manager is shutting down, cannot launch tasks")
+    }
     if (!model) {
       throw new Error("无法确定主会话的当前模型，无法启动后台任务")
     }
@@ -200,8 +219,14 @@ export class BackgroundManager {
     this.processingKeys.add(key)
 
     try {
-      const queue = this.queuesByKey.get(key)
-      while (queue && queue.length > 0) {
+      while (!this.shutdownTriggered) {
+        // Re-read the queue on every iteration: cancelTask deletes the map
+        // entry once its array drains, and a concurrent retry/launch then
+        // creates a FRESH array for the same key. A reference captured once
+        // outside the loop would go stale and starve the new items until an
+        // unrelated launch happened to re-trigger this key.
+        const queue = this.queuesByKey.get(key)
+        if (!queue || queue.length === 0) break
         const item = queue.shift()
         if (!item) continue
 
@@ -212,7 +237,7 @@ export class BackgroundManager {
           continue
         }
 
-        if (TERMINAL_STATUSES.has(item.task.status)) {
+        if (this.shutdownTriggered || TERMINAL_STATUSES.has(item.task.status)) {
           this.concurrency.release(key)
           continue
         }
@@ -221,10 +246,16 @@ export class BackgroundManager {
           await this.startTask(item)
         } catch (error) {
           this.logger("[prism] error starting task", { taskId: item.task.id, error })
+          // startTask can only throw BEFORE it claims the slot
+          // (task.concurrencyKey): once claimed, no awaited call remains that
+          // could throw. When it threw unclaimed, the slot acquired above is
+          // still ours to release — finalizeTask only releases claimed ones,
+          // so skipping this leaked a slot permanently (shrinking the
+          // effective concurrency limit until the key stalled entirely).
+          const slotClaimed = item.task.concurrencyKey !== undefined
           this.finalizeTask(item.task, "error", error instanceof Error ? error.message : String(error))
-          if (item.task.concurrencyKey) {
-            this.concurrency.release(item.task.concurrencyKey)
-            item.task.concurrencyKey = undefined
+          if (!slotClaimed) {
+            this.concurrency.release(key)
           }
           if (item.task.sessionId) {
             await this.abortSession(item.task.sessionId, "startTask error cleanup")
@@ -266,9 +297,15 @@ export class BackgroundManager {
 
     const sessionID = createResult.data.id
 
-    if (TERMINAL_STATUSES.has(task.status)) {
+    // shutdown can land while session.create is in flight: its abort snapshot
+    // missed this session, so retiring it here is the only chance to avoid an
+    // orphaned child running with no manager oversight.
+    if (this.shutdownTriggered || TERMINAL_STATUSES.has(task.status)) {
       this.concurrency.release(this.concurrencyKeyFor(model))
       await this.abortSession(sessionID, "cancelled pre-start cleanup")
+      if (this.shutdownTriggered) {
+        this.finalizeTask(task, "cancelled", "background manager shut down during session creation")
+      }
       return
     }
 
@@ -601,7 +638,11 @@ export class BackgroundManager {
       })
     } catch (error) {
       this.logger("[prism] failed to validate session output", { sessionID, error })
-      return true
+      // Cannot verify — fail CLOSED: never complete (and abort) a task we
+      // could not check; its child session may still be running server-side.
+      // The sweep retries on the next interval; worst case the TTL backstop
+      // cancels the task instead of falsely completing it.
+      return false
     }
   }
 
@@ -620,12 +661,30 @@ export class BackgroundManager {
     task.status = status
     task.completedAt = new Date()
     if (error) task.error = error
+    // The run is over: parts (image data URLs can be multi-MB) and the tool
+    // dedupe set are only needed while the task can still launch or retry.
+    task.parts = undefined
+    if (task.progress) task.progress.toolPartIds = undefined
+    // Close the visualization pane for EVERY terminal transition, not just
+    // the complete/cancel paths: error-terminal tasks (agent not found, retry
+    // exhausted, polled error) used to leave placeholder panes looping
+    // forever. cancelTask/tryRetry clear sessionId before finalizing and
+    // close the pane explicitly with the saved id; closePane is idempotent.
+    if (task.sessionId) {
+      this.deps.onSessionDeleted?.({ sessionID: task.sessionId })
+    }
     if (task.concurrencyKey) {
       this.concurrency.release(task.concurrencyKey)
       task.concurrencyKey = undefined
     }
     for (const listener of this.terminalListeners) {
-      listener(task)
+      // A throwing listener must not abort the remaining listeners nor
+      // propagate into the status-flip path.
+      try {
+        listener(task)
+      } catch (error) {
+        this.logger("[prism] terminal listener failed (swallowed)", { taskId: task.id, error })
+      }
     }
     if (!this.hasRunningTasks()) this.stopPolling()
   }
@@ -635,18 +694,20 @@ export class BackgroundManager {
     // wake landing, hasActiveChildTasks() would already report false. The
     // reservation only covers the flip-to-notification queue window; the
     // actual gate dispatch happens after release (same two-phase design as
-    // oh-my-openagent's notification-preparation reservation).
-    this.deps.gate.reserve(task.parentSessionId, `background-completion:${task.id}`)
+    // oh-my-openagent's notification-preparation reservation). Release is
+    // scoped to this reservation's source: when two completions overlap, an
+    // earlier holder's release must not clear the later holder's reservation.
+    const reservationSource = `background-completion:${task.id}`
+    this.deps.gate.reserve(task.parentSessionId, reservationSource)
 
     try {
       this.finalizeTask(task, "completed")
 
       if (task.sessionId) {
         await this.abortSession(task.sessionId, `task completion (${source})`)
-        this.deps.onSessionDeleted?.({ sessionID: task.sessionId })
       }
     } finally {
-      this.deps.gate.release(task.parentSessionId)
+      this.deps.gate.release(task.parentSessionId, reservationSource)
     }
 
     await this.notifyParent(task)
@@ -689,6 +750,17 @@ export class BackgroundManager {
       })
     }
     return true
+  }
+
+  // Retire every task owned by a parent session (e.g. the parent was deleted):
+  // children are aborted and no wake is dispatched — the parent no longer
+  // exists to receive one. Already-terminal tasks are no-ops.
+  async cancelAllByParentSession(parentSessionID: string, source: string): Promise<void> {
+    const taskIDs = this.tasksByParentSession.get(parentSessionID)
+    if (!taskIDs) return
+    for (const taskID of Array.from(taskIDs)) {
+      await this.cancelTask(taskID, { source, skipNotification: true })
+    }
   }
 
   async resume(taskId: string, prompt: string): Promise<BgTask> {
@@ -858,66 +930,102 @@ export class BackgroundManager {
     this.pollingInFlight = true
     try {
       let allStatuses: SessionStatusMap | undefined
+      let statusMapAvailable = false
       try {
         const statusResult = await this.deps.client.session.status()
         if (statusResult.data && typeof statusResult.data === "object") {
           allStatuses = statusResult.data as SessionStatusMap
+          statusMapAvailable = true
         }
       } catch {
-        // session.status unavailable; fall through to per-task validation
+        // session.status unavailable (network/restart): treated below as a
+        // skip-the-sweep signal, NOT as "everything is idle" — that would
+        // falsely complete tasks and abort their still-running children.
       }
 
       this.pruneStaleTasks()
 
+      // Without the status map there is no way to tell idle from busy or
+      // deleted; completing anything now would be guesswork. The sweep
+      // retries on the next interval instead.
+      if (!statusMapAvailable) return
+
       for (const task of this.tasks.values()) {
-        if (task.status !== "running" || !task.sessionId) continue
+        // Per-task isolation: a rejection escaping one iteration would abort
+        // the rest of the sweep and surface as an unhandled rejection in the
+        // host process (whose stderr leaks into the TUI).
+        try {
+          if (task.status !== "running" || !task.sessionId) continue
 
-        // The status map only contains non-idle sessions (idle entries are
-        // removed when they settle), so an absent entry IS the idle state.
-        const sessionStatus = allStatuses?.[task.sessionId]?.type
-        if (sessionStatus === "busy" || sessionStatus === "retry") {
-          continue
+          // The status map only contains non-idle sessions (idle entries are
+          // removed when they settle), so an absent entry IS the idle state.
+          const sessionStatus = allStatuses?.[task.sessionId]?.type
+          if (sessionStatus === "busy" || sessionStatus === "retry") {
+            continue
+          }
+
+          // Terminal failure states: never mark a failed session "completed".
+          if (sessionStatus === "error") {
+            this.logger("[prism] session errored (polled status)", { taskId: task.id, sessionID: task.sessionId })
+            this.finalizeTask(task, "error", "child session errored (polled as error status)")
+            this.notifyParent(task).catch((notifyError) => {
+              this.logger("[prism] failed to notify on polled error", { taskId: task.id, error: notifyError })
+            })
+            continue
+          }
+          if (sessionStatus === "deleted") {
+            await this.cancelTask(task.id, { source: "polling (session deleted)" })
+            continue
+          }
+
+          // Idle (or an unavailable status map) is a completion candidate;
+          // unknown future statuses are skipped rather than assumed done.
+          if (sessionStatus !== undefined && sessionStatus !== "idle") continue
+
+          const hasOutput = await this.validateSessionHasOutput(task.sessionId, task)
+          if (!hasOutput) continue
+
+          await this.completeTask(task, "polling (idle)")
+        } catch (error) {
+          this.logger("[prism] polling iteration failed for task (swallowed)", { taskId: task.id, error })
         }
-
-        // Terminal failure states: never mark a failed session "completed".
-        if (sessionStatus === "error") {
-          this.logger("[prism] session errored (polled status)", { taskId: task.id, sessionID: task.sessionId })
-          this.finalizeTask(task, "error", "child session errored (polled as error status)")
-          this.notifyParent(task).catch((notifyError) => {
-            this.logger("[prism] failed to notify on polled error", { taskId: task.id, error: notifyError })
-          })
-          continue
-        }
-        if (sessionStatus === "deleted") {
-          await this.cancelTask(task.id, { source: "polling (session deleted)" })
-          continue
-        }
-
-        // Idle (or an unavailable status map) is a completion candidate;
-        // unknown future statuses are skipped rather than assumed done.
-        if (sessionStatus !== undefined && sessionStatus !== "idle") continue
-
-        const hasOutput = await this.validateSessionHasOutput(task.sessionId, task)
-        if (!hasOutput) continue
-
-        await this.completeTask(task, "polling (idle)")
       }
     } finally {
       this.pollingInFlight = false
     }
   }
 
+  // Drop a terminal task from the maps once its batch report has long been
+  // delivered (or the task never got that far) — keeps a long-lived TUI
+  // session from accumulating unbounded task state.
+  private removeTask(task: BgTask): void {
+    this.tasks.delete(task.id)
+    const siblings = this.tasksByParentSession.get(task.parentSessionId)
+    if (!siblings) return
+    siblings.delete(task.id)
+    if (siblings.size === 0) this.tasksByParentSession.delete(task.parentSessionId)
+  }
+
   private pruneStaleTasks(): void {
     const now = Date.now()
     for (const task of this.tasks.values()) {
-      if (task.status !== "running" && task.status !== "pending") continue
-      const anchor = task.startedAt ?? task.queuedAt
-      if (anchor && now - anchor.getTime() > TASK_TTL_MS) {
-        this.logger("[prism] pruning stale task", { taskId: task.id })
-        void this.cancelTask(task.id, {
-          source: "stale-prune",
-          reason: "task exceeded the 30 minute TTL",
-        })
+      if (task.status === "running" || task.status === "pending") {
+        const anchor = task.startedAt ?? task.queuedAt
+        if (anchor && now - anchor.getTime() > TASK_TTL_MS) {
+          this.logger("[prism] pruning stale task", { taskId: task.id })
+          void this.cancelTask(task.id, {
+            source: "stale-prune",
+            reason: "task exceeded the 30 minute TTL",
+          })
+        }
+        continue
+      }
+      // Terminal tasks: prune once past the retention window. The batch report
+      // is dispatched at the last task's completion, and TASK_TTL_MS bounds
+      // how long a batch can outlive a sibling, so a 1h window is safe.
+      if (task.completedAt && now - task.completedAt.getTime() > TERMINAL_TASK_RETENTION_MS) {
+        this.logger("[prism] pruning retained terminal task", { taskId: task.id })
+        this.removeTask(task)
       }
     }
   }

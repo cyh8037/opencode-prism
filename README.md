@@ -161,7 +161,10 @@ QA 记录：`docs/qa/`（每次 harness 验证一份）。
 ## 已知边界
 
 - **`opencode run` 非交互模式**：主会话结束后进程退出，未完成的后台任务会被 dispose 中止。TUI 模式不受影响。修复方向：CLI run 模式的 continuation marker（保持未完成 todo 直到后台任务清空），参考 oh-my-openagent 的 background-task-marker 机制。
+- **插件实例重启（opencode 重启/升级/崩溃后重开）**：在途后台任务与已开的 tmux pane 不跨实例存活——新实例没有旧任务的记录，旧子会话在服务端继续运行但不再被管理（完成通知不会到达），旧 pane 也不会被新实例清理。重启前请先等待任务结束或手动 `/bg cancel`。
 - **tmux isolation window/session**：配置 schema 已预留，v1 实现 inline；window/session 两种隔离待实现。
+
+后台任务归属当前会话：`/bg status`、`/bg output`、`bg_output`、`bg_cancel` 只能访问发起会话自己的任务（子任务会话不能读取或取消其他会话的任务）。`/bg cancel` 与 `/split cancel`（不带任务 id）可整体取消当前会话的全部后台任务。
 
 ## 变更记录
 

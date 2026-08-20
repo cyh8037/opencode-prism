@@ -36,6 +36,37 @@ describe("pane commands", () => {
     expect(command).toContain("prism subagent pane ready: my task")
     expect(command).toContain("while :; do sleep 86400; done")
   })
+
+  // The description can be LLM-generated (bg_spawn), so the pane command must
+  // not execute shell metacharacters inside it. Runs the built command the
+  // same way tmux would (via /bin/sh -c) and asserts no command substitution
+  // fired. The placeholder's infinite loop is torn down after the probe.
+  test("placeholder does not execute metacharacters in the description", async () => {
+    const { existsSync, unlinkSync } = await import("node:fs")
+    const { tmpdir } = await import("node:os")
+    const { join } = await import("node:path")
+    const marker = join(tmpdir(), `prism-injection-${process.pid}`)
+    const description = "evil $(touch " + marker + ") and `touch " + marker + "`"
+
+    const command = buildTmuxPlaceholderCommand(description)
+    // No unescaped substitution syntax may survive quoting.
+    expect(command).not.toMatch(/(?<!\\)\$\(/)
+    expect(command).not.toMatch(/(?<!\\)`/)
+
+    // Run it backgrounded, then kill the whole little process tree (the
+    // placeholder loops forever, so pkill the loop's sleep child BEFORE its
+    // parent shell dies and orphans/repars it).
+    const wrapped =
+      command + " & pid=$!; sleep 0.3; pkill -P $pid 2>/dev/null; kill $pid 2>/dev/null; exit 0"
+    const proc = Bun.spawn(["/bin/sh", "-c", wrapped], { stdout: "ignore", stderr: "ignore" })
+    await proc.exited
+
+    try {
+      expect(existsSync(marker)).toBe(false) // substitution must not have run
+    } finally {
+      if (existsSync(marker)) unlinkSync(marker)
+    }
+  })
 })
 
 function createMockRunner(): { runner: TmuxRunner; commands: string[][] } {
