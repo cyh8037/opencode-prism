@@ -1,10 +1,10 @@
 {
   "name": "opencode-prism",
-  "version": "0.1.0",
+  "version": "0.1.0-beta.0",
   "description": "Prism: OpenCode plugin for vision interpretation, parallel background agents, task splitting, and tmux pane visualization",
+  "license": "MIT",
   "type": "module",
   "main": "dist/index.js",
-  "types": "dist/index.d.ts",
   "files": [
     "dist",
     "assets"
@@ -12,7 +12,8 @@
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "build": "bun build src/index.ts --outdir dist --target bun --external @opencode-ai/plugin --external zod"
+    "build": "bun build src/index.ts --outdir dist --target bun --external @opencode-ai/plugin --external zod",
+    "prepublishOnly": "bun run build"
   },
   "engines": {
     "opencode": ">=1.15.0"
