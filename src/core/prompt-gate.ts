@@ -56,9 +56,8 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-// Internal message injection gate. Ported semantics from oh-my-openagent's
-// prompt-async-gate: per-session reservation, semantic dedupe over a recent
-// dispatch window, wait-for-idle settling, and explicit release.
+// Internal message injection gate: per-session reservation, semantic dedupe
+// over a recent dispatch window, wait-for-idle settling, and explicit release.
 // EVERY internal prompt Prism sends to a parent session goes through here.
 export class PromptGate {
   private state = new Map<string, SessionState>()

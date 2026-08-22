@@ -37,7 +37,6 @@ export interface BgTask {
   concurrencyKey?: string
   /** Stable key for re-acquiring a concurrency slot on resume. */
   concurrencyGroup: string
-  suppressTmux?: boolean
 }
 
 export interface LaunchInput {
@@ -49,7 +48,6 @@ export interface LaunchInput {
   system?: string
   parentSessionId: string
   agent?: string
-  suppressTmux?: boolean
   /** Pin the child session's model (e.g. the gate-checked vision model). Default: resolve the parent session's current model. */
   model?: ResolvedModel
 }

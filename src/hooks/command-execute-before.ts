@@ -2,7 +2,9 @@ import { MAX_SUBTASKS } from "../config/constants"
 import type { BackgroundManager } from "../core/background/manager"
 import type { BgTask } from "../core/background/types"
 import type { SplitService } from "../core/split/service"
-import type { PrismClient } from "../core/client-types"
+import type { VisionPipeline } from "../core/vision/pipeline"
+import { guessImageMime } from "../core/vision/detector"
+import { VISION_NO_MODEL_HINT } from "../core/vision/interpreter"
 
 type CommandInput = { command: string; sessionID: string; arguments: string }
 type CommandOutput = { parts: Array<{ type: string; text?: string; [key: string]: unknown }> }
@@ -36,6 +38,9 @@ function formatTaskOutput(manager: BackgroundManager, taskID: string, fullSessio
   if (task.resultText) lines.push(`\n结果:\n${task.resultText.slice(0, 2000)}`)
   if (fullSession && task.sessionId) {
     lines.push(`\n完整会话: opencode attach ${serverUrl} --session ${task.sessionId}`)
+    if (process.env.OPENCODE_SERVER_PASSWORD) {
+      lines.push("（服务端已启用密码认证，attach 前需设置 OPENCODE_SERVER_PASSWORD 环境变量）")
+    }
   }
   return lines.join("\n")
 }
@@ -56,6 +61,20 @@ function checkTaskOwnership(
 }
 
 const FLAG_PATTERN = /--(dry-run|sequential)\b|--max(?:\s+|=)(\d+)/g
+
+// /vision <path/URL ... | last> [--goal <text>]: everything after --goal is
+// the goal (it may contain spaces); the rest splits into image references.
+function parseVisionArgs(argumentsText: string): { targets: string[]; goal?: string } {
+  let goal: string | undefined
+  let remainder = argumentsText
+  const goalMatch = remainder.match(/--goal(?:=|\s+)([\s\S]+)$/)
+  if (goalMatch) {
+    goal = goalMatch[1]!.trim()
+    remainder = remainder.slice(0, goalMatch.index)
+  }
+  const targets = remainder.trim().split(/\s+/).filter(Boolean)
+  return { targets, goal }
+}
 
 function parseSplitArgs(argumentsText: string): {
   task: string
@@ -87,11 +106,34 @@ function parseSplitArgs(argumentsText: string): {
 export function createCommandExecuteBeforeHook(args: {
   manager: BackgroundManager
   splitService: SplitService
-  client: PrismClient
   serverUrl: string
+  vision: VisionPipeline
 }) {
   return async (input: CommandInput, output: CommandOutput): Promise<void> => {
     const argumentsText = input.arguments.trim()
+
+    if (input.command === "vision") {
+      const { targets, goal } = parseVisionArgs(argumentsText)
+      if (targets.length === 0) {
+        pushText(output, "用法: /vision <图片路径/URL ... | last> [--goal <关注点>]\nlast = 解读本会话最近的一张图片")
+        return
+      }
+      // "last" resolves the most recent image message of THIS session — a
+      // user pasting an image has no URL the command arguments could carry.
+      if (targets.length === 1 && targets[0] === "last") {
+        const result = await args.vision.lookLatest(input.sessionID, goal)
+        if (result.notFound) {
+          pushText(output, "当前会话没有找到任何图片消息。请改用图片的本地路径/URL")
+        } else {
+          pushText(output, result.text ?? VISION_NO_MODEL_HINT)
+        }
+        return
+      }
+      const images = targets.map((target) => ({ mime: guessImageMime(target), url: target }))
+      const text = await args.vision.look(input.sessionID, images, goal)
+      pushText(output, text ?? VISION_NO_MODEL_HINT)
+      return
+    }
 
     if (input.command === "bg") {
       if (argumentsText === "status" || argumentsText === "list") {
@@ -124,6 +166,24 @@ export function createCommandExecuteBeforeHook(args: {
       if (argumentsText === "cancel") {
         await args.manager.cancelAllByParentSession(input.sessionID, "/bg cancel")
         pushText(output, "已取消当前会话的全部后台任务")
+        return
+      }
+      // resume <task_id> <追问>: continue a finished task's child session in
+      // place — the child keeps its context, no re-launch needed.
+      const resumeMatch = argumentsText.match(/^resume\s+(\S+)\s+([\s\S]+)$/)
+      if (resumeMatch) {
+        const taskID = resumeMatch[1]!
+        const owned = checkTaskOwnership(args.manager, input.sessionID, taskID)
+        if (!owned.ok) {
+          pushText(output, owned.error)
+          return
+        }
+        try {
+          await args.manager.resume(taskID, resumeMatch[2]!)
+          pushText(output, `任务 \`${taskID}\` 已恢复运行（追问已发送到其子会话），结束后会收到通知`)
+        } catch (error) {
+          pushText(output, `恢复失败: ${error instanceof Error ? error.message : String(error)}`)
+        }
         return
       }
       return

@@ -90,16 +90,35 @@ export class SplitService {
     })
 
     void run.done.then(async () => {
-      await this.deps.gate.dispatch({
-        sessionID: request.sessionID,
-        source: "split-aggregation",
-        text: buildSplitReport(run.tasksByPlanID, plans),
-      })
+      const text = buildSplitReport(run.tasksByPlanID, plans, run.skippedPlanIDs)
+      const dispatch = () =>
+        this.deps.gate.dispatch({
+          sessionID: request.sessionID,
+          source: "split-aggregation",
+          text,
+        })
+      let result = await dispatch()
+      if (result.status === "failed") {
+        // The aggregation is the only record of the whole run — callers do not
+        // re-enqueue, so give it one more chance after a pause.
+        this.logger("[prism] split: aggregation dispatch failed, retrying once", {
+          sessionID: request.sessionID,
+          error: result.error,
+        })
+        await new Promise((resolve) => setTimeout(resolve, 2_000))
+        result = await dispatch()
+        if (result.status === "failed") {
+          this.logger("[prism] split: aggregation dispatch failed permanently (report lost)", {
+            sessionID: request.sessionID,
+            error: result.error,
+          })
+        }
+      }
     })
 
     return {
       kind: "launched",
-      message: `拆分计划已启动：${plans.length} 个子任务，按依赖分层并发执行。每个子任务实时显示在 tmux pane 和 toast 中，全部完成后会收到汇总通知。`,
+      message: `拆分计划已启动：${plans.length} 个子任务，按依赖分层并发执行。子任务进度通过 toast 展示，全部完成后会收到汇总通知。`,
       run,
     }
   }

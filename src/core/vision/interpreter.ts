@@ -23,16 +23,36 @@ export const VISION_SYSTEM_PROMPT = [
 ].join("\n")
 
 // Per-call instruction (user message); system-level behavior lives in
-// VISION_SYSTEM_PROMPT. Keep this specific to what THIS call needs.
-export const VISION_INSTRUCTION = "请解读以下图片。".trim()
+// VISION_SYSTEM_PROMPT. A caller-supplied goal focuses the interpretation on
+// what is actually needed (higher signal, fewer tokens back into context).
+export const VISION_INSTRUCTION = "请解读以下图片。"
+
+export function makeVisionInstruction(goal?: string): string {
+  const trimmed = goal?.trim()
+  if (!trimmed) return VISION_INSTRUCTION
+  return `${VISION_INSTRUCTION}\n重点关注：${trimmed}\n只回答与关注点相关的内容。`
+}
+
+// Shared user-facing hint for every manual interpretation surface
+// (vision_look tool, /vision command) when no vision model is available.
+export const VISION_NO_MODEL_HINT =
+  "视觉解读失败: 无可用视觉模型（vision.model 配置不可用，或未配置且主会话模型不支持图片）。请配置 prism 的 vision.model，或切换到支持图片的主会话模型"
 
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+export interface InterpretationOutcome {
+  /** The interpretation text, or null on failure. */
+  text: string | null
+  /** True when the wait timed out — a retry would only stall the caller again. */
+  timedOut: boolean
+}
+
 // Run a sync vision interpretation: create a child session with the vision
 // model, send the images, poll until idle, return the interpretation text.
-// Returns null on timeout or chain-level failure (caller degrades gracefully).
+// Returns text=null on failure (caller degrades gracefully); timedOut tells
+// the retry logic in the pipeline which failures are worth retrying.
 export async function runVisionInterpretation(args: {
   client: PrismClient
   directory: string
@@ -42,10 +62,10 @@ export async function runVisionInterpretation(args: {
   instruction?: string
   timeoutMs?: number
   /** Fired with the child session id right after creation — the caller uses
-   *  it to guard against the child's own injected prompt re-triggering an
+   *  it to guard against the child's own tool output re-triggering an
    *  interpretation (which would recurse unboundedly). */
   onSessionCreated?: (sessionID: string) => void
-}): Promise<string | null> {
+}): Promise<InterpretationOutcome> {
   const {
     client,
     directory,
@@ -59,7 +79,7 @@ export async function runVisionInterpretation(args: {
   const normalized = await normalizeImageBatch(images, directory)
   if (normalized.length === 0) {
     log("[prism] vision: no usable images after normalization")
-    return null
+    return { text: null, timedOut: false }
   }
 
   // The client resolves 4xx/5xx with { error }; network failures reject, so
@@ -79,11 +99,11 @@ export async function runVisionInterpretation(args: {
     })
   } catch (error) {
     log("[prism] vision: failed to create child session", { error })
-    return null
+    return { text: null, timedOut: false }
   }
   if (createResult.error || !createResult.data?.id) {
     log("[prism] vision: failed to create child session", { error: createResult.error })
-    return null
+    return { text: null, timedOut: false }
   }
   const sessionID = createResult.data.id
   args.onSessionCreated?.(sessionID)
@@ -111,7 +131,7 @@ export async function runVisionInterpretation(args: {
 
     if (promptError) {
       log("[prism] vision: promptAsync failed", { sessionID, error: promptError })
-      return null
+      return { text: null, timedOut: false }
     }
 
     const deadline = Date.now() + timeoutMs
@@ -121,7 +141,7 @@ export async function runVisionInterpretation(args: {
         .messages({ path: { id: sessionID }, query: { directory } })
         .catch(() => null)
       const text = messagesResponse ? lastAssistantText(messagesResponse.data) : null
-      if (text !== null) return text
+      if (text !== null) return { text, timedOut: false }
 
       // The status map only contains non-idle sessions (idle entries are
       // removed when they settle), so an absent entry means idle — but ONLY
@@ -137,18 +157,17 @@ export async function runVisionInterpretation(args: {
       }
       if (observedBusy && (status === undefined || status === "idle")) {
         // settled without assistant text: model produced nothing usable
-        return null
+        return { text: null, timedOut: false }
       }
       await sleep(VISION_INTERPRET_POLL_MS)
     }
 
     log("[prism] vision: interpretation timed out", { sessionID, timeoutMs })
-    return null
+    return { text: null, timedOut: true }
   } finally {
-    // Fire-and-forget cleanup: the caller (chat.message hook) blocks the
-    // message pipeline while this runs, so the abort must not add its own
-    // latency to the hook's return. The server tears the session down
-    // regardless of whether this promise settles first.
+    // Fire-and-forget cleanup: callers may be blocking a hook while this
+    // runs, so the abort must not add its own latency. The server tears the
+    // session down regardless of whether this promise settles first.
     client.session.abort({ path: { id: sessionID } }).catch(() => {})
   }
 }

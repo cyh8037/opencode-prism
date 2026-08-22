@@ -18,3 +18,30 @@ export function lastAssistantText(messages: unknown): string | null {
   }
   return null
 }
+
+// Concatenate EVERY completed assistant text in message order, capped at
+// maxChars. Used for background-task results: a multi-turn child session's
+// intermediate conclusions matter as much as its final line, and "last text
+// only" silently dropped them.
+export function collectAssistantText(messages: unknown, maxChars: number): string | null {
+  if (!Array.isArray(messages)) return null
+  const collected: string[] = []
+  let total = 0
+  for (const message of messages) {
+    const record = message as { info?: { role?: string }; parts?: unknown[] }
+    if (record.info?.role !== "assistant") continue
+    for (const part of record.parts ?? []) {
+      const p = part as { type?: string; text?: string; state?: { status?: string } } | undefined
+      if (p?.type !== "text" || !p.text?.trim()) continue
+      if (p.state && p.state.status !== "completed") continue
+      // The "\n\n" join separator counts against the cap.
+      const budget = maxChars - total - (collected.length > 0 ? 2 : 0)
+      if (budget <= 0) break
+      const slice = p.text.slice(0, budget)
+      collected.push(slice)
+      total += slice.length + (collected.length > 1 ? 2 : 0)
+      if (total >= maxChars) break
+    }
+  }
+  return collected.length > 0 ? collected.join("\n\n") : null
+}

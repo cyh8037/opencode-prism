@@ -51,7 +51,7 @@ provider 快照正确过滤为已连接子集（1 个），vision 链警告正�
 
 **发现的问题（1 个，已知边界）:**
 
-`opencode run` 非交互模式在主会话结束后退出进程，dispose → shutdown 中止了仍在运行的子任务（日志 `shutting down BackgroundManager`）。TUI 模式下会话常驻，后台任务正常存活。修复方向：CLI run 模式 continuation marker（保持一个未完成 todo 直到后台任务清空），参考 oh-my-openagent 的 background-task-marker 机制，列为后续里程碑。
+`opencode run` 非交互模式在主会话结束后退出进程，dispose → shutdown 中止了仍在运行的子任务（日志 `shutting down BackgroundManager`）。TUI 模式下会话常驻，后台任务正常存活。修复方向：CLI run 模式 continuation marker（保持一个未完成 todo 直到后台任务清空），列为后续里程碑。
 
 ## WHY IT IS ENOUGH
 

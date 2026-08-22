@@ -10,29 +10,33 @@ const FETCH_TIMEOUT_MS = 10_000
 // Detect bare local filesystem paths (as opposed to URLs): absolute POSIX,
 // relative, dotfiles, home-relative, Windows drive paths, UNC, and bare
 // relative filenames with a supported image extension ("shot.png",
-// "assets/shot.PNG"). file:// URLs are not matched here: they go through
-// fetch, which Bun supports natively.
+// "assets/shot.PNG"). Backslashes are normalized to "/" first so Windows-style
+// relative paths (".\shot.png") are recognized too. file:// URLs are not
+// matched here: only http(s) URLs may go through fetch.
 function isLocalPath(url: string): boolean {
+  const normalized = url.replace(/\\/g, "/")
   return (
-    url.startsWith("/") ||
-    url.startsWith("./") ||
-    url.startsWith("../") ||
-    url.startsWith("~/") ||
-    /^\.[^/]/.test(url) || // dotfiles like .screenshot.png
-    url.startsWith("\\\\") || // Windows UNC
-    /^[A-Za-z]:[\\/]/.test(url) ||
+    normalized.startsWith("/") ||
+    normalized.startsWith("./") ||
+    normalized.startsWith("../") ||
+    normalized.startsWith("~/") ||
+    normalized.startsWith("//") || // Windows UNC after normalization
+    /^\.[^/]/.test(normalized) || // dotfiles like .screenshot.png
+    /^[A-Za-z]:\//.test(normalized) ||
     // Fallback: bare filenames and unprefixed relative paths ending in a
     // supported image extension. The ":" ban keeps scheme-bearing URLs
     // (https://, file://) out; drive paths carry ":" but match above.
-    /^[^:]+\.(png|jpe?g|gif|webp)$/i.test(url)
+    /^[^:]+\.(png|jpe?g|gif|webp)$/i.test(normalized)
   )
 }
 
-// Relative paths resolve against the opencode project directory.
+// Relative paths resolve against the opencode project directory. Backslashes
+// are normalized in the relative case so ".\shot.png" typed on Windows also
+// resolves on the POSIX host running the server.
 function expandLocalPath(url: string, baseDir: string): string {
   if (url.startsWith("~/")) return resolve(homedir(), url.slice(2))
   if (isAbsolute(url) || url.startsWith("\\\\") || /^[A-Za-z]:[\\/]/.test(url)) return url
-  return resolve(baseDir, url)
+  return resolve(baseDir, url.replace(/\\/g, "/"))
 }
 
 // Magic-byte sniff for the four supported image formats. Real files always
@@ -87,16 +91,63 @@ function normalizeLocalImage(image: ImageAttachment, baseDir: string): ImageAtta
   }
 }
 
+// data: URLs carry their bytes inline, so the same 8MB cap and magic-byte
+// sniff as file/remote sources apply — a claimed mime is never trusted.
+function normalizeDataUrl(image: ImageAttachment): ImageAttachment | null {
+  const match = image.url.match(/^data:([^;,]*)(;[^,]*)?,(.*)$/s)
+  if (!match) {
+    log(`[prism] vision: malformed data URL, skipping`, { url: image.url.slice(0, 64) })
+    return null
+  }
+  const payload = match[3] ?? ""
+  // Pre-check on the base64 length (4 chars per 3 bytes) so an oversized
+  // payload is rejected before the decode allocates.
+  if (payload.length > Math.ceil((VISION_IMAGE_MAX_BYTES / 3) * 4)) {
+    log(`[prism] vision: data URL exceeds 8MB, skipping`, { url: image.url.slice(0, 64) })
+    return null
+  }
+  try {
+    const bytes = new Uint8Array(Buffer.from(payload, "base64"))
+    if (bytes.byteLength > VISION_IMAGE_MAX_BYTES) {
+      log(`[prism] vision: data URL exceeds 8MB, skipping`, { url: image.url.slice(0, 64) })
+      return null
+    }
+    const mime = sniffImageMime(bytes)
+    if (!mime) {
+      log(`[prism] vision: data URL is not a supported image, skipping`, { url: image.url.slice(0, 64) })
+      return null
+    }
+    return { ...image, mime }
+  } catch (error) {
+    log(`[prism] vision: data URL decode failed`, { url: image.url.slice(0, 64), error })
+    return null
+  }
+}
+
 // Convert remote image URLs to data URLs so every vision provider can consume
-// them. Local data: URLs pass through, bare filesystem paths are read from
-// disk. Oversized and non-image responses are dropped with a note so the
-// batch still proceeds.
+// them. Local data: URLs are validated (size + magic bytes), bare filesystem
+// paths are read from disk. Only http(s) URLs are fetched: other protocols
+// (file:, ftp:, ...) are rejected — fetch on Bun would happily read local
+// files via file://, which is an arbitrary-local-file-read hole when the URL
+// comes from tool output.
 export async function normalizeImageUrl(
   image: ImageAttachment,
   baseDir = process.cwd(),
 ): Promise<ImageAttachment | null> {
-  if (image.url.startsWith("data:")) return image
+  if (image.url.startsWith("data:")) return normalizeDataUrl(image)
   if (isLocalPath(image.url)) return normalizeLocalImage(image, baseDir)
+
+  let parsed: URL
+  try {
+    parsed = new URL(image.url)
+  } catch {
+    log(`[prism] vision: invalid image URL, skipping`, { url: image.url })
+    return null
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    log(`[prism] vision: unsupported image URL protocol, skipping`, { url: image.url, protocol: parsed.protocol })
+    return null
+  }
 
   try {
     const response = await fetch(image.url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) })

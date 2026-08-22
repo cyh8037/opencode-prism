@@ -37,17 +37,7 @@ export interface PrismTui {
   showToast(params: { body: { title: string; message: string; variant: string; duration: number } }): Promise<unknown>
 }
 
-export interface PrismProviderListResult {
-  data?: {
-    connected?: string[]
-    all?: Array<{ id: string; models?: Record<string, unknown> }>
-  }
-}
-
 export interface PrismClient {
   session: PrismSession
   tui: PrismTui
-  provider?: {
-    list?: () => Promise<PrismProviderListResult>
-  }
 }

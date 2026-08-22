@@ -13,7 +13,8 @@ export interface SplitRunOptions {
 export interface SplitRunResult {
   /** Live map: plan id -> background task (filled as tasks launch). */
   tasksByPlanID: Map<string, BgTask>
-  failed: BgTask[]
+  /** Plans never launched because an upstream dependency failed. plan id -> failed dep id. */
+  skippedPlanIDs: Map<string, string>
   /** Resolves when every launched subtask reached a terminal status. */
   done: Promise<void>
 }
@@ -28,6 +29,7 @@ export function runSplit(manager: BackgroundManager, options: SplitRunOptions): 
   const tasksByPlanID = new Map<string, BgTask>()
   const launchedPlanIDs = new Set<string>()
   const terminalPlanIDs = new Set<string>()
+  const skippedPlanIDs = new Map<string, string>()
 
   let resolveDone: () => void = () => {}
   const done = new Promise<void>((resolve) => {
@@ -67,6 +69,18 @@ export function runSplit(manager: BackgroundManager, options: SplitRunOptions): 
     }
   }
 
+  // A dependency that ended in error/cancelled (or was itself skipped) means
+  // the dependent would build on a missing/empty result — skip it and cascade
+  // to everything downstream.
+  const failedDependency = (plan: SubTaskPlan): string | undefined => {
+    for (const depID of plan.dependsOn) {
+      if (skippedPlanIDs.has(depID)) return depID
+      const depTask = tasksByPlanID.get(depID)
+      if (depTask && (depTask.status === "error" || depTask.status === "cancelled")) return depID
+    }
+    return undefined
+  }
+
   const launchReady = (): void => {
     if (options.sequential) {
       const anyActive = Array.from(tasksByPlanID.values()).some(
@@ -75,8 +89,18 @@ export function runSplit(manager: BackgroundManager, options: SplitRunOptions): 
       if (anyActive) return
     }
 
+    let skippedThisPass = 0
     for (const plan of plans) {
       if (launchedPlanIDs.has(plan.id)) continue
+
+      const failedDep = failedDependency(plan)
+      if (failedDep) {
+        launchedPlanIDs.add(plan.id)
+        skippedPlanIDs.set(plan.id, failedDep)
+        terminalPlanIDs.add(plan.id)
+        skippedThisPass++
+        continue
+      }
 
       const depsTerminal = plan.dependsOn.every((depID) => terminalPlanIDs.has(depID))
       if (!depsTerminal) continue
@@ -101,6 +125,13 @@ export function runSplit(manager: BackgroundManager, options: SplitRunOptions): 
 
       if (options.sequential) return
     }
+
+    // Skips can cascade (a skipped plan fails its own dependents); re-run
+    // until a pass skips nothing new.
+    if (skippedThisPass > 0) {
+      checkSettled()
+      launchReady()
+    }
   }
 
   launchReady()
@@ -111,18 +142,23 @@ export function runSplit(manager: BackgroundManager, options: SplitRunOptions): 
 
   return {
     tasksByPlanID,
-    get failed() {
-      return Array.from(tasksByPlanID.values()).filter(
-        (task) => task.status === "error" || task.status === "cancelled",
-      )
-    },
+    skippedPlanIDs,
     done,
   }
 }
 
-export function buildSplitReport(tasksByPlanID: Map<string, BgTask>, plans: SubTaskPlan[]): string {
+export function buildSplitReport(
+  tasksByPlanID: Map<string, BgTask>,
+  plans: SubTaskPlan[],
+  skippedPlanIDs: Map<string, string> = new Map(),
+): string {
   const lines = ["<system-reminder>", "[PRISM SPLIT REPORT]", ""]
   for (const plan of plans) {
+    const skippedDep = skippedPlanIDs.get(plan.id)
+    if (skippedDep) {
+      lines.push(`- ${plan.id} ${plan.title}: SKIPPED (上游 ${skippedDep} 失败，未启动)`)
+      continue
+    }
     const task = tasksByPlanID.get(plan.id)
     if (!task) {
       lines.push(`- ${plan.id} ${plan.title}: 未启动`)

@@ -13,7 +13,7 @@ import type { ResolvedModel } from "../../models"
 import { isAgentNotFoundError, shouldRetryError, type ErrorInfo } from "../../models"
 import { errorInfoFromResult } from "../../shared/api-result"
 import { log } from "../../shared/log"
-import { lastAssistantText } from "../assistant-text"
+import { collectAssistantText } from "../assistant-text"
 import type { PrismClient } from "../client-types"
 import type { PromptGate } from "../prompt-gate"
 import { ConcurrencyManager } from "./concurrency"
@@ -23,21 +23,12 @@ import type { BgTask, LaunchInput, QueueItem, SessionStatusMap } from "./types"
 // parent session's current model; returns undefined when unavailable.
 export type ResolveModelFn = (parentSessionID: string) => Promise<ResolvedModel | undefined>
 
-export interface TaskSessionEvent {
-  sessionID: string
-  parentID: string
-  description: string
-  directory: string
-}
-
 export interface BackgroundManagerDeps {
   client: PrismClient
   directory: string
   config: PrismConfig
   gate: PromptGate
   resolveModel: ResolveModelFn
-  onSessionCreated?: (event: TaskSessionEvent) => void
-  onSessionDeleted?: (event: { sessionID: string }) => void
   logger?: typeof log
   pollingIntervalMs?: number
 }
@@ -98,6 +89,8 @@ export class BackgroundManager {
   private pollingInterval?: ReturnType<typeof setInterval>
   private pollingInFlight = false
   private shutdownTriggered = false
+  /** Running tasks already warned about exceeding the TTL (warn once). */
+  private ttlWarned = new Set<string>()
   private logger: typeof log
 
   constructor(private deps: BackgroundManagerDeps) {
@@ -186,7 +179,6 @@ export class BackgroundManager {
       status: "pending",
       queuedAt: new Date(),
       concurrencyGroup: this.concurrencyKeyFor(model),
-      suppressTmux: input.suppressTmux,
     }
 
     this.addTask(task)
@@ -315,15 +307,6 @@ export class BackgroundManager {
     task.progress = { toolCalls: 0, lastUpdate: new Date() }
     task.concurrencyKey = this.concurrencyKeyFor(model)
 
-    if (!task.suppressTmux) {
-      this.deps.onSessionCreated?.({
-        sessionID,
-        parentID: input.parentSessionId,
-        description: input.description,
-        directory: parentDirectory,
-      })
-    }
-
     this.startPolling()
 
     // The prompt API's model reference is { providerID, modelID } — the
@@ -434,7 +417,6 @@ export class BackgroundManager {
       task.sessionId = undefined
       task.status = "pending"
       await this.abortSession(previousSessionID, "same-model retry")
-      this.deps.onSessionDeleted?.({ sessionID: previousSessionID })
     }
 
     // The task may have been cancelled while the abort was in flight; let the
@@ -460,7 +442,6 @@ export class BackgroundManager {
         system: task.system,
         parentSessionId: task.parentSessionId,
         agent: task.agent,
-        suppressTmux: task.suppressTmux,
       },
       model,
     })
@@ -618,10 +599,12 @@ export class BackgroundManager {
       if (!Array.isArray(messages)) return false
 
       // Authoritative result capture: part-level events carry no role/state
-      // (role lives on the message), so the final assistant text is read from
-      // the message history right before the task completes.
+      // (role lives on the message), so the assistant text is read from the
+      // message history right before the task completes. ALL completed
+      // assistant texts are joined (capped) so multi-turn children keep
+      // their intermediate conclusions.
       if (task && !task.resultText) {
-        const text = lastAssistantText(messages)
+        const text = collectAssistantText(messages, MAX_NOTIFICATION_RESULT_CHARS)
         if (text) task.resultText = text
       }
 
@@ -665,14 +648,6 @@ export class BackgroundManager {
     // dedupe set are only needed while the task can still launch or retry.
     task.parts = undefined
     if (task.progress) task.progress.toolPartIds = undefined
-    // Close the visualization pane for EVERY terminal transition, not just
-    // the complete/cancel paths: error-terminal tasks (agent not found, retry
-    // exhausted, polled error) used to leave placeholder panes looping
-    // forever. cancelTask/tryRetry clear sessionId before finalizing and
-    // close the pane explicitly with the saved id; closePane is idempotent.
-    if (task.sessionId) {
-      this.deps.onSessionDeleted?.({ sessionID: task.sessionId })
-    }
     if (task.concurrencyKey) {
       this.concurrency.release(task.concurrencyKey)
       task.concurrencyKey = undefined
@@ -693,8 +668,7 @@ export class BackgroundManager {
     // Reserve the parent gate BEFORE flipping status: between the flip and the
     // wake landing, hasActiveChildTasks() would already report false. The
     // reservation only covers the flip-to-notification queue window; the
-    // actual gate dispatch happens after release (same two-phase design as
-    // oh-my-openagent's notification-preparation reservation). Release is
+    // actual gate dispatch happens after release. Release is
     // scoped to this reservation's source: when two completions overlap, an
     // earlier holder's release must not clear the later holder's reservation.
     const reservationSource = `background-completion:${task.id}`
@@ -739,7 +713,6 @@ export class BackgroundManager {
       // re-enter cancellation for the same task.
       task.sessionId = undefined
       await this.abortSession(sessionID, `task cancellation (${source})`)
-      this.deps.onSessionDeleted?.({ sessionID })
     }
 
     this.finalizeTask(task, "cancelled", options?.reason)
@@ -848,7 +821,9 @@ export class BackgroundManager {
         const singleCompleted = allComplete && siblingTasks.length === 1 && task.status === "completed"
         const resultText = (task.resultText ?? "").trim()
         const fullResult = singleCompleted && resultText.length > 0
-        const truncated = resultText.length > MAX_NOTIFICATION_RESULT_CHARS
+        // >= : resultText was itself captured with the same cap, so hitting
+        // the cap exactly still means the full output is longer.
+        const truncated = resultText.length >= MAX_NOTIFICATION_RESULT_CHARS
 
         const lines = [
           "<system-reminder>",
@@ -1012,11 +987,28 @@ export class BackgroundManager {
       if (task.status === "running" || task.status === "pending") {
         const anchor = task.startedAt ?? task.queuedAt
         if (anchor && now - anchor.getTime() > TASK_TTL_MS) {
-          this.logger("[prism] pruning stale task", { taskId: task.id })
-          void this.cancelTask(task.id, {
-            source: "stale-prune",
-            reason: "task exceeded the 30 minute TTL",
-          })
+          if (task.status === "pending") {
+            // A queued task stuck past the TTL is an anomaly (dead queue,
+            // leaked slot) — cancelling is safe.
+            this.logger("[prism] pruning stale queued task", { taskId: task.id })
+            void this.cancelTask(task.id, {
+              source: "stale-prune",
+              reason: "queued task exceeded the 30 minute TTL",
+            })
+          } else if (!this.ttlWarned.has(task.id)) {
+            // A RUNNING task past the TTL may be legitimate long work —
+            // warn once and let it run; a hard cancel killed real tasks.
+            this.ttlWarned.add(task.id)
+            this.logger("[prism] running task exceeded the TTL (warning only, not cancelled)", {
+              taskId: task.id,
+            })
+            this.showToast(
+              "Prism background task",
+              `任务 ${task.id} 已运行超过 30 分钟，仍在继续（不会自动取消）`,
+              "warning",
+              6000,
+            )
+          }
         }
         continue
       }
@@ -1025,6 +1017,7 @@ export class BackgroundManager {
       // how long a batch can outlive a sibling, so a 1h window is safe.
       if (task.completedAt && now - task.completedAt.getTime() > TERMINAL_TASK_RETENTION_MS) {
         this.logger("[prism] pruning retained terminal task", { taskId: task.id })
+        this.ttlWarned.delete(task.id)
         this.removeTask(task)
       }
     }
@@ -1039,12 +1032,6 @@ export class BackgroundManager {
       .filter((task) => task.status === "running" && task.sessionId)
       .map((task) => this.abortSession(task.sessionId!, "shutdown"))
     await Promise.allSettled(aborts)
-
-    for (const task of this.tasks.values()) {
-      if (task.sessionId) {
-        this.deps.onSessionDeleted?.({ sessionID: task.sessionId })
-      }
-    }
 
     this.concurrency.clear()
     this.tasks.clear()

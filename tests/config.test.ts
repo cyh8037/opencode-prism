@@ -27,11 +27,20 @@ describe("parseConfig", () => {
     expect(config.vision.mode).toBe("sync")
   })
 
-  test("multiple invalid sections all fall back without throwing", () => {
-    const config = parseConfig({ vision: 42, background: { concurrency: "many" }, tmux: null })
+  test("multiple invalid sections all fall back without throwing", async () => {
+    const config = parseConfig({ vision: 42, background: { concurrency: "many" } })
     expect(config.vision.mode).toBe("sync")
     expect(config.background.concurrency).toBe(5)
-    expect(config.tmux.enabled).toBe(true)
+  })
+
+  test("a legacy tmux config section is ignored without warnings", () => {
+    const warnings: string[] = []
+    const config = parseConfig(
+      { tmux: { enabled: true, layout: "tiled", isolation: "window" } },
+      warnings,
+    )
+    expect(warnings).toHaveLength(0)
+    expect(config.vision.mode).toBe("sync")
   })
 })
 

@@ -1,6 +1,9 @@
-// Minimal JSONC support: strips // and /* */ comments and trailing commas,
-// then parses with JSON.parse. String contents (URLs, regexes) are preserved.
-export function stripJsoncComments(source: string): string {
+// Minimal JSONC support in a single pass: strips // and /* */ comments and
+// trailing commas (only outside strings) while preserving string contents.
+// String-awareness is what makes trailing-comma stripping safe: a blind
+// regex over the text would corrupt values like "bracket, ]".
+
+export function stripJsonc(source: string): string {
   let output = ""
   let inString = false
   let inLineComment = false
@@ -47,6 +50,35 @@ export function stripJsoncComments(source: string): string {
     }
     if (char === '"') {
       inString = true
+      output += char
+      continue
+    }
+    if (char === ",") {
+      // Trailing comma: look ahead past whitespace and comments; drop the
+      // comma only if the next significant character closes the container.
+      let j = i + 1
+      let significant = ""
+      while (j < source.length) {
+        const c = source[j]
+        if (c === undefined) break
+        if (c === " " || c === "\t" || c === "\n" || c === "\r") {
+          j++
+          continue
+        }
+        if (c === "/" && source[j + 1] === "/") {
+          while (j < source.length && source[j] !== "\n") j++
+          continue
+        }
+        if (c === "/" && source[j + 1] === "*") {
+          j += 2
+          while (j < source.length && !(source[j] === "*" && source[j + 1] === "/")) j++
+          j += 2
+          continue
+        }
+        significant = c
+        break
+      }
+      if (significant === "}" || significant === "]") continue
     }
     output += char
   }
@@ -54,10 +86,6 @@ export function stripJsoncComments(source: string): string {
   return output
 }
 
-export function stripTrailingCommas(source: string): string {
-  return source.replace(/,\s*([}\]])/g, "$1")
-}
-
 export function parseJsonc(source: string): unknown {
-  return JSON.parse(stripTrailingCommas(stripJsoncComments(source)))
+  return JSON.parse(stripJsonc(source))
 }

@@ -5,27 +5,18 @@ import { join } from "node:path"
 import { lastAssistantText } from "../src/core/assistant-text"
 import { extractImageAttachments, extractImageParts } from "../src/core/vision/detector"
 import { normalizeImageUrl } from "../src/core/vision/image-utils"
+
+// A minimal valid PNG (magic bytes only) so the sniffing data-URL path
+// accepts it — fake base64 like "abc" is rejected by the magic-byte check.
+const FAKE_PNG_URL = `data:image/png;base64,${Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString("base64")}`
 import { createVisionLookTool } from "../src/tools/vision-look"
 import { VisionPipeline } from "../src/core/vision/pipeline"
-import { CurrentModelTracker, waitForVisionModel } from "../src/core/vision/model-tracker"
 import { BackgroundManager } from "../src/core/background/manager"
 import { PromptGate } from "../src/core/prompt-gate"
 import { parseConfig } from "../src/config/load"
 import type { PrismClient } from "../src/core/client-types"
 
 const VISION_MODEL = { providerID: "openai", modelID: "gpt-5.6-sol" }
-
-// The sync vision path fires the gate dispatch without awaiting it (the
-// chat.message hook must not be held up), so tests poll for the dispatched
-// marker instead of asserting synchronously.
-async function waitForRecentDispatch(gate: PromptGate, sessionID: string): Promise<void> {
-  const deadline = Date.now() + 1000
-  while (Date.now() < deadline) {
-    if (gate.hasRecentDispatch(sessionID)) return
-    await new Promise((resolve) => setTimeout(resolve, 10))
-  }
-  throw new Error("gate never recorded a recent dispatch")
-}
 
 describe("detector", () => {
   test("extracts image attachments from tool output", () => {
@@ -61,8 +52,8 @@ function pngBytes(): Uint8Array {
 
 describe("normalizeImageUrl", () => {
   test("passes data URLs through", async () => {
-    const image = await normalizeImageUrl({ mime: "image/png", url: "data:image/png;base64,abc" })
-    expect(image?.url).toBe("data:image/png;base64,abc")
+    const image = await normalizeImageUrl({ mime: "image/png", url: FAKE_PNG_URL })
+    expect(image?.url).toBe(FAKE_PNG_URL)
   })
 
   test("converts remote URLs to data URLs", async () => {
@@ -261,10 +252,8 @@ function createVisionHarness(mode: "sync" | "background" = "sync") {
     client,
     directory: "/work",
     config,
-    gate,
     background,
     getVisionModel: () => VISION_MODEL,
-    waitForVisionModel: async () => VISION_MODEL,
   })
   return { pipeline, client, config, gate, background, childSessions }
 }
@@ -276,7 +265,7 @@ describe("VisionPipeline", () => {
     await pipeline.onToolOutput(
       { tool: "screenshot", sessionID: "parent" },
       output,
-      [{ mime: "image/png", url: "data:image/png;base64,abc" }],
+      [{ mime: "image/png", url: FAKE_PNG_URL }],
     )
     expect(output.output).toContain("[prism vision]")
     expect(output.output).toContain("登录页截图")
@@ -285,43 +274,102 @@ describe("VisionPipeline", () => {
   test("tool output batches beyond the cap are noted in the output", async () => {
     const { pipeline } = createVisionHarness("sync")
     const output = { title: "screenshot", output: "screenshot taken" }
-    const images = Array.from({ length: 5 }, () => ({ mime: "image/png", url: "data:image/png;base64,abc" }))
+    const images = Array.from({ length: 5 }, () => ({ mime: "image/png", url: FAKE_PNG_URL }))
     await pipeline.onToolOutput({ tool: "screenshot", sessionID: "parent" }, output, images)
     expect(output.output).toContain("[prism vision] 图片解读")
     expect(output.output).toContain("1 张未解读")
   })
 
-  test("background vision tasks suppress tmux panes", async () => {
-    const { pipeline, background } = createVisionHarness("background")
-    await pipeline.onChatImages("parent", [{ mime: "image/png", url: "data:image/png;base64,abc" }])
-    const tasks = background.getTasksByParentSession("parent")
-    expect(tasks).toHaveLength(1)
-    // Interpretation tasks finish in seconds: no pane (panes are reserved for
-    // user-spawned /bg and /split work).
-    expect(tasks[0]?.suppressTmux).toBe(true)
-    await background.shutdown()
+  test("vision child session uses the configured model and carries the system prompt", async () => {
+    const { pipeline, childSessions } = createVisionHarness("sync")
+    await pipeline.onToolOutput(
+      { tool: "screenshot", sessionID: "parent" },
+      { title: "s", output: "taken" },
+      [{ mime: "image/png", url: FAKE_PNG_URL }],
+    )
+    const child = Array.from(childSessions.values())[0]
+    expect(child?.createdModel).toEqual({ id: "gpt-5.6-sol", providerID: "openai" })
+    const promptBody = child?.prompts[0] as Record<string, unknown>
+    expect(promptBody?.system).toContain("视觉分析专家")
+    expect(promptBody?.system).toContain("结构固定")
   })
 
-  // A prism child session's injected prompt (vision instruction + image)
-  // fires chat.message for the child; auto-interpreting it would spawn a
-  // grandchild interpretation, and so on, unbounded.
-  test("chat images on a prism child session do not re-trigger interpretation", async () => {
+  // A goal focuses the interpretation: the instruction sent to the child
+  // carries the caller's concern instead of the generic one-liner.
+  test("look with a goal sends a focused instruction", async () => {
+    const { pipeline, childSessions } = createVisionHarness("sync")
+    await pipeline.look("parent", [{ mime: "image/png", url: FAKE_PNG_URL }], "找出页面里的报错信息")
+    const promptBody = Array.from(childSessions.values())[0]?.prompts[0] as Record<string, unknown>
+    const parts = promptBody?.parts as Array<{ type: string; text?: string }>
+    expect(parts?.[0]?.text).toContain("重点关注")
+    expect(parts?.[0]?.text).toContain("找出页面里的报错信息")
+  })
+
+  test("look without a goal keeps the generic instruction", async () => {
+    const { pipeline, childSessions } = createVisionHarness("sync")
+    await pipeline.look("parent", [{ mime: "image/png", url: FAKE_PNG_URL }])
+    const promptBody = Array.from(childSessions.values())[0]?.prompts[0] as Record<string, unknown>
+    const parts = promptBody?.parts as Array<{ type: string; text?: string }>
+    expect(parts?.[0]?.text).toBe("请解读以下图片。")
+  })
+
+  // P2-4: a timed-out interpretation must NOT be retried — the model or
+  // network is slow and a second attempt would block the caller again.
+  test("a timed-out interpretation is not retried", async () => {
+    const { client } = createVisionHarness("sync")
+    const childSessions = new Map<string, { prompts: unknown[] }>()
+    let counter = 0
+    client.session.create = async () => {
+      counter += 1
+      const id = `slow_child_${counter}`
+      childSessions.set(id, { prompts: [] })
+      return { data: { id } }
+    }
+    client.session.messages = async () => ({ data: [] }) // never any text
+    client.session.status = async () => ({ data: { slow_child_1: { type: "busy" } } })
+    const pipeline = new VisionPipeline({
+      client,
+      directory: "/work",
+      config: parseConfig({ vision: { model: "openai/gpt-5.6-sol" } }),
+      background: new BackgroundManager({
+        client,
+        directory: "/work",
+        config: parseConfig({}),
+        gate: new PromptGate(client, { idlePollMs: 10 }),
+        resolveModel: async () => VISION_MODEL,
+        pollingIntervalMs: 60_000,
+      }),
+      getVisionModel: () => VISION_MODEL,
+      interpretTimeoutMs: 300,
+    })
+    const text = await pipeline.look("parent", [{ mime: "image/png", url: FAKE_PNG_URL }])
+    expect(text).toBeNull()
+    // exactly one child: the timeout suppressed the second attempt
+    expect(childSessions.size).toBe(1)
+  })
+
+  // A prism child session's tool output must not re-trigger interpretation —
+  // that would spawn a grandchild interpretation, and so on, unbounded.
+  test("tool output on a prism child session does not re-trigger interpretation", async () => {
     const { pipeline, background, childSessions } = createVisionHarness("sync")
     const task = await background.launch({ description: "parent task", prompt: "work", parentSessionId: "parent" })
     await new Promise((resolve) => setTimeout(resolve, 100))
     if (!task.sessionId) throw new Error("task never claimed a session")
 
     const before = childSessions.size
-    await pipeline.onChatImages(task.sessionId, [{ mime: "image/png", url: "data:image/png;base64,abc" }])
+    await pipeline.onToolOutput(
+      { tool: "screenshot", sessionID: task.sessionId },
+      { title: "s", output: "taken" },
+      [{ mime: "image/png", url: FAKE_PNG_URL }],
+    )
     expect(childSessions.size).toBe(before) // no grandchild interpretation
     await background.shutdown()
   })
 
   // Regression for the 2026-08-19 incident: sync-mode interpretation children
   // live outside the BackgroundManager, so the manager-based guard alone did
-  // not stop the child's own injected prompt from re-triggering — 1585 nested
-  // interpretation sessions were created in seconds and froze the TUI.
-  test("chat images on an in-flight sync interpretation child do not re-trigger", async () => {
+  // not stop the child's own output from re-triggering.
+  test("tool output on an in-flight sync interpretation child does not re-trigger", async () => {
     const { pipeline, client, childSessions } = createVisionHarness("sync")
     // Keep the interpretation in flight by blocking its output poll.
     let releasePoll!: () => void
@@ -335,341 +383,119 @@ describe("VisionPipeline", () => {
       return originalMessages(...args)
     }
 
-    const pending = pipeline.onChatImages("parent", [{ mime: "image/png", url: "data:image/png;base64,abc" }])
+    const pending = pipeline.onToolOutput(
+      { tool: "screenshot", sessionID: "parent" },
+      { title: "s", output: "taken" },
+      [{ mime: "image/png", url: FAKE_PNG_URL }],
+    )
     await blocked // interpretation child (child_1) created and now polling
 
     const before = childSessions.size
-    // The child's own injected prompt fires chat.message for the child:
-    await pipeline.onChatImages("child_1", [{ mime: "image/png", url: "data:image/png;base64,abc" }])
+    await pipeline.onToolOutput(
+      { tool: "screenshot", sessionID: "child_1" },
+      { title: "s", output: "taken" },
+      [{ mime: "image/png", url: FAKE_PNG_URL }],
+    )
     expect(childSessions.size).toBe(before) // no grandchild interpretation
 
     releasePoll()
     await pending
   })
 
-  test("vision child session uses the configured model and carries the system prompt", async () => {
-    const { pipeline, childSessions } = createVisionHarness("sync")
-    await pipeline.onToolOutput(
-      { tool: "screenshot", sessionID: "parent" },
-      { title: "s", output: "taken" },
-      [{ mime: "image/png", url: "data:image/png;base64,abc" }],
-    )
-    const child = Array.from(childSessions.values())[0]
-    expect(child?.createdModel).toEqual({ id: "gpt-5.6-sol", providerID: "openai" })
-    const promptBody = child?.prompts[0] as Record<string, unknown>
-    expect(promptBody?.system).toContain("视觉分析专家")
-    expect(promptBody?.system).toContain("结构固定")
-  })
-
-  test("sync mode injects chat-image interpretation via the gate", async () => {
-    const { pipeline, gate } = createVisionHarness("sync")
-    await pipeline.onChatImages("parent", [{ mime: "image/png", url: "data:image/png;base64,abc" }])
-    await waitForRecentDispatch(gate, "parent")
-  })
-
-  // Two-phase sync: the chat.message hook returns immediately (message list
-  // renders instantly) and messages.transform injects the interpretation into
-  // the FIRST LLM call's context — where it belongs — not into the history.
-  test("messages.transform injects the interpretation into the outgoing LLM context", async () => {
-    const { pipeline } = createVisionHarness("sync")
-    await pipeline.onChatImages("parent", [{ mime: "image/png", url: "data:image/png;base64,abc" }], "msg_1")
-    const messages = [
-      { info: { id: "msg_1", role: "user", sessionID: "parent" }, parts: [{ type: "file", mime: "image/png" }] },
-    ]
-    await pipeline.onMessagesTransform(messages)
-    expect(messages).toHaveLength(2)
-    const injected = messages[1] as { info?: { role?: string }; parts?: Array<{ text?: string }> }
-    expect(injected?.info?.role).toBe("user")
-    expect(injected?.parts?.[0]?.text).toContain("[PRISM VISION] 对话图片解读")
-    // Second call: the entry is consumed — nothing new is injected.
-    await pipeline.onMessagesTransform(messages)
-    expect(messages).toHaveLength(2)
-  })
-
-  test("a transform-claimed interpretation does not dispatch a duplicate wake", async () => {
-    const { pipeline, gate } = createVisionHarness("sync")
-    await pipeline.onChatImages("parent", [{ mime: "image/png", url: "data:image/png;base64,abc" }], "msg_2")
-    const messages = [{ info: { id: "msg_2", role: "user", sessionID: "parent" }, parts: [] }]
-    await pipeline.onMessagesTransform(messages)
-    await new Promise((resolve) => setTimeout(resolve, 100))
-    expect(gate.hasRecentDispatch("parent")).toBe(false)
-  })
-
-  // Regression: the chat.message hook input carries messageID only when the
-  // client generates one. When it does not, the committed message id lives on
-  // output.message — the hook must key the pending interpretation off that, or
-  // the transform can never claim it and the wake fallback double-fires.
-  test("chat.message hook keys off output.message.id when input.messageID is absent", async () => {
-    const { createChatMessageHook } = await import("../src/hooks/chat-message")
-    const harness = createVisionHarness("sync")
-    const hook = createChatMessageHook({
-      config: harness.config,
-      pipeline: harness.pipeline,
-      tracker: new CurrentModelTracker(),
-    })
-
-    // Realistic runtime shape: no messageID in input, the final id only on
-    // output.message (the info object opencode commits).
-    const input = { sessionID: "parent" }
-    const output = {
-      message: { id: "msg_hook1", role: "user" },
-      parts: [{ type: "file", mime: "image/png", url: "data:image/png;base64,abc" }],
-    }
-    await hook(input as never, output as never)
-
-    const messages = [{ info: { id: "msg_hook1", role: "user" }, parts: [] }]
-    await harness.pipeline.onMessagesTransform(messages)
-    expect(messages).toHaveLength(2)
-    const injected = messages[1] as { parts?: Array<{ text?: string }> }
-    expect(injected?.parts?.[0]?.text).toContain("[PRISM VISION] 对话图片解读")
-  })
-
-  // Regression: sessionID on the transform messages is not guaranteed on
-  // every runtime — matching must not depend on it, only on the message id.
-  test("messages.transform claims entries even when message info lacks sessionID", async () => {
-    const { pipeline } = createVisionHarness("sync")
-    await pipeline.onChatImages("parent", [{ mime: "image/png", url: "data:image/png;base64,abc" }], "msg_ns")
-    const messages = [{ info: { id: "msg_ns", role: "user" }, parts: [] }]
-    await pipeline.onMessagesTransform(messages)
-    expect(messages).toHaveLength(2)
-    const injected = messages[1] as { parts?: Array<{ text?: string }> }
-    expect(injected?.parts?.[0]?.text).toContain("[PRISM VISION] 对话图片解读")
-  })
-
-  test("messages.transform injects a failure note when the interpretation fails", async () => {
-    const { pipeline, client } = createVisionHarness("sync")
-    client.session.create = async () => ({ error: { message: "boom" } }) as never
-    await pipeline.onChatImages("parent", [{ mime: "image/png", url: "data:image/png;base64,abc" }], "msg_f")
-    const messages = [{ info: { id: "msg_f", role: "user", sessionID: "parent" }, parts: [] }]
-    await pipeline.onMessagesTransform(messages)
-    expect(messages).toHaveLength(2)
-    const injected = messages[1] as { parts?: Array<{ text?: string }> }
-    expect(injected?.parts?.[0]?.text).toContain("图片解读失败")
-  })
-
-  test("messages.transform skips prism child session contexts", async () => {
-    const { pipeline, background } = createVisionHarness("sync")
-    const task = await background.launch({ description: "parent task", prompt: "work", parentSessionId: "parent" })
-    await new Promise((resolve) => setTimeout(resolve, 100))
-    if (!task.sessionId) throw new Error("task never claimed a session")
-    const messages = [{ info: { id: "msg_c", role: "user", sessionID: task.sessionId }, parts: [] }]
-    await pipeline.onMessagesTransform(messages)
-    expect(messages).toHaveLength(1) // nothing injected for a child session
-    await background.shutdown()
-  })
-
-  test("unavailable vision model skips sync interpretation without creating a child session", async () => {
+  test("unavailable vision model skips interpretation without creating a child session", async () => {
     const harness = createVisionHarness("sync")
     const noModelPipeline = new VisionPipeline({
       client: harness.client,
       directory: "/work",
       config: harness.config,
-      gate: harness.gate,
       background: harness.background,
       getVisionModel: () => undefined,
-      waitForVisionModel: async () => undefined,
     })
     const output = { title: "screenshot", output: "taken" }
     await noModelPipeline.onToolOutput(
       { tool: "screenshot", sessionID: "parent" },
       output,
-      [{ mime: "image/png", url: "data:image/png;base64,abc" }],
+      [{ mime: "image/png", url: FAKE_PNG_URL }],
     )
     // fully skipped: output untouched AND no child session was ever created
     expect(output.output).toBe("taken")
     expect(harness.childSessions.size).toBe(0)
   })
+})
 
-  test("unavailable vision model skips background task launch", async () => {
-    const harness = createVisionHarness("background")
-    const noModelPipeline = new VisionPipeline({
-      client: harness.client,
-      directory: "/work",
-      config: harness.config,
-      gate: harness.gate,
-      background: harness.background,
-      getVisionModel: () => undefined,
-      waitForVisionModel: async () => undefined,
+describe("lookLatest (the \"last\" sentinel)", () => {
+  test("interprets the most recent image message of the session", async () => {
+    const { pipeline, client, childSessions } = createVisionHarness("sync")
+    client.session.messages = async () => ({
+      data: [
+        {
+          info: { role: "user" },
+          parts: [
+            { type: "text", text: "看看这个" },
+            { type: "file", mime: "image/png", url: FAKE_PNG_URL },
+          ],
+        },
+        { info: { role: "assistant" }, parts: [{ type: "text", text: "解读：这是一个登录页", state: { status: "completed" } }] },
+      ],
     })
-    await noModelPipeline.onChatImages("parent", [{ mime: "image/png", url: "data:image/png;base64,abc" }])
-    await new Promise((resolve) => setTimeout(resolve, 50))
-    expect(harness.background.getTasksByParentSession("parent")).toHaveLength(0)
+    const result = await pipeline.lookLatest("parent", "找出报错信息")
+    expect(result.notFound).toBe(false)
+    expect(result.text).toContain("这是一个登录页")
+    // the interpretation child got the session's image + the focused goal
+    const promptBody = Array.from(childSessions.values())[0]?.prompts[0] as Record<string, unknown>
+    const parts = promptBody?.parts as Array<{ type: string; text?: string }>
+    expect(parts?.[0]?.text).toContain("找出报错信息")
+    expect(JSON.stringify(promptBody)).toContain("data:image/png;base64,")
   })
 
-  test("chat images wait for the session's first capability snapshot (recalled image in a new session)", async () => {
-    const harness = createVisionHarness("sync")
-    let snapshotWaited = false
-    const pipeline = new VisionPipeline({
-      client: harness.client,
-      directory: "/work",
-      config: harness.config,
-      gate: harness.gate,
-      background: harness.background,
-      getVisionModel: () => undefined, // no snapshot yet at chat.message time
-      waitForVisionModel: async () => {
-        // the session's first chat.params arrives shortly after the message
-        await new Promise((resolve) => setTimeout(resolve, 100))
-        snapshotWaited = true
-        return VISION_MODEL
-      },
+  test("reports notFound when the session has no image messages", async () => {
+    const { pipeline, client } = createVisionHarness("sync")
+    client.session.messages = async () => ({
+      data: [{ info: { role: "user" }, parts: [{ type: "text", text: "纯文本" }] }],
     })
-    // Two-phase: onChatImages returns immediately; the snapshot wait and the
-    // interpretation run in the background (messages.transform will claim the
-    // result). Poll for the eventual child session.
-    await pipeline.onChatImages("parent", [{ mime: "image/png", url: "data:image/png;base64,abc" }], "msg_snap")
-    const deadline = Date.now() + 1000
-    while (Date.now() < deadline && !(snapshotWaited && harness.childSessions.size === 1)) {
-      await new Promise((resolve) => setTimeout(resolve, 10))
-    }
-    expect(snapshotWaited).toBe(true)
-    expect(harness.childSessions.size).toBe(1)
+    const result = await pipeline.lookLatest("parent")
+    expect(result.notFound).toBe(true)
+    expect(result.text).toBeNull()
   })
+})
 
-  test("chat images skip when no snapshot ever arrives", async () => {
-    const harness = createVisionHarness("sync")
-    const pipeline = new VisionPipeline({
-      client: harness.client,
-      directory: "/work",
-      config: harness.config,
-      gate: harness.gate,
-      background: harness.background,
-      getVisionModel: () => undefined,
-      waitForVisionModel: async () => {
-        await new Promise((resolve) => setTimeout(resolve, 50))
-        return undefined
-      },
-    })
-    await pipeline.onChatImages("parent", [{ mime: "image/png", url: "data:image/png;base64,abc" }], "msg_none")
-    // The background model resolution settles (no model) — nothing created.
-    await new Promise((resolve) => setTimeout(resolve, 150))
-    expect(harness.childSessions.size).toBe(0)
-  })
-
-  test("background vision pins the gate-checked model into the launch", async () => {
-    const harness = createVisionHarness("background")
-    const pinnedModel = { providerID: "openai", modelID: "gpt-5.6-sol" }
-    const pipeline = new VisionPipeline({
-      client: harness.client,
-      directory: "/work",
-      config: harness.config,
-      gate: harness.gate,
-      background: harness.background,
-      getVisionModel: () => pinnedModel,
-      waitForVisionModel: async () => pinnedModel,
-    })
-    await pipeline.onChatImages("parent", [{ mime: "image/png", url: "data:image/png;base64,abc" }])
-    await new Promise((resolve) => setTimeout(resolve, 100))
-    const tasks = harness.background.getTasksByParentSession("parent")
-    expect(tasks).toHaveLength(1)
-    const child = Array.from(harness.childSessions.values())[0]
-    // the child session was created with the pinned model (create uses the
-    // { id, providerID } shape; the prompt body uses { providerID, modelID })
-    expect(child?.createdModel).toEqual({ id: "gpt-5.6-sol", providerID: "openai" })
-    const promptBody = child?.prompts[0] as Record<string, unknown> | undefined
-    expect(promptBody?.model).toEqual({ providerID: "openai", modelID: "gpt-5.6-sol" })
-  })
-
-  test("background mode launches a vision background task with the system prompt", async () => {
-    const { pipeline, background, childSessions } = createVisionHarness("background")
-    await pipeline.onChatImages("parent", [{ mime: "image/png", url: "data:image/png;base64,abc" }])
-    await new Promise((resolve) => setTimeout(resolve, 100))
-    const tasks = background.getTasksByParentSession("parent")
-    expect(tasks).toHaveLength(1)
-    const promptBody = Array.from(childSessions.values())[0]?.prompts[0] as Record<string, unknown> | undefined
-    expect(promptBody?.system).toContain("视觉分析专家")
-  })
-
-  test("no vision model configured degrades gracefully", async () => {
+describe("vision_look tool", () => {
+  test("with no vision model returns failure text without throwing", async () => {
     const harness = createVisionHarness("sync")
     const noModelPipeline = new VisionPipeline({
       client: harness.client,
       directory: "/work",
       config: harness.config,
-      gate: harness.gate,
       background: harness.background,
       getVisionModel: () => undefined,
-      waitForVisionModel: async () => undefined,
-    })
-    const output = { title: "screenshot", output: "taken" }
-    await noModelPipeline.onToolOutput(
-      { tool: "screenshot", sessionID: "parent" },
-      output,
-      [{ mime: "image/png", url: "data:image/png;base64,abc" }],
-    )
-    // graceful: output untouched, no crash
-    expect(output.output).toBe("taken")
-  })
-
-  test("vision_look with no vision model returns failure text without throwing", async () => {
-    const harness = createVisionHarness("sync")
-    const noModelPipeline = new VisionPipeline({
-      client: harness.client,
-      directory: "/work",
-      config: harness.config,
-      gate: harness.gate,
-      background: harness.background,
-      getVisionModel: () => undefined,
-      waitForVisionModel: async () => undefined,
     })
     const tool = createVisionLookTool(noModelPipeline)
     const result = await tool.execute({ images: ["https://x/1.png"] }, { sessionID: "parent" } as never)
     expect(result).toContain("视觉解读失败")
   })
-})
 
-describe("createChatMessageHook", () => {
-  test("extracts images from the output argument (parts live in output, not input)", async () => {
-    const { createChatMessageHook } = await import("../src/hooks/chat-message")
-    const { CurrentModelTracker } = await import("../src/core/vision/model-tracker")
-
+  test('images: ["last"] delegates to lookLatest', async () => {
     const harness = createVisionHarness("sync")
-    const tracker = new CurrentModelTracker()
-    const hook = createChatMessageHook({
-      config: harness.config,
-      pipeline: harness.pipeline,
-      tracker,
-    })
-
-    // The runtime calls hooks with (input, output); input carries only
-    // sessionID/agent/model/messageID/variant — parts arrive in output.
-    const input = {
-      sessionID: "parent",
-      model: { providerID: "openai", modelID: "gpt-5.6-sol" },
-      // no parts key — matches the real input contract
-    }
-    const output = {
-      message: { role: "user" },
-      parts: [
-        { type: "text", text: "look at this" },
-        { type: "file", mime: "image/png", url: "data:image/png;base64,abc" },
+    harness.client.session.messages = async () => ({
+      data: [
+        { info: { role: "user" }, parts: [{ type: "file", mime: "image/png", url: FAKE_PNG_URL }] },
+        { info: { role: "assistant" }, parts: [{ type: "text", text: "解读：页面顶部有报错横幅", state: { status: "completed" } }] },
       ],
-    }
-    await hook(input as never, output as never)
-
-    // the tracker learned the session model from input
-    expect(tracker.get("parent")?.model).toEqual({ providerID: "openai", modelID: "gpt-5.6-sol" })
-    // the image in output.parts triggered an interpretation (gate has a recent dispatch)
-    await waitForRecentDispatch(harness.gate, "parent")
+    })
+    const tool = createVisionLookTool(harness.pipeline)
+    const result = await tool.execute(
+      { images: ["last"], goal: "列出可见文字" },
+      { sessionID: "parent" } as never,
+    )
+    expect(result).toContain("报错横幅")
   })
 
-  test("input-side parts (the old contract) trigger nothing", async () => {
-    const { createChatMessageHook } = await import("../src/hooks/chat-message")
-    const { CurrentModelTracker } = await import("../src/core/vision/model-tracker")
-
+  test('images: ["last"] with no images returns guidance text', async () => {
     const harness = createVisionHarness("sync")
-    const hook = createChatMessageHook({
-      config: harness.config,
-      pipeline: harness.pipeline,
-      tracker: new CurrentModelTracker(),
-    })
-
-    const input = {
-      sessionID: "parent",
-      parts: [{ type: "file", mime: "image/png", url: "data:image/png;base64,abc" }],
-    }
-    await hook(input as never, { message: {}, parts: [] })
-
-    expect(harness.gate.hasRecentDispatch("parent")).toBe(false)
+    harness.client.session.messages = async () => ({ data: [] })
+    const tool = createVisionLookTool(harness.pipeline)
+    const result = await tool.execute({ images: ["last"] }, { sessionID: "parent" } as never)
+    expect(result).toContain("没有找到任何图片消息")
   })
 })
 
@@ -702,95 +528,13 @@ describe("runVisionInterpretation", () => {
       client,
       directory: "/work",
       parentSessionID: "parent",
-      images: [{ mime: "image/png", url: "data:image/png;base64,abc" }],
+      images: [{ mime: "image/png", url: FAKE_PNG_URL }],
       model: { providerID: "openai", modelID: "gpt-5.6-sol" },
       timeoutMs: 5000,
     })
-    expect(result).toBeNull()
+    expect(result).toEqual({ text: null, timedOut: false })
     // must not have aborted on the first (empty-map) poll before the session
     // was ever observed busy
     expect(statusCalls).toBeGreaterThanOrEqual(3)
-  })
-})
-
-describe("waitForVisionModel", () => {
-  const VISION_MODEL_REF = { providerID: "vision-pro", modelID: "vision-model" }
-  const SESSION_MODEL_REF = { providerID: "openai", modelID: "gpt-5.6-sol" }
-
-  // Regression: chat images on a non-vision main session used to be skipped
-  // even when vision.model was configured — the wait path only consulted the
-  // session model's capability snapshot and ignored the explicit model.
-  test("a configured vision model wins immediately, even when the session model cannot see images", async () => {
-    const tracker = new CurrentModelTracker()
-    tracker.onChatParams({
-      sessionID: "s",
-      model: { providerID: "deepseek", id: "deepseek-v4-flash", capabilities: { input: { image: false } } },
-    })
-    const model = await waitForVisionModel({
-      visionModel: VISION_MODEL_REF,
-      visionRefInvalid: false,
-      tracker,
-      sessionID: "s",
-      timeoutMs: 5000,
-    })
-    expect(model).toEqual(VISION_MODEL_REF)
-  })
-
-  test("an invalid vision reference stays off", async () => {
-    const tracker = new CurrentModelTracker()
-    const model = await waitForVisionModel({
-      visionModel: undefined,
-      visionRefInvalid: true,
-      tracker,
-      sessionID: "s",
-      timeoutMs: 100,
-    })
-    expect(model).toBeUndefined()
-  })
-
-  test("without a configured model, a vision-capable snapshot inherits the session model", async () => {
-    const tracker = new CurrentModelTracker()
-    tracker.onChatParams({
-      sessionID: "s",
-      model: { providerID: "openai", id: "gpt-5.6-sol", capabilities: { input: { image: true } } },
-    })
-    const model = await waitForVisionModel({
-      visionModel: undefined,
-      visionRefInvalid: false,
-      tracker,
-      sessionID: "s",
-      timeoutMs: 1000,
-    })
-    expect(model).toEqual(SESSION_MODEL_REF)
-  })
-
-  test("without a configured model, a non-vision snapshot yields undefined", async () => {
-    const tracker = new CurrentModelTracker()
-    tracker.onChatParams({
-      sessionID: "s",
-      model: { providerID: "deepseek", id: "deepseek-v4-flash", capabilities: { input: { image: false } } },
-    })
-    const model = await waitForVisionModel({
-      visionModel: undefined,
-      visionRefInvalid: false,
-      tracker,
-      sessionID: "s",
-      timeoutMs: 1000,
-    })
-    expect(model).toBeUndefined()
-  })
-
-  test("without a snapshot arriving in time, yields undefined after the timeout", async () => {
-    const tracker = new CurrentModelTracker()
-    const started = Date.now()
-    const model = await waitForVisionModel({
-      visionModel: undefined,
-      visionRefInvalid: false,
-      tracker,
-      sessionID: "s",
-      timeoutMs: 120,
-    })
-    expect(model).toBeUndefined()
-    expect(Date.now() - started).toBeGreaterThanOrEqual(100)
   })
 })

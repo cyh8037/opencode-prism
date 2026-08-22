@@ -1,20 +1,8 @@
 import { DEFAULT_SERVER_PORT } from "../config/constants"
-import { log } from "../shared/log"
+import { log } from "./log"
 
-// Running inside a tmux session (TMUX env var set by the tmux server)?
-export function isInsideTmux(env: Record<string, string | undefined> = process.env): boolean {
-  return env.TMUX !== undefined && env.TMUX !== ""
-}
-
-// Current pane id (TMUX_PANE, e.g. "%3" or "3").
-export function getCurrentPaneId(env: Record<string, string | undefined> = process.env): string | undefined {
-  const pane = env.TMUX_PANE
-  if (!pane) return undefined
-  return pane.startsWith("%") ? pane : `%${pane}`
-}
-
-// OpenCode server URL for `opencode attach`. Port 0 (server not bound) falls
-// back to the default port with a warning (see oh-my-openagent issue #3963).
+// OpenCode server URL for attach hints (e.g. the /bg output --full pointer).
+// Port 0 (server not bound) falls back to the default port with a warning.
 export function resolveServerUrl(
   rawServerUrl: string | undefined,
   env: Record<string, string | undefined> = process.env,
@@ -28,7 +16,7 @@ export function resolveServerUrl(
     try {
       const parsed = new URL(rawServerUrl)
       if (parsed.port === "0") {
-        logger("[prism] tmux: ctx.serverUrl has port 0, falling back. Launch opencode with --port N and OPENCODE_PORT=N", {
+        logger("[prism] ctx.serverUrl has port 0, falling back. Launch opencode with --port N and OPENCODE_PORT=N", {
           kind: "warning",
         })
         return fallbackUrl

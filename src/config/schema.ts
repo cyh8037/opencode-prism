@@ -21,25 +21,16 @@ export const prismConfigSchema = z.object({
       model: visionModelSchema,
       mode: z.enum(["sync", "background"]),
       tools: z.array(z.string().min(1)).optional(),
-      chatImages: z.boolean(),
     })
     .default({
       model: "",
       mode: "sync",
-      chatImages: true,
     }),
   background: z
     .object({
       concurrency: z.number().int().min(1),
     })
     .default({ concurrency: 5 }),
-  tmux: z
-    .object({
-      enabled: z.boolean(),
-      layout: z.enum(["main-vertical", "main-horizontal", "tiled", "even-horizontal", "even-vertical"]),
-      isolation: z.enum(["inline", "window", "session"]),
-    })
-    .default({ enabled: true, layout: "main-vertical", isolation: "inline" }),
 })
 
 export type PrismConfig = z.infer<typeof prismConfigSchema>

@@ -73,7 +73,7 @@ export function parseConfig(partial: Record<string, unknown>, warnings: string[]
   warnings.push(`config validation failed, invalid sections fell back to defaults:\n${issues}`)
 
   const result: PrismConfig = { ...defaults }
-  for (const key of ["vision", "background", "tmux"] as const) {
+  for (const key of ["vision", "background"] as const) {
     const value = merged[key]
     if (value === undefined) continue
     const sectionParsed = prismConfigSchema.shape[key].safeParse(value)

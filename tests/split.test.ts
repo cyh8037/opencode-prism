@@ -157,4 +157,35 @@ describe("runSplit", () => {
     expect(report).toContain("s1 one")
     expect(report).toContain("s2 two")
   })
+
+  test("a failed dependency skips its dependents and cascades downstream", async () => {
+    const { manager } = createManager()
+    const plans = [
+      { id: "s1", title: "base", description: "a", dependsOn: [] },
+      { id: "s2", title: "mid", description: "b", dependsOn: ["s1"] },
+      { id: "s3", title: "leaf", description: "c", dependsOn: ["s2"] },
+      { id: "s4", title: "free", description: "d", dependsOn: [] },
+    ]
+    const result = runSplit(manager, { parentSessionId: "parent", plans })
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const s1 = result.tasksByPlanID.get("s1")!
+    await manager.cancelTask(s1.id) // dependency fails terminally
+
+    // the independent plan still runs and completes
+    const s4 = result.tasksByPlanID.get("s4")!
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: s4.sessionId } })
+
+    await result.done
+    expect(result.skippedPlanIDs.get("s2")).toBe("s1")
+    expect(result.skippedPlanIDs.get("s3")).toBe("s2") // cascaded through the skipped s2
+    expect(result.tasksByPlanID.has("s2")).toBe(false)
+    expect(result.tasksByPlanID.has("s3")).toBe(false)
+    expect(s4.status).toBe("completed")
+
+    const report = buildSplitReport(result.tasksByPlanID, plans, result.skippedPlanIDs)
+    expect(report).toContain("s2 mid: SKIPPED (上游 s1 失败，未启动)")
+    expect(report).toContain("s3 leaf: SKIPPED (上游 s2 失败，未启动)")
+    expect(report).toContain("s4 free: COMPLETED")
+  })
 })

@@ -1,5 +1,4 @@
-// Per-key semaphore with FIFO wait queue. Ported from oh-my-openagent's
-// features/background-agent/concurrency.ts.
+// Per-key semaphore with FIFO wait queue.
 interface QueueEntry {
   taskId?: string
   resolve: () => void
@@ -91,13 +90,5 @@ export class ConcurrencyManager {
     }
     this.queues.clear()
     this.counts.clear()
-  }
-
-  getCount(key: string): number {
-    return this.counts.get(key) ?? 0
-  }
-
-  getQueueLength(key: string): number {
-    return this.queues.get(key)?.length ?? 0
   }
 }

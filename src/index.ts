@@ -5,22 +5,19 @@ import type { ResolvedModel } from "./models"
 import { PromptGate } from "./core/prompt-gate"
 import type { PrismClient } from "./core/client-types"
 import { BackgroundManager, type ResolveModelFn } from "./core/background/manager"
-import { VisionPipeline, type GetVisionModelFn } from "./core/vision/pipeline"
-import { CurrentModelTracker, waitForVisionModel as waitForVisionModelResolved } from "./core/vision/model-tracker"
+import { VisionPipeline } from "./core/vision/pipeline"
+import { CurrentModelTracker } from "./core/vision/model-tracker"
 import { SplitService } from "./core/split/service"
-import { TmuxManager } from "./tmux/manager"
 import { createToolExecuteAfterHook } from "./hooks/tool-execute-after"
-import { createChatMessageHook } from "./hooks/chat-message"
 import { createChatParamsHook } from "./hooks/chat-params"
 import { createEventHook } from "./hooks/event"
-import { createMessagesTransformHook } from "./hooks/messages-transform"
 import { createCommandExecuteBeforeHook } from "./hooks/command-execute-before"
 import { createBgTools } from "./tools/bg"
 import { createVisionLookTool } from "./tools/vision-look"
-import { BG_COMMAND, SPLIT_COMMAND, type PrismCommandDefinition } from "./commands/templates"
-import { resolveServerUrl } from "./tmux/env"
+import { BG_COMMAND, SPLIT_COMMAND, VISION_COMMAND, type PrismCommandDefinition } from "./commands/templates"
 import { log } from "./shared/log"
 import { guardHook } from "./shared/hook-guard"
+import { resolveServerUrl } from "./shared/server-url"
 
 function modelFromRecord(value: unknown): ResolvedModel | undefined {
   if (typeof value !== "object" || value === null) return undefined
@@ -115,12 +112,9 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
 
   const gate = new PromptGate(client)
 
-  // Resolve once so the tmux panes and the /bg output --full hint print the
-  // same attach URL (port-0 fallback, OPENCODE_PORT, config).
+  // Resolve once so the /bg output --full hint prints a consistent attach URL
+  // (port-0 fallback, OPENCODE_PORT, config).
   const attachServerUrl = resolveServerUrl(serverUrl, process.env, log)
-
-  const tmux = new TmuxManager({ client, directory, config, serverUrl: attachServerUrl })
-  await tmux.init()
 
   const resolveModel: ResolveModelFn = (parentSessionID) =>
     resolveSessionModel(client, parentSessionID, directory, opencodeDefaultModel)
@@ -131,12 +125,6 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
     config,
     gate,
     resolveModel,
-    onSessionCreated: (event) => {
-      void tmux.onSessionCreated(event)
-    },
-    onSessionDeleted: (event) => {
-      void tmux.onSessionDeleted(event)
-    },
   })
 
   // Per-session model tracker: chat.params fires before every LLM call with
@@ -146,30 +134,19 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
 
   // Explicit model wins; otherwise inherit the session's current model when
   // it accepts images; an invalid vision.model stays permanently off.
-  const getVisionModel: GetVisionModelFn = (sessionID) => {
+  const getVisionModel = (sessionID: string): ResolvedModel | undefined => {
     if (visionModel) return visionModel
     if (visionRefInvalid) return undefined
     const snapshot = modelTracker.get(sessionID)
     return snapshot?.visionCapable ? snapshot.model : undefined
   }
 
-  const waitForVisionModel = (sessionID: string, timeoutMs: number): Promise<ResolvedModel | undefined> =>
-    waitForVisionModelResolved({
-      visionModel,
-      visionRefInvalid,
-      tracker: modelTracker,
-      sessionID,
-      timeoutMs,
-    })
-
   const vision = new VisionPipeline({
     client,
     directory,
     config,
-    gate,
     background: manager,
     getVisionModel,
-    waitForVisionModel,
   })
 
   const splitService = new SplitService({
@@ -200,6 +177,7 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
         ...(cfg.command ?? {}),
         bg: BG_COMMAND,
         split: SPLIT_COMMAND,
+        vision: VISION_COMMAND,
       }
     },
     tool: {
@@ -210,21 +188,15 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
     // as Session.Event.Error and rendered as an error in the TUI, so Prism
     // swallows its own failures into the file log instead.
     "tool.execute.after": guardHook("tool.execute.after", createToolExecuteAfterHook({ config, pipeline: vision })),
-    "chat.message": guardHook("chat.message", createChatMessageHook({ config, pipeline: vision, tracker: modelTracker })),
-    "experimental.chat.messages.transform": guardHook(
-      "experimental.chat.messages.transform",
-      createMessagesTransformHook({ pipeline: vision }),
-    ),
     "chat.params": guardHook("chat.params", createChatParamsHook(modelTracker)),
     "command.execute.before": guardHook(
       "command.execute.before",
-      createCommandExecuteBeforeHook({ manager, splitService, client, serverUrl: attachServerUrl }),
+      createCommandExecuteBeforeHook({ manager, splitService, serverUrl: attachServerUrl, vision }),
     ),
     event: guardHook("event", createEventHook(manager, modelTracker, gate)),
     dispose: async () => {
       try {
         await manager.shutdown()
-        await tmux.sweep()
         gate.clearAll()
       } catch (error) {
         log("[prism] dispose failed (swallowed)", { error })

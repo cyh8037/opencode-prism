@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { BackgroundManager } from "../src/core/background/manager"
 import { PromptGate } from "../src/core/prompt-gate"
-import { TERMINAL_TASK_RETENTION_MS } from "../src/config/constants"
+import { TERMINAL_TASK_RETENTION_MS, TASK_TTL_MS } from "../src/config/constants"
 import { parseConfig } from "../src/config/load"
 import type { PrismClient } from "../src/core/client-types"
 import type { BgTask } from "../src/core/background/types"
@@ -610,37 +610,6 @@ describe("BackgroundManager", () => {
     await manager.shutdown()
   })
 
-  // Error-terminal tasks used to leave their tmux placeholder panes running
-  // forever (only the complete/cancel paths closed panes).
-  test("finalize closes the pane on error-terminal tasks", async () => {
-    const { client } = createMockClient()
-    const deleted: Array<{ sessionID: string }> = []
-    const manager = new BackgroundManager({
-      client,
-      directory: "/work",
-      config: parseConfig({ background: { concurrency: 1 } }),
-      gate: new PromptGate(client, { idlePollMs: 10 }),
-      resolveModel: async () => SESSION_MODEL,
-      onSessionCreated: () => {},
-      onSessionDeleted: (event) => {
-        deleted.push(event)
-      },
-      pollingIntervalMs: 60_000,
-    })
-    const task = await manager.launch({ description: "doomed", prompt: "work", parentSessionId: "parent" })
-    await new Promise((resolve) => setTimeout(resolve, 100))
-    if (!task.sessionId) throw new Error("task never claimed a session")
-    const sessionID = task.sessionId
-
-    ;(manager as unknown as { finalizeTask(t: BgTask, s: BgTask["status"], e?: string): void }).finalizeTask(
-      task,
-      "error",
-      "agent not found",
-    )
-    expect(deleted).toEqual([{ sessionID }])
-    await manager.shutdown()
-  })
-
   test("cancelAllByParentSession retires every task of a parent session without waking it", async () => {
     const { manager, gate } = createManager()
     const a = await manager.launch({ description: "a", prompt: "work", parentSessionId: "parent" })
@@ -667,5 +636,40 @@ describe("BackgroundManager", () => {
     expect(task.sessionId).toBeUndefined()
     manager.handleEvent({ type: "session.deleted", properties: { sessionID } })
     expect(task.status).toBe("cancelled")
+  })
+
+  test("resume re-runs a completed task's child session with a continuation prompt", async () => {
+    const { manager, childSessions } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: task.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(task.status).toBe("completed")
+
+    const resumed = await manager.resume(task.id, "展开第二步的细节")
+    expect(resumed.status).toBe("running")
+    expect(resumed.completedAt).toBeUndefined()
+    const prompts = childSessions.get(task.sessionId!)!.prompts
+    expect(prompts).toHaveLength(2)
+    const followUp = prompts[1] as { parts?: Array<{ type: string; text?: string }> }
+    expect(followUp.parts?.[0]?.text).toBe("展开第二步的细节")
+    await manager.shutdown()
+  })
+
+  test("running tasks past the TTL are warned once, not cancelled", async () => {
+    const { manager, toasts, statusData } = createManager()
+    const task = await manager.launch({ description: "long", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    statusData[task.sessionId!] = { type: "busy" } // keep it from completing via the sweep
+    task.startedAt = new Date(Date.now() - TASK_TTL_MS - 1000)
+
+    await poll(manager)
+    expect(task.status).toBe("running")
+    expect(toasts.some((t) => t.message.includes("仍在继续"))).toBe(true)
+
+    await poll(manager) // second sweep must not warn again
+    expect(toasts.filter((t) => t.message.includes("仍在继续"))).toHaveLength(1)
+    expect(task.status).toBe("running")
+    await manager.shutdown()
   })
 })

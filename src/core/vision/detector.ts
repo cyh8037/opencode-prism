@@ -11,7 +11,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 // Extract image attachments from a tool result output object.
-// Ported from oh-my-openagent's read-image-resizer extractImageAttachments.
 export function extractImageAttachments(output: Record<string, unknown>): ImageAttachment[] {
   const attachmentsValue = output.attachments
   if (!Array.isArray(attachmentsValue)) return []
@@ -52,4 +51,23 @@ export function extractImageParts(parts: unknown): ImageAttachment[] {
     images.push({ mime: normalizedMime, url })
   }
   return images
+}
+
+// Best-effort mime guess for caller-supplied bare paths/URLs. The sniff in
+// image-utils is authoritative; this only shapes the request before it.
+export function guessImageMime(url: string): string {
+  const match = url.match(/^data:(image\/[a-z+]+);base64,/)
+  if (match) return match[1]!
+  const extension = url.split("?")[0]?.split(".").pop()?.toLowerCase()
+  switch (extension) {
+    case "jpeg":
+    case "jpg":
+      return "image/jpeg"
+    case "gif":
+      return "image/gif"
+    case "webp":
+      return "image/webp"
+    default:
+      return "image/png"
+  }
 }

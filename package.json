@@ -1,13 +1,14 @@
 {
   "name": "opencode-prism",
-  "version": "0.1.0-beta.0",
-  "description": "Prism: OpenCode plugin for vision interpretation, parallel background agents, task splitting, and tmux pane visualization",
+  "version": "0.2.0-beta.0",
+  "description": "Prism: OpenCode plugin for vision interpretation, parallel background agents, and task splitting",
   "license": "MIT",
   "type": "module",
   "main": "dist/index.js",
   "files": [
     "dist",
-    "assets"
+    "assets",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "test": "bun test",
