@@ -1,4 +1,5 @@
 import { z } from "zod"
+import { MAX_SUBTASKS } from "../../config/constants"
 
 export interface SubTaskPlan {
   id: string
@@ -19,7 +20,7 @@ export const subTaskPlanSchema = z
 export const subTaskPlanArraySchema = z
   .array(subTaskPlanSchema)
   .min(1)
-  .max(12)
+  .max(MAX_SUBTASKS)
   .superRefine((plans, ctx) => {
     const ids = new Set<string>()
     for (const plan of plans) {

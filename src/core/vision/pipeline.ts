@@ -6,13 +6,27 @@ import type { BackgroundManager } from "../background/manager"
 import type { PrismClient } from "../client-types"
 import type { ImageAttachment } from "./detector"
 import { extractImageParts } from "./detector"
-import { makeVisionInstruction, runVisionInterpretation, VISION_SYSTEM_PROMPT } from "./interpreter"
+import {
+  makeVisionInstruction,
+  runVisionInterpretation,
+  VISION_SYSTEM_PROMPT,
+  type InterpretationOutcome,
+  type VisionFailureReason,
+} from "./interpreter"
 
 // The model a vision interpretation should use for a session: the explicit
 // vision.model, or the session's current model when it is image-capable.
 // Returns undefined when vision is unavailable (invalid config, or the
 // session model cannot see images) — triggers skip in that case.
 export type GetVisionModelFn = (sessionID: string) => ResolvedModel | undefined
+
+// Result of a manual interpretation (vision_look tool):
+// the text on success, or the failure reason the caller turns into a
+// cause-specific user message.
+export interface VisionLookResult {
+  text: string | null
+  reason: VisionFailureReason | null
+}
 
 export interface VisionPipelineDeps {
   client: PrismClient
@@ -38,28 +52,30 @@ export class VisionPipeline {
   }
 
   // Single configured model with one same-model retry on FAST failure
-  // (session create/prompt rejected, no output). A timeout is NOT retried:
+  // (session create/prompt rejected, no output). Timeouts are NOT retried:
   // the model or network is slow, and a second attempt would only block the
-  // caller (agent loop or command hook) for another full window.
+  // caller (agent loop or command hook) for another full window. Invalid
+  // image refs are not retried either: the failure is deterministic.
   private async interpretWithFallback(
     parentSessionID: string,
     images: ImageAttachment[],
     goal?: string,
-  ): Promise<string | null> {
+  ): Promise<VisionLookResult> {
     const model = this.deps.getVisionModel(parentSessionID)
     if (!model) {
       this.logger("[prism] vision: no vision model available (invalid config or session model not image-capable), skipping", {
         parentSessionID,
       })
-      return null
+      return { text: null, reason: "no-model" }
     }
     const instruction = makeVisionInstruction(goal)
 
+    let lastReason: VisionFailureReason = "internal-error"
     for (let attempt = 0; attempt <= 1; attempt++) {
       // Track this call's children so the trigger guard can see them while
       // the interpretation is in flight (the recursion window).
       const createdThisCall: string[] = []
-      let outcome: { text: string | null; timedOut: boolean } = { text: null, timedOut: false }
+      let outcome: InterpretationOutcome = { text: null, reason: "internal-error" }
       try {
         outcome = await runVisionInterpretation({
           client: this.deps.client,
@@ -80,18 +96,20 @@ export class VisionPipeline {
       for (const sessionID of createdThisCall) {
         this.interpretationSessions.delete(sessionID)
       }
-      if (outcome.text !== null) return outcome.text
-      if (outcome.timedOut) {
-        this.logger("[prism] vision: interpretation timed out, not retrying", { model })
-        return null
+      if (outcome.text !== null) return { text: outcome.text, reason: null }
+      lastReason = outcome.reason ?? "internal-error"
+      if (lastReason === "timeout" || lastReason === "invalid-images") {
+        this.logger("[prism] vision: interpretation failed, not retrying", { model, reason: lastReason })
+        return { text: null, reason: lastReason }
       }
 
       this.logger("[prism] vision: interpretation failed fast, retrying with the same model", {
         model,
+        reason: lastReason,
         attempt: attempt + 1,
       })
     }
-    return null
+    return { text: null, reason: lastReason }
   }
 
   // Cap the batch at MAX_IMAGES_PER_BATCH. Extras are dropped with a log AND
@@ -138,27 +156,31 @@ export class VisionPipeline {
     }
 
     const { batch, dropped } = this.capBatch(images)
-    const text = await this.interpretWithFallback(input.sessionID, batch)
-    if (text === null) {
-      log("[prism] vision: interpretation unavailable, leaving image in main context")
+    const result = await this.interpretWithFallback(input.sessionID, batch)
+    if (result.text === null) {
+      log("[prism] vision: interpretation unavailable, leaving image in main context", { reason: result.reason })
       return
     }
-    output.output += `\n\n[prism vision] 图片解读（${input.tool}）:\n${text}`
+    output.output += `\n\n[prism vision] 图片解读（${input.tool}）:\n${result.text}`
     if (dropped > 0) {
       output.output += `\n\n[prism vision] 注意: 本次共收到 ${images.length} 张图片，超出批量上限（${MAX_IMAGES_PER_BATCH}），有 ${dropped} 张未解读。`
     }
   }
 
-  // Manual path used by the vision_look tool and the /vision command:
-  // interpret explicit images (optionally with a goal) and return the text.
-  look(sessionID: string, images: ImageAttachment[], goal?: string): Promise<string | null> {
+  // Manual path used by the vision_look tool:
+  // interpret explicit images (optionally with a goal) and return the text
+  // plus the failure reason when interpretation did not succeed.
+  look(sessionID: string, images: ImageAttachment[], goal?: string): Promise<VisionLookResult> {
     return this.interpretWithFallback(sessionID, images, goal)
   }
 
   // Manual path for the "last" sentinel: interpret the most recent image
   // message of the session. This is the bridge for pasted chat images when
   // the main model cannot see them and has no way to reference their URL.
-  async lookLatest(sessionID: string, goal?: string): Promise<{ text: string | null; notFound: boolean }> {
+  async lookLatest(
+    sessionID: string,
+    goal?: string,
+  ): Promise<VisionLookResult & { notFound: boolean }> {
     let messages: unknown
     try {
       const response = await this.deps.client.session.messages({
@@ -168,7 +190,7 @@ export class VisionPipeline {
       messages = response.data
     } catch (error) {
       this.logger("[prism] vision: failed to fetch session messages for 'last'", { sessionID, error })
-      return { text: null, notFound: true }
+      return { text: null, reason: "internal-error", notFound: false }
     }
     if (Array.isArray(messages)) {
       for (let i = messages.length - 1; i >= 0; i--) {
@@ -176,12 +198,12 @@ export class VisionPipeline {
         const images = extractImageParts(parts)
         if (images.length > 0) {
           const { batch } = this.capBatch(images)
-          const text = await this.interpretWithFallback(sessionID, batch, goal)
-          return { text, notFound: false }
+          const result = await this.interpretWithFallback(sessionID, batch, goal)
+          return { ...result, notFound: false }
         }
       }
     }
-    return { text: null, notFound: true }
+    return { text: null, reason: null, notFound: true }
   }
 
   // Callers gate BEFORE this: without a usable model the task would run

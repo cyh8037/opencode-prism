@@ -33,10 +33,45 @@ export function makeVisionInstruction(goal?: string): string {
   return `${VISION_INSTRUCTION}\n重点关注：${trimmed}\n只回答与关注点相关的内容。`
 }
 
-// Shared user-facing hint for every manual interpretation surface
-// (vision_look tool, /vision command) when no vision model is available.
+// Shared user-facing hint for the manual interpretation surface
+// (vision_look tool) when no vision model is available.
 export const VISION_NO_MODEL_HINT =
   "视觉解读失败: 无可用视觉模型（vision.model 配置不可用，或未配置且主会话模型不支持图片）。请配置 prism 的 vision.model，或切换到支持图片的主会话模型"
+
+// Why an interpretation failed. Every failure path carries one so the
+// user-facing message can state the actual cause instead of the generic
+// "no vision model" hint (which wrongly told users with a working
+// vision.model that their config was missing).
+export type VisionFailureReason =
+  | "no-model"
+  | "invalid-images"
+  | "session-error"
+  | "no-output"
+  | "timeout"
+  | "internal-error"
+
+// Map a failure reason to the message shown by the manual surfaces. The
+// optional refs power the invalid-images case: listing what was rejected
+// points the user at what to fix.
+export function visionFailureMessage(reason: VisionFailureReason, invalidRefs: string[] = []): string {
+  switch (reason) {
+    case "no-model":
+      return VISION_NO_MODEL_HINT
+    case "invalid-images": {
+      const refs = invalidRefs.filter(Boolean).slice(0, 3)
+      const list = refs.length > 0 ? `（已拒绝: ${refs.join("、")}${invalidRefs.length > 3 ? " 等" : ""}）` : ""
+      return `视觉解读失败: 图片引用无效或无法读取${list}。请传入图片的本地路径/URL/data URL；解读对话贴图请用 vision_look(["last"])`
+    }
+    case "session-error":
+      return "视觉解读失败: 视觉子会话创建或提交失败（详见插件日志），可稍后重试"
+    case "no-output":
+      return "视觉解读失败: 视觉模型未返回有效内容，可重试或更换 vision.model"
+    case "timeout":
+      return "视觉解读失败: 视觉模型响应超时，可重试或更换 vision.model"
+    case "internal-error":
+      return "视觉解读失败: 插件内部错误（详见插件日志）"
+  }
+}
 
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms))
@@ -45,14 +80,15 @@ async function sleep(ms: number): Promise<void> {
 export interface InterpretationOutcome {
   /** The interpretation text, or null on failure. */
   text: string | null
-  /** True when the wait timed out — a retry would only stall the caller again. */
-  timedOut: boolean
+  /** Failure cause, set iff text is null. Null on success. */
+  reason: VisionFailureReason | null
 }
 
 // Run a sync vision interpretation: create a child session with the vision
 // model, send the images, poll until idle, return the interpretation text.
-// Returns text=null on failure (caller degrades gracefully); timedOut tells
-// the retry logic in the pipeline which failures are worth retrying.
+// Returns text=null on failure (caller degrades gracefully); reason tells
+// the retry logic in the pipeline which failures are worth retrying
+// (timeout and invalid-images are not).
 export async function runVisionInterpretation(args: {
   client: PrismClient
   directory: string
@@ -79,7 +115,7 @@ export async function runVisionInterpretation(args: {
   const normalized = await normalizeImageBatch(images, directory)
   if (normalized.length === 0) {
     log("[prism] vision: no usable images after normalization")
-    return { text: null, timedOut: false }
+    return { text: null, reason: "invalid-images" }
   }
 
   // The client resolves 4xx/5xx with { error }; network failures reject, so
@@ -99,11 +135,11 @@ export async function runVisionInterpretation(args: {
     })
   } catch (error) {
     log("[prism] vision: failed to create child session", { error })
-    return { text: null, timedOut: false }
+    return { text: null, reason: "session-error" }
   }
   if (createResult.error || !createResult.data?.id) {
     log("[prism] vision: failed to create child session", { error: createResult.error })
-    return { text: null, timedOut: false }
+    return { text: null, reason: "session-error" }
   }
   const sessionID = createResult.data.id
   args.onSessionCreated?.(sessionID)
@@ -131,7 +167,7 @@ export async function runVisionInterpretation(args: {
 
     if (promptError) {
       log("[prism] vision: promptAsync failed", { sessionID, error: promptError })
-      return { text: null, timedOut: false }
+      return { text: null, reason: "session-error" }
     }
 
     const deadline = Date.now() + timeoutMs
@@ -141,7 +177,7 @@ export async function runVisionInterpretation(args: {
         .messages({ path: { id: sessionID }, query: { directory } })
         .catch(() => null)
       const text = messagesResponse ? lastAssistantText(messagesResponse.data) : null
-      if (text !== null) return { text, timedOut: false }
+      if (text !== null) return { text, reason: null }
 
       // The status map only contains non-idle sessions (idle entries are
       // removed when they settle), so an absent entry means idle — but ONLY
@@ -157,13 +193,13 @@ export async function runVisionInterpretation(args: {
       }
       if (observedBusy && (status === undefined || status === "idle")) {
         // settled without assistant text: model produced nothing usable
-        return { text: null, timedOut: false }
+        return { text: null, reason: "no-output" }
       }
       await sleep(VISION_INTERPRET_POLL_MS)
     }
 
     log("[prism] vision: interpretation timed out", { sessionID, timeoutMs })
-    return { text: null, timedOut: true }
+    return { text: null, reason: "timeout" }
   } finally {
     // Fire-and-forget cleanup: callers may be blocking a hook while this
     // runs, so the abort must not add its own latency. The server tears the

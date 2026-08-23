@@ -33,6 +33,14 @@ export interface BgTask {
   error?: string
   /** Last assistant text captured from the child session (result excerpt). */
   resultText?: string
+  /** Queued mid-run steering messages, delivered as one round at the child's
+   *  next idle boundary (before completion is declared). */
+  steeringQueue?: string[]
+  /** Consecutive failed steering delivery attempts (bounded, then dropped). */
+  steeringAttempts?: number
+  /** When the last steering round was accepted — completion is deferred for
+   *  a grace window after this (busy-mark lag + stale sweep snapshots). */
+  lastSteeringDeliveredAt?: Date
   progress?: TaskProgress
   concurrencyKey?: string
   /** Stable key for re-acquiring a concurrency slot on resume. */

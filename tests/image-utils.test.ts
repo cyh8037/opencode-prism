@@ -2,7 +2,8 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { normalizeImageUrl } from "../src/core/vision/image-utils"
+import { expandLocalPath, normalizeImageBatch, normalizeImageUrl } from "../src/core/vision/image-utils"
+import { VISION_IMAGE_MAX_BYTES } from "../src/config/constants"
 
 const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3])
 const PNG_DATA_URL = `data:image/png;base64,${Buffer.from(PNG_BYTES).toString("base64")}`
@@ -68,8 +69,8 @@ describe("normalizeImageUrl data URLs", () => {
   })
 
   test("oversized data URL is rejected before decode", async () => {
-    // base64 length above the 8MB-equivalent threshold (~11.2M chars)
-    const oversized = `data:image/png;base64,${"A".repeat(12_000_000)}`
+    // base64 length above the 4MB-equivalent threshold
+    const oversized = `data:image/png;base64,${"A".repeat(6_000_000)}`
     expect(await normalizeImageUrl({ mime: "image/png", url: oversized })).toBeNull()
   })
 })
@@ -87,5 +88,65 @@ describe("normalizeImageUrl local paths", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
+  })
+})
+
+describe("expandLocalPath", () => {
+  // The regression: isLocalPath normalizes backslashes BEFORE matching "~/",
+  // so "~\shot.png" is classified as a home path — expandLocalPath used to
+  // check the raw string, missed the branch, and resolved to
+  // <baseDir>/~/shot.png on every platform.
+  test("windows-style home paths (~\\...) expand against home, not the project dir", () => {
+    expect(expandLocalPath("~\\Pictures\\shot.png", "/work", "/home/tester")).toBe("/home/tester/Pictures/shot.png")
+    expect(expandLocalPath("~/Pictures/shot.png", "/work", "/home/tester")).toBe("/home/tester/Pictures/shot.png")
+    // mixed separators survive the same normalization
+    expect(expandLocalPath("~/a\\b.png", "/work", "/home/tester")).toBe("/home/tester/a/b.png")
+  })
+
+  test("absolute and drive-letter paths pass through unchanged", () => {
+    expect(expandLocalPath("/abs/shot.png", "/work", "/home/tester")).toBe("/abs/shot.png")
+    expect(expandLocalPath("C:\\Users\\j\\shot.png", "/work", "/home/tester")).toBe("C:\\Users\\j\\shot.png")
+    expect(expandLocalPath("\\\\server\\share\\shot.png", "/work", "/home/tester")).toBe("\\\\server\\share\\shot.png")
+  })
+})
+
+describe("normalizeImageUrl remote size limits", () => {
+  test("a Content-Length over the cap is rejected from the header alone", async () => {
+    stubFetch(
+      () =>
+        new Response(PNG_BYTES, {
+          headers: { "content-length": String(VISION_IMAGE_MAX_BYTES + 1) },
+        }),
+    )
+    const result = await normalizeImageUrl({ mime: "image/png", url: "https://example.com/big.png" })
+    expect(result).toBeNull()
+  })
+})
+
+describe("normalizeImageBatch total cap", () => {
+  // Providers cap the whole inline request (Gemini at 20MB) — the cap is on
+  // the encoded payload, and the images that fit are kept, the tail dropped.
+  const pngOfEncodedLength = (encodedLen: number): string => {
+    const raw = Math.floor((encodedLen * 3) / 4)
+    const bytes = new Uint8Array(raw)
+    bytes.set(PNG_BYTES.subarray(0, Math.min(PNG_BYTES.length, raw)))
+    return `data:image/png;base64,${Buffer.from(bytes).toString("base64")}`
+  }
+
+  test("keeps the images that fit and drops the rest", async () => {
+    stubFetch(() => new Response(PNG_BYTES))
+    // ~3.4MB raw each: within the per-image cap, but three of them exceed the
+    // 16MB encoded batch cap together with a fourth.
+    const perImage = 4_500_000
+    const images = [1, 2, 3, 4].map(() => ({ mime: "image/png", url: pngOfEncodedLength(perImage) }))
+    const kept = await normalizeImageBatch(images)
+    expect(kept).toHaveLength(3)
+  })
+
+  test("a small batch passes through untouched", async () => {
+    stubFetch(() => new Response(PNG_BYTES))
+    const kept = await normalizeImageBatch([{ mime: "image/png", url: PNG_DATA_URL }])
+    expect(kept).toHaveLength(1)
+    expect(kept[0]?.url).toBe(PNG_DATA_URL)
   })
 })

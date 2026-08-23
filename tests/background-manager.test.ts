@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { BackgroundManager } from "../src/core/background/manager"
 import { PromptGate } from "../src/core/prompt-gate"
-import { TERMINAL_TASK_RETENTION_MS, TASK_TTL_MS } from "../src/config/constants"
+import { TERMINAL_TASK_RETENTION_MS, TASK_INACTIVITY_TIMEOUT_MS, TASK_TTL_MS } from "../src/config/constants"
 import { parseConfig } from "../src/config/load"
 import type { PrismClient } from "../src/core/client-types"
 import type { BgTask } from "../src/core/background/types"
@@ -74,6 +74,7 @@ function createManager(
   overrides: {
     concurrency?: number
     pollingIntervalMs?: number
+    resumeAcquireTimeoutMs?: number
     model?: ResolvedModel
     statusData?: Record<string, { type?: string }>
     noToast?: boolean
@@ -91,6 +92,7 @@ function createManager(
     gate,
     resolveModel: async () => overrides.model ?? SESSION_MODEL,
     pollingIntervalMs: overrides.pollingIntervalMs ?? 60_000,
+    resumeAcquireTimeoutMs: overrides.resumeAcquireTimeoutMs,
   })
   return { manager, gate, client, childSessions, statusData, toasts }
 }
@@ -670,6 +672,613 @@ describe("BackgroundManager", () => {
     await poll(manager) // second sweep must not warn again
     expect(toasts.filter((t) => t.message.includes("仍在继续"))).toHaveLength(1)
     expect(task.status).toBe("running")
+    await manager.shutdown()
+  })
+
+  // A silent hang (stuck model call, dead tool) produces no part updates, so
+  // the circuit breaker never fires and the TTL only warns — without the
+  // watchdog the task holds its concurrency slot forever and a /split run
+  // never aggregates.
+  test("the inactivity watchdog cancels a silently hung task", async () => {
+    const { manager, toasts, statusData, childSessions } = createManager()
+    const task = await manager.launch({ description: "hung", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    statusData[task.sessionId!] = { type: "busy" }
+    const sessionID = task.sessionId!
+    // Silent past the watchdog window AND past the TTL: the watchdog must
+    // win, and the TTL's "仍在继续" warn must not fire for the same task.
+    task.progress = {
+      toolCalls: 2,
+      lastUpdate: new Date(Date.now() - TASK_INACTIVITY_TIMEOUT_MS - 1000),
+    }
+    task.startedAt = new Date(Date.now() - TASK_TTL_MS - 1000)
+
+    await poll(manager)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    expect(task.status).toBe("cancelled")
+    expect(task.error).toContain("看门狗")
+    expect(childSessions.get(sessionID)?.aborted).toBe(true) // hung child is killed
+    expect(toasts.some((t) => t.message.includes("仍在继续"))).toBe(false)
+    await manager.shutdown()
+  })
+
+  test("an active task past the TTL is never watchdog-cancelled", async () => {
+    const { manager, statusData } = createManager()
+    const task = await manager.launch({ description: "busy", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    statusData[task.sessionId!] = { type: "busy" }
+    task.startedAt = new Date(Date.now() - TASK_TTL_MS - 1000)
+    // parts keep flowing: lastUpdate stays fresh
+
+    await poll(manager)
+    expect(task.status).toBe("running")
+    await manager.shutdown()
+  })
+
+  test("the watchdog never touches pending tasks even with a stale anchor", async () => {
+    const { manager } = createManager({ concurrency: 1 })
+    const first = await manager.launch({ description: "a", prompt: "work", parentSessionId: "parent" })
+    const second = await manager.launch({ description: "b", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(first.status).toBe("running")
+    expect(second.status).toBe("pending")
+
+    // A pending task has no progress in reality; a stale one must still be
+    // ignored — the watchdog is scoped to running tasks.
+    second.progress = {
+      toolCalls: 0,
+      lastUpdate: new Date(Date.now() - TASK_INACTIVITY_TIMEOUT_MS - 1000),
+    }
+    ;(manager as unknown as { pruneStaleTasks(): void }).pruneStaleTasks()
+
+    expect(second.status).toBe("pending")
+    await manager.shutdown()
+  })
+
+  // Regression: tryRetry used to keep the first start's startedAt while
+  // flipping the task back to pending — stale-prune anchors pending tasks on
+  // startedAt ?? queuedAt, so a retry landing 30+ minutes into a task was
+  // cancelled as a "queued task exceeded the TTL" moments after re-queueing.
+  test("a retried task's pending TTL anchor resets to the fresh queue time", async () => {
+    const { manager, statusData } = createManager({ concurrency: 1 })
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(task.status).toBe("running")
+    statusData[task.sessionId!] = { type: "busy" }
+
+    const blocker = await manager.launch({ description: "blocker", prompt: "b", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(blocker.status).toBe("pending") // parked behind the single slot
+
+    // the first start happened past the TTL
+    task.startedAt = new Date(Date.now() - TASK_TTL_MS - 1000)
+    await (
+      manager as unknown as {
+        tryRetry(t: BgTask, e: { statusCode?: number; message?: string }): Promise<boolean>
+      }
+    ).tryRetry(task, { statusCode: 429, message: "rate limited" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    // the retry parked behind the blocker (its released slot went to the waiter)
+    expect(task.status).toBe("pending")
+    expect(task.startedAt).toBeUndefined()
+
+    ;(manager as unknown as { pruneStaleTasks(): void }).pruneStaleTasks()
+    expect(task.status).toBe("pending") // NOT cancelled as a stale queued task
+    await manager.shutdown()
+  })
+
+  // Regression: resume() awaited the concurrency slot with no bound — a
+  // saturated group (running tasks past the TTL are only warned, never
+  // killed) parked the bg_send call forever, and a terminal task could not
+  // even be cancelled out of the wait.
+  test("resume on a saturated group times out with an actionable error and leaks no slot", async () => {
+    const { manager, statusData } = createManager({ concurrency: 1, resumeAcquireTimeoutMs: 50 })
+    const completed = await manager.launch({ description: "done", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: completed.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(completed.status).toBe("completed")
+
+    const holder = await manager.launch({ description: "holder", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    statusData[holder.sessionId!] = { type: "busy" }
+    expect(holder.status).toBe("running")
+
+    await expect(manager.resume(completed.id, "continue")).rejects.toThrow("并发槽已满")
+
+    // the failed resume must not have shrunk the group's effective limit
+    await manager.cancelTask(holder.id)
+    const third = await manager.launch({ description: "third", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(third.status).toBe("running")
+    await manager.shutdown()
+  })
+
+  test("cancelling a terminal task parked in resume's wait unblocks the stuck send", async () => {
+    const { manager, statusData } = createManager({ concurrency: 1, resumeAcquireTimeoutMs: 60_000 })
+    const completed = await manager.launch({ description: "done", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: completed.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(completed.status).toBe("completed")
+
+    const holder = await manager.launch({ description: "holder", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    statusData[holder.sessionId!] = { type: "busy" }
+
+    let sendError: Error | undefined
+    const sendSettled = manager.send(completed.id, "continue").catch((error: Error) => {
+      sendError = error
+    })
+    await new Promise((resolve) => setTimeout(resolve, 50)) // parked in acquire
+
+    const cancelled = await manager.cancelTask(completed.id)
+    expect(cancelled).toBe(false) // already terminal — but the wait must clear
+    await sendSettled
+    expect(sendError?.message).toContain("已被取消")
+    await manager.shutdown()
+  })
+
+  // Regression: send() landing while the settle's completion confirmation
+  // (confirmStillIdle) was in flight used to be silently dropped — the caller
+  // had been told "已排队", then finalizeTask cleared the queue.
+  test("a message queued during completion confirmation is delivered, not dropped", async () => {
+    const { manager, client, childSessions } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const sessionID = task.sessionId!
+
+    // Hold the FIRST status call in flight so send() can land inside the
+    // confirmation window (deliverSteering has already seen an empty queue);
+    // later calls answer idle immediately.
+    let releaseStatus: (() => void) | undefined
+    let holdNext = true
+    client.session.status = async () => {
+      if (holdNext) {
+        holdNext = false
+        await new Promise<void>((resolve) => {
+          releaseStatus = resolve
+        })
+      }
+      return { data: { [sessionID]: { type: "idle" } } }
+    }
+
+    manager.handleEvent({ type: "session.idle", properties: { sessionID } })
+    await new Promise((resolve) => setTimeout(resolve, 50)) // settle is now inside confirmStillIdle
+
+    const result = await manager.send(task.id, "结算窗口内到达")
+    expect(result.queued).toBe(true)
+
+    releaseStatus!()
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    // the queued message must survive: completion defers to the next boundary
+    expect(task.status).toBe("running")
+
+    // the next idle boundary delivers the round, then (past the settle
+    // grace) the task completes
+    manager.handleEvent({ type: "session.idle", properties: { sessionID } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(task.status).toBe("running") // steering grace window
+    task.lastSteeringDeliveredAt = new Date(Date.now() - 30_000)
+    manager.handleEvent({ type: "session.idle", properties: { sessionID } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(task.status).toBe("completed")
+
+    const prompts = childSessions.get(sessionID)!.prompts
+    const round = prompts[1] as { parts?: Array<{ type: string; text?: string }> }
+    expect(round?.parts?.some((part) => part.text === "结算窗口内到达")).toBe(true)
+    await manager.shutdown()
+  })
+
+  // Regression: a same-model retry landing while a steering round's
+  // acceptance was in flight used to discard the spliced messages — the
+  // relaunch neither merged nor re-delivered them.
+  test("messages in flight during a same-model retry are re-queued and delivered", async () => {
+    const { manager, client, childSessions } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const sessionID = task.sessionId!
+    await manager.send(task.id, "重试窗口内的补充")
+
+    // Hold the steering round's promptAsync acceptance in flight — ONE shot:
+    // the re-queued message is delivered again later, and that retry must
+    // pass through normally.
+    let releasePrompt: (() => void) | undefined
+    let holdUsed = false
+    client.session.promptAsync = async ({ path, body }) => {
+      const parts = (body as { parts?: Array<{ text?: string }> }).parts ?? []
+      if (!holdUsed && parts.some((part) => part.text === "重试窗口内的补充")) {
+        holdUsed = true
+        await new Promise<void>((resolve) => {
+          releasePrompt = resolve
+        })
+      }
+      childSessions.get((path as { id: string }).id)?.prompts.push(body)
+    }
+
+    manager.handleEvent({ type: "session.idle", properties: { sessionID } })
+    for (let i = 0; i < 50 && !releasePrompt; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    expect(releasePrompt).toBeDefined() // delivery is holding on acceptance
+    expect(task.steeringQueue?.length ?? 0).toBe(0) // spliced for delivery
+
+    // a rate-limited error retries the task mid-delivery
+    await (manager as unknown as { tryRetry(t: BgTask, e: { statusCode?: number; message?: string }): Promise<boolean> }).tryRetry(task, {
+      statusCode: 429,
+      message: "rate limited",
+    })
+    expect(task.status).toBe("pending")
+
+    releasePrompt!()
+    await new Promise((resolve) => setTimeout(resolve, 150))
+
+    // the batch is re-queued, not discarded; the relaunch runs on a new child
+    expect(task.steeringQueue).toContain("重试窗口内的补充")
+    expect(task.sessionId).toBeDefined()
+    expect(task.sessionId).not.toBe(sessionID)
+
+    // and the message reaches the new child at its next idle boundary
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: task.sessionId! } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    const prompts = childSessions.get(task.sessionId!)!.prompts
+    const texts = prompts.flatMap(
+      (body) => ((body as { parts?: Array<{ text?: string }> }).parts ?? []).map((part) => part.text),
+    )
+    expect(texts).toContain("重试窗口内的补充")
+    await manager.shutdown()
+  })
+
+  test("waitForTasks is woken by shutdown instead of hanging until its own timeout", async () => {
+    const { manager } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    const waiting = manager.waitForTasks([task.id], 60_000)
+    await manager.shutdown()
+    const result = await waiting // must resolve promptly, not after 60s
+
+    expect(result.timedOut).toBe(true)
+    expect(result.tasks).toEqual([])
+  })
+
+  // --- mid-run steering (bg_send / /bg send) ---
+
+  test("send to a running task queues; the idle boundary delivers a round instead of completing", async () => {
+    const { manager, childSessions } = createManager()
+    const task = await manager.launch({ description: "review", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(task.status).toBe("running")
+
+    const result = await manager.send(task.id, "不新增 PROJECT-FACT-*，这里共用 CODE-FACT-*")
+    expect(result.queued).toBe(true)
+    expect(result.queueLength).toBe(1)
+
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: task.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    // steering round launched, task stays running
+    expect(task.status).toBe("running")
+    expect(task.lastSteeringDeliveredAt).toBeDefined()
+    const prompts = childSessions.get(task.sessionId!)!.prompts
+    expect(prompts).toHaveLength(2)
+    const round = prompts[1] as { tools?: Record<string, unknown>; parts?: Array<{ type: string; text?: string }> }
+    expect(round.tools).toMatchObject({ bg_spawn: false, bg_send: false, bg_wait: false })
+    expect(round.parts?.some((part) => part.text?.includes("PROJECT-FACT"))).toBe(true)
+
+    // simulate the round finishing after the settle grace window, then the
+    // next idle settles the task for real
+    task.lastSteeringDeliveredAt = new Date(Date.now() - 30_000)
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: task.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(task.status).toBe("completed")
+    expect(childSessions.get(task.sessionId!)!.prompts).toHaveLength(2)
+    await manager.shutdown()
+  })
+
+  test("multiple queued steering messages are delivered as ONE round", async () => {
+    const { manager, childSessions } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await manager.send(task.id, "第一条补充")
+    await manager.send(task.id, "第二条补充")
+
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: task.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    expect(task.status).toBe("running")
+    const prompts = childSessions.get(task.sessionId!)!.prompts
+    expect(prompts).toHaveLength(2) // launch + ONE combined steering round
+    const parts = (prompts[1] as { parts?: Array<{ type: string; text?: string }> }).parts
+    expect(parts).toHaveLength(2)
+    expect(parts?.[0]?.text).toBe("第一条补充")
+    expect(parts?.[1]?.text).toBe("第二条补充")
+    await manager.shutdown()
+  })
+
+  test("steering delivery resets the tool budget and the TTL anchor", async () => {
+    const { manager, toasts } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    task.progress = { toolCalls: 3_900, toolPartIds: new Set(["p1"]), lastUpdate: new Date() }
+    task.startedAt = new Date(Date.now() - TASK_TTL_MS - 1_000)
+    const internals = manager as unknown as { ttlWarned: Set<string> }
+    internals.ttlWarned.add(task.id)
+
+    await manager.send(task.id, "keep going")
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: task.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    expect(task.status).toBe("running")
+    expect(task.progress?.toolCalls).toBe(0)
+    // the part-id set survives so late events from the old round are deduped
+    expect(task.progress?.toolPartIds).toEqual(new Set(["p1"]))
+    expect(task.startedAt!.getTime()).toBeGreaterThan(Date.now() - 5_000)
+    expect(internals.ttlWarned.has(task.id)).toBe(false)
+    expect(toasts.some((t) => t.message.includes("补充指令已投递"))).toBe(true)
+    await manager.shutdown()
+  })
+
+  test("send to a terminal task continues its child session (resume semantics)", async () => {
+    const { manager, childSessions } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: task.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(task.status).toBe("completed")
+
+    const result = await manager.send(task.id, "展开第二步的细节")
+    expect(result.queued).toBe(false)
+    expect(task.status).toBe("running")
+    const prompts = childSessions.get(task.sessionId!)!.prompts
+    expect(prompts).toHaveLength(2)
+    const parts = (prompts[1] as { parts?: Array<{ type: string; text?: string }> }).parts
+    expect(parts?.[parts.length - 1]?.text).toBe("展开第二步的细节")
+    await manager.shutdown()
+  })
+
+  test("failed steering delivery re-queues, gives up after the cap, then lets the task settle", async () => {
+    const { manager, client, statusData, childSessions } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    statusData[task.sessionId!] = { type: "idle" }
+
+    // Wrapped AFTER launch landed (unwrapped), so every wrapped call to the
+    // child session is a steering delivery — they all fail.
+    const original = client.session.promptAsync.bind(client.session)
+    client.session.promptAsync = async (...args: Parameters<PrismClient["session"]["promptAsync"]>) => {
+      if (args[0].path.id === task.sessionId) throw new Error("boom")
+      return original(...args)
+    }
+
+    await manager.send(task.id, "adjust")
+    await poll(manager) // attempt 1: fail, re-queue
+    expect(task.status).toBe("running")
+    await poll(manager) // attempt 2: fail, re-queue
+    expect(task.status).toBe("running")
+    await poll(manager) // attempt 3: cap reached, messages dropped
+    expect(task.status).toBe("running")
+    await poll(manager) // empty queue → settles
+    expect(task.status).toBe("completed")
+    // failures never rebuilt the child session (the launch retry path aborts
+    // and recreates; steering failures must not)
+    expect(childSessions.size).toBe(1)
+    await manager.shutdown()
+  })
+
+  test("cancel drops queued steering messages", async () => {
+    const { manager } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await manager.send(task.id, "too late")
+    await manager.cancelTask(task.id)
+    expect(task.steeringQueue).toBeUndefined()
+    expect(task.status).toBe("cancelled")
+  })
+
+  // Regression (review blocker): the sweep's status snapshot can predate a
+  // steering round's acceptance — a just-delivered round must not be
+  // completed by an immediately following sweep (the busy mark also lags
+  // acceptance, so "absent from the map" reads as idle here).
+  test("a just-accepted steering round is not completed by an immediately following sweep", async () => {
+    const { manager } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    await manager.send(task.id, "adjust")
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: task.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(task.status).toBe("running")
+
+    await poll(manager) // stale/absent snapshot says idle — grace must hold
+    expect(task.status).toBe("running")
+
+    // past the grace window with the round truly idle, the sweep settles it
+    task.lastSteeringDeliveredAt = new Date(Date.now() - 30_000)
+    await poll(manager)
+    expect(task.status).toBe("completed")
+    await manager.shutdown()
+  })
+
+  // The other half of the same protection: completion re-checks the session
+  // status fresh — an idle event must not complete a session that is busy
+  // right now (e.g. the sweep's snapshot said idle, reality says busy).
+  test("an idle event does not complete a session the fresh status check reports busy", async () => {
+    const { manager, statusData } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    statusData[task.sessionId!] = { type: "busy" }
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: task.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(task.status).toBe("running")
+
+    statusData[task.sessionId!] = { type: "idle" }
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: task.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(task.status).toBe("completed")
+    await manager.shutdown()
+  })
+
+  test("a task cancelled while a steering delivery is in flight discards the result silently", async () => {
+    const { manager, client, toasts } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    // Installed after launch: every wrapped call to the child is a delivery.
+    let release!: (value: unknown) => void
+    const acceptanceGate = new Promise((resolve) => (release = resolve))
+    const original = client.session.promptAsync.bind(client.session)
+    client.session.promptAsync = async (...args: Parameters<PrismClient["session"]["promptAsync"]>) => {
+      if (args[0].path.id === task.sessionId) await acceptanceGate
+      return original(...args)
+    }
+
+    await manager.send(task.id, "late correction")
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: task.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 50)) // settle awaits acceptance
+
+    await manager.cancelTask(task.id)
+    release(undefined) // acceptance resolves AFTER the cancellation
+    await new Promise((resolve) => setTimeout(resolve, 150))
+
+    expect(task.status).toBe("cancelled")
+    expect(task.steeringQueue).toBeUndefined() // failure path must not resurrect it
+    expect(toasts.some((t) => t.message.includes("已投递"))).toBe(false)
+    expect(toasts.some((t) => t.message.includes("将重试"))).toBe(false)
+    await manager.shutdown()
+  })
+
+  test("messages queued after a failed delivery batch survive the attempt cap", async () => {
+    const { manager, client, statusData, childSessions } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    statusData[task.sessionId!] = { type: "idle" }
+
+    // Fail every wrapped child call; hold the THIRD one in flight so a new
+    // message can be queued while that delivery attempt is underway.
+    let holdRelease!: (value: unknown) => void
+    const hold = new Promise((resolve) => (holdRelease = resolve))
+    let wrappedCalls = 0
+    const original = client.session.promptAsync.bind(client.session)
+    client.session.promptAsync = async (...args: Parameters<PrismClient["session"]["promptAsync"]>) => {
+      if (args[0].path.id === task.sessionId) {
+        wrappedCalls++
+        if (wrappedCalls === 3) await hold
+        throw new Error("boom")
+      }
+      return original(...args)
+    }
+
+    await manager.send(task.id, "adjust")
+    await poll(manager) // attempt 1: fail
+    await poll(manager) // attempt 2: fail
+    const thirdPoll = poll(manager) // attempt 3: held in flight…
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await manager.send(task.id, "queued during the attempt") // …so this was never tried
+    holdRelease(undefined)
+    await thirdPoll // attempt 3 hits the cap, drops only "adjust"
+
+    expect(task.steeringQueue).toEqual(["queued during the attempt"])
+    expect(task.status).toBe("running")
+
+    client.session.promptAsync = original // delivery works again
+    await poll(manager) // delivers the surviving message
+    expect(task.status).toBe("running")
+    const prompts = childSessions.get(task.sessionId!)!.prompts
+    const parts = (prompts[prompts.length - 1] as { parts?: Array<{ text?: string }> }).parts
+    expect(parts?.some((part) => part.text === "queued during the attempt")).toBe(true)
+    await manager.shutdown()
+  })
+
+  test("steering queued while a task is still pending merges into its launch round", async () => {
+    const { manager, childSessions } = createManager({ concurrency: 1 })
+    const blocker = await manager.launch({ description: "blocker", prompt: "b", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50)) // holds the only slot
+    const task = await manager.launch({ description: "queued", prompt: "work", parentSessionId: "parent" })
+    expect(task.status).toBe("pending")
+
+    await manager.send(task.id, "do it this way")
+
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: blocker.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    expect(task.status).toBe("running")
+
+    const prompts = childSessions.get(task.sessionId!)!.prompts
+    const parts = (prompts[0] as { parts?: Array<{ text?: string }> }).parts
+    expect(parts?.some((part) => part.text === "work")).toBe(true)
+    expect(parts?.some((part) => part.text === "do it this way")).toBe(true)
+    await manager.shutdown()
+  })
+
+  // --- bg_wait ---
+
+  test("waitForTasks resolves once every task settles", async () => {
+    const { manager } = createManager()
+    const a = await manager.launch({ description: "a", prompt: "work", parentSessionId: "parent" })
+    const b = await manager.launch({ description: "b", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(a.status).toBe("running")
+    expect(b.status).toBe("running")
+
+    let done: { tasks: BgTask[]; timedOut: boolean } | undefined
+    const waiting = manager.waitForTasks([a.id, b.id], 5_000).then((result) => (done = result))
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(done).toBeUndefined()
+
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: a.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(done).toBeUndefined() // b still running
+
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: b.sessionId } })
+    await waiting
+    expect(done?.timedOut).toBe(false)
+    expect(done?.tasks.map((t) => t.status)).toEqual(["completed", "completed"])
+    await manager.shutdown()
+  })
+
+  test("waitForTasks times out and reports current statuses", async () => {
+    const { manager } = createManager()
+    const task = await manager.launch({ description: "slow", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    const { tasks, timedOut } = await manager.waitForTasks([task.id], 30)
+    expect(timedOut).toBe(true)
+    expect(tasks[0]?.status).toBe("running")
+    await manager.shutdown()
+  })
+
+  test("waitForTasks resolves immediately for already-terminal tasks", async () => {
+    const { manager } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: task.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(task.status).toBe("completed")
+
+    const { tasks, timedOut } = await manager.waitForTasks([task.id], 5)
+    expect(timedOut).toBe(false)
+    expect(tasks[0]?.status).toBe("completed")
+    await manager.shutdown()
+  })
+
+  test("waitForTasks always removes its terminal listener (resolve and timeout paths)", async () => {
+    const { manager } = createManager()
+    const internals = manager as unknown as { terminalListeners: Set<unknown> }
+    const baseline = internals.terminalListeners.size
+
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    await manager.waitForTasks([task.id], 20) // timeout path
+    expect(internals.terminalListeners.size).toBe(baseline)
+
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: task.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    await manager.waitForTasks([task.id], 5) // immediate-resolve path
+    expect(internals.terminalListeners.size).toBe(baseline)
     await manager.shutdown()
   })
 })

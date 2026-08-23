@@ -71,3 +71,23 @@ export function guessImageMime(url: string): string {
       return "image/png"
   }
 }
+
+// The TUI renders slash-command attachments as "[Image N]" placeholder tokens
+// in the command arguments (and relay models pass the same tokens to
+// vision_look). They carry no path or URL, so they are not usable image
+// references — callers detect them and fall back to the session's latest
+// image message instead.
+const IMAGE_PLACEHOLDER_RE = /^\[Image \d+\]$/
+
+// Split reference lists into attachment placeholders and real (path/URL/data
+// URL) references. "last" is a real reference here: the sentinel is handled
+// by the callers before placeholder splitting.
+export function splitPlaceholderRefs(refs: string[]): { placeholders: string[]; real: string[] } {
+  const placeholders: string[] = []
+  const real: string[] = []
+  for (const ref of refs) {
+    if (IMAGE_PLACEHOLDER_RE.test(ref)) placeholders.push(ref)
+    else real.push(ref)
+  }
+  return { placeholders, real }
+}

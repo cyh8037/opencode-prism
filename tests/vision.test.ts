@@ -342,8 +342,9 @@ describe("VisionPipeline", () => {
       getVisionModel: () => VISION_MODEL,
       interpretTimeoutMs: 300,
     })
-    const text = await pipeline.look("parent", [{ mime: "image/png", url: FAKE_PNG_URL }])
-    expect(text).toBeNull()
+    const result = await pipeline.look("parent", [{ mime: "image/png", url: FAKE_PNG_URL }])
+    expect(result.text).toBeNull()
+    expect(result.reason).toBe("timeout")
     // exactly one child: the timeout suppressed the second attempt
     expect(childSessions.size).toBe(1)
   })
@@ -497,6 +498,48 @@ describe("vision_look tool", () => {
     const result = await tool.execute({ images: ["last"] }, { sessionID: "parent" } as never)
     expect(result).toContain("没有找到任何图片消息")
   })
+
+  // The 2026-08-22 incident (originally via the removed /vision command):
+  // an invalid image reference was reported as a missing vision model even
+  // though vision.model was configured and resolved — the failure cause must
+  // be reported truthfully on every entry point.
+  test("invalid image refs report the real cause, not the missing-model hint", async () => {
+    const harness = createVisionHarness("sync")
+    const tool = createVisionLookTool(harness.pipeline)
+    const result = await tool.execute({ images: ["not-a-ref"] }, { sessionID: "parent" } as never)
+    expect(result).toContain("图片引用无效")
+    expect(result).not.toContain("无可用视觉模型")
+  })
+
+  // A relay model may forward attachment placeholders as if they were
+  // references; with only placeholders the tool must fall back to the
+  // session's latest image instead of failing on unresolvable tokens.
+  test('images: ["[Image 1]"] delegates to lookLatest', async () => {
+    const harness = createVisionHarness("sync")
+    harness.client.session.messages = async () => ({
+      data: [
+        { info: { role: "user" }, parts: [{ type: "file", mime: "image/png", url: FAKE_PNG_URL }] },
+        { info: { role: "assistant" }, parts: [{ type: "text", text: "解读：页面顶部有报错横幅", state: { status: "completed" } }] },
+      ],
+    })
+    const tool = createVisionLookTool(harness.pipeline)
+    const result = await tool.execute({ images: ["[Image 1]"] }, { sessionID: "parent" } as never)
+    expect(result).toContain("报错横幅")
+  })
+
+  test("mixed placeholders and a real data URL interpret the real one with a note", async () => {
+    const harness = createVisionHarness("sync")
+    harness.client.session.messages = async () => ({
+      data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: "解读：图表", state: { status: "completed" } }] }],
+    })
+    const tool = createVisionLookTool(harness.pipeline)
+    const result = await tool.execute(
+      { images: ["[Image 1]", FAKE_PNG_URL] },
+      { sessionID: "parent" } as never,
+    )
+    expect(result).toContain("图表")
+    expect(result).toContain("已忽略 1 个 [Image N] 占位符")
+  })
 })
 
 describe("runVisionInterpretation", () => {
@@ -532,7 +575,7 @@ describe("runVisionInterpretation", () => {
       model: { providerID: "openai", modelID: "gpt-5.6-sol" },
       timeoutMs: 5000,
     })
-    expect(result).toEqual({ text: null, timedOut: false })
+    expect(result).toEqual({ text: null, reason: "no-output" })
     // must not have aborted on the first (empty-map) poll before the session
     // was ever observed busy
     expect(statusCalls).toBeGreaterThanOrEqual(3)

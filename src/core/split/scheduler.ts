@@ -20,6 +20,34 @@ export interface SplitRunResult {
 }
 
 const TERMINAL = new Set(["completed", "error", "cancelled"])
+// Sentinel value in skippedPlanIDs: the plan itself never launched (manager
+// rejected it — unresolvable model, shutdown). Distinct from a plan id so
+// the report can say "启动失败" instead of the misleading "上游 <自己> 失败".
+const LAUNCH_FAILED = "launch-failed"
+
+// Topological layering for display (dry-run). Layer N holds every plan whose
+// dependencies all live in earlier layers. NOTE: this matches the runtime's
+// ORDER, not its trigger semantics — the scheduler launches each task as soon
+// as its own dependencies reach terminal status (ASAP), with no whole-wave
+// barrier; display text must not claim more than the ordering. Plans are
+// schema-validated (acyclic, known ids); any unorderable remainder is
+// appended to a final layer rather than dropped, keeping this total.
+export function layerPlans(plans: SubTaskPlan[]): SubTaskPlan[][] {
+  const placed = new Set<string>()
+  const layers: SubTaskPlan[][] = []
+  let remaining = plans
+  while (remaining.length > 0) {
+    const layer = remaining.filter((plan) => plan.dependsOn.every((dep) => placed.has(dep)))
+    if (layer.length === 0) {
+      layers.push(remaining)
+      break
+    }
+    for (const plan of layer) placed.add(plan.id)
+    layers.push(layer)
+    remaining = remaining.filter((plan) => !placed.has(plan.id))
+  }
+  return layers
+}
 
 // DAG scheduler: topological layering. Layer 0 launches immediately; a task's
 // dependents launch once all their dependencies reached a terminal status.
@@ -117,7 +145,10 @@ export function runSplit(manager: BackgroundManager, options: SplitRunOptions): 
           tasksByPlanID.set(plan.id, task)
         })
         .catch(() => {
-          // launch failure: mark the plan terminal so dependents can proceed
+          // A launch failure IS a failed dependency: proceeding would run the
+          // dependents on missing upstream output. Record it in the skip map
+          // so failedDependency() cascades, exactly like an errored task.
+          skippedPlanIDs.set(plan.id, LAUNCH_FAILED)
           terminalPlanIDs.add(plan.id)
           checkSettled()
           launchReady()
@@ -156,7 +187,11 @@ export function buildSplitReport(
   for (const plan of plans) {
     const skippedDep = skippedPlanIDs.get(plan.id)
     if (skippedDep) {
-      lines.push(`- ${plan.id} ${plan.title}: SKIPPED (上游 ${skippedDep} 失败，未启动)`)
+      if (skippedDep === LAUNCH_FAILED) {
+        lines.push(`- ${plan.id} ${plan.title}: 启动失败（未能创建后台任务，详见插件日志）`)
+      } else {
+        lines.push(`- ${plan.id} ${plan.title}: SKIPPED (上游 ${skippedDep} 失败，未启动)`)
+      }
       continue
     }
     const task = tasksByPlanID.get(plan.id)

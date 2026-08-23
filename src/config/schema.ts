@@ -31,6 +31,13 @@ export const prismConfigSchema = z.object({
       concurrency: z.number().int().min(1),
     })
     .default({ concurrency: 5 }),
+  split: z
+    .object({
+      // split_task tool (model-initiated splits). The /split command is always
+      // available; this only gates the LLM-facing tool entry point.
+      tool: z.boolean(),
+    })
+    .default({ tool: true }),
 })
 
 export type PrismConfig = z.infer<typeof prismConfigSchema>

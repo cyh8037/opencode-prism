@@ -1,9 +1,12 @@
+import { MAX_SUBTASKS } from "../../config/constants"
 import type { ResolvedModel } from "../../models"
 import { log } from "../../shared/log"
 import type { BackgroundManager } from "../background/manager"
 import type { PrismClient } from "../client-types"
 import type { PromptGate } from "../prompt-gate"
+import type { SubTaskPlan } from "./plan-schema"
 import { planSplit } from "./planner"
+import { layerPlans } from "./scheduler"
 import { buildSplitReport, runSplit, type SplitRunResult } from "./scheduler"
 
 export interface SplitServiceDeps {
@@ -38,6 +41,15 @@ export class SplitService {
   }
 
   async split(request: SplitRequest): Promise<SplitOutcome> {
+    // Single source of the subtask bounds for BOTH entry points (/split
+    // command and split_task tool): out-of-range or non-integer values fall
+    // back to the default instead of producing a contradictory planner
+    // prompt ("2 到 1 个子任务") or a plan the schema rejects wholesale.
+    const maxSubtasks =
+      request.maxSubtasks !== undefined && Number.isInteger(request.maxSubtasks)
+        ? Math.min(Math.max(request.maxSubtasks, 2), MAX_SUBTASKS)
+        : undefined
+
     const plannerModel = await this.deps.resolvePlannerModel(request.sessionID)
     if (!plannerModel) {
       return {
@@ -56,7 +68,7 @@ export class SplitService {
         parentSessionID: request.sessionID,
         task: request.task,
         model: plannerModel,
-        maxSubtasks: request.maxSubtasks,
+        maxSubtasks,
       })
     } catch (error) {
       this.logger("[prism] split: planner threw", { error })
@@ -70,16 +82,30 @@ export class SplitService {
     }
 
     if (request.dryRun) {
-      const planLines = plans
-        .map((plan) => {
-          const deps = plan.dependsOn.length > 0 ? ` (依赖: ${plan.dependsOn.join(", ")})` : ""
-          return `- ${plan.id} ${plan.title}${deps}\n  ${plan.description}`
-        })
-        .join("\n")
-      return {
-        kind: "dry-run",
-        message: `拆分计划（${plans.length} 个子任务，未执行）:\n${planLines}`,
+      const renderPlan = (prefix: string, plan: SubTaskPlan) => {
+        const deps = plan.dependsOn.length > 0 ? ` (依赖: ${plan.dependsOn.join(", ")})` : ""
+        return `${prefix} ${plan.id} ${plan.title}${deps}\n  ${plan.description}`
       }
+      const layers = layerPlans(plans)
+      // Sequential runs launch in plan order (the scheduler's sequential
+      // loop), not wave order — render the actual execution order. Parallel
+      // runs render topological waves, but each task starts as soon as ITS
+      // OWN dependencies finish (ASAP), so the wave text must not imply a
+      // whole-wave barrier.
+      const message = request.sequential
+        ? `拆分计划（${plans.length} 个子任务，串行执行，未执行）:\n执行顺序:\n${plans
+            .map((plan, index) => renderPlan(`${index + 1}.`, plan))
+            .join("\n")}`
+        : `拆分计划（${plans.length} 个子任务，分 ${layers.length} 波执行，未执行）:\n${layers
+            .map((layer, index) => {
+              const header =
+                index === 0
+                  ? "第 1 波（无依赖，立即启动）:"
+                  : `第 ${index + 1} 波（依赖在前一波；各任务在其依赖完成后即启动，不等整波全部结束）:`
+              return `${header}\n${layer.map((plan) => renderPlan("-", plan)).join("\n")}`
+            })
+            .join("\n")}`
+      return { kind: "dry-run", message }
     }
 
     const run = runSplit(this.deps.manager, {
@@ -108,9 +134,14 @@ export class SplitService {
         await new Promise((resolve) => setTimeout(resolve, 2_000))
         result = await dispatch()
         if (result.status === "failed") {
-          this.logger("[prism] split: aggregation dispatch failed permanently (report lost)", {
+          // The report is the only record of the SKIPPED plans (the per-task
+          // batch notices never mention unlaunched ones) — once it is lost to
+          // the parent conversation, the log file is the only place it can
+          // still be recovered from.
+          this.logger("[prism] split: aggregation dispatch failed permanently (report lost to chat, preserved below)", {
             sessionID: request.sessionID,
             error: result.error,
+            report: text,
           })
         }
       }

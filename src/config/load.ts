@@ -73,7 +73,7 @@ export function parseConfig(partial: Record<string, unknown>, warnings: string[]
   warnings.push(`config validation failed, invalid sections fell back to defaults:\n${issues}`)
 
   const result: PrismConfig = { ...defaults }
-  for (const key of ["vision", "background"] as const) {
+  for (const key of ["vision", "background", "split"] as const) {
     const value = merged[key]
     if (value === undefined) continue
     const sectionParsed = prismConfigSchema.shape[key].safeParse(value)
@@ -96,11 +96,9 @@ export function loadConfig(startDir: string, env: Record<string, string | undefi
 
   const warnings: string[] = []
   let merged: Record<string, unknown> = {}
-  if (userPath !== null) {
-    const user = readConfigFile(userPath)
-    if (user.warning) warnings.push(user.warning)
-    if (user.value) merged = deepMerge(merged, user.value)
-  }
+  const user = readConfigFile(userPath)
+  if (user.warning) warnings.push(user.warning)
+  if (user.value) merged = deepMerge(merged, user.value)
   if (projectPath !== null) {
     const project = readConfigFile(projectPath)
     if (project.warning) warnings.push(project.warning)

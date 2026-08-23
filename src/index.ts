@@ -13,8 +13,9 @@ import { createChatParamsHook } from "./hooks/chat-params"
 import { createEventHook } from "./hooks/event"
 import { createCommandExecuteBeforeHook } from "./hooks/command-execute-before"
 import { createBgTools } from "./tools/bg"
+import { createSplitTool } from "./tools/split"
 import { createVisionLookTool } from "./tools/vision-look"
-import { BG_COMMAND, SPLIT_COMMAND, VISION_COMMAND, type PrismCommandDefinition } from "./commands/templates"
+import { BG_COMMAND, SPLIT_COMMAND, type PrismCommandDefinition } from "./commands/templates"
 import { log } from "./shared/log"
 import { guardHook } from "./shared/hook-guard"
 import { resolveServerUrl } from "./shared/server-url"
@@ -176,12 +177,16 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
       cfg.command = {
         ...(cfg.command ?? {}),
         bg: BG_COMMAND,
-        split: SPLIT_COMMAND,
-        vision: VISION_COMMAND,
+        // split.tool gates BOTH split entries: the command's task mode runs
+        // through the split_task tool (template-instructed), so without the
+        // tool a registered command could not execute — do not register it.
+        ...(config.split.tool ? { split: SPLIT_COMMAND } : {}),
       }
     },
     tool: {
       ...createBgTools(manager),
+      // Read once at plugin load: toggling it requires restarting opencode.
+      ...(config.split.tool ? createSplitTool(splitService) : {}),
       vision_look: createVisionLookTool(vision),
     },
     // Every hook is guarded: a throwing plugin hook is published by opencode
@@ -191,7 +196,7 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
     "chat.params": guardHook("chat.params", createChatParamsHook(modelTracker)),
     "command.execute.before": guardHook(
       "command.execute.before",
-      createCommandExecuteBeforeHook({ manager, splitService, serverUrl: attachServerUrl, vision }),
+      createCommandExecuteBeforeHook({ manager, serverUrl: attachServerUrl, client }),
     ),
     event: guardHook("event", createEventHook(manager, modelTracker, gate)),
     dispose: async () => {

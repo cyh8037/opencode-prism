@@ -64,4 +64,50 @@ describe("plugin init resilience", () => {
       rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  // Since 0.3.0 the switch gates BOTH split entries: the /split command's
+  // task mode runs through the split_task tool (template-instructed), so
+  // disabling the tool also unregisters the command — a registered command
+  // that could not execute would be worse.
+  test("split.tool=false disables both the split_task tool and the /split command", async () => {
+    const init = async (contents: string | null) => {
+      const dir = withProjectConfig(contents)
+      try {
+        const plugin = await Prism({ directory: dir, client: stubClient } as never)
+        const dispose = plugin.dispose as (() => Promise<void>) | undefined
+        await dispose?.()
+        const toolNames = Object.keys(plugin.tool as Record<string, unknown>)
+        const cfg: Record<string, unknown> = { model: "openai/gpt-5.6-sol" }
+        await (plugin.config as (c: unknown) => Promise<void>)(cfg)
+        const commandNames = Object.keys((cfg as { command?: Record<string, unknown> }).command ?? {})
+        return { toolNames, commandNames }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }
+
+    const on = await init(null)
+    expect(on.toolNames).toContain("split_task")
+    expect(on.commandNames).toEqual(["bg", "split"])
+
+    const off = await init('{ "split": { "tool": false } }')
+    expect(off.toolNames).not.toContain("split_task")
+    expect(off.commandNames).toEqual(["bg"])
+    // neighboring tools are unaffected by the switch
+    expect(off.toolNames).toContain("bg_spawn")
+  })
+
+  // An invalid split section falls back to its own defaults (tool on) — the
+  // same per-section resilience vision/background already have.
+  test("an invalid split section falls back to the default instead of disabling the tool", async () => {
+    const dir = withProjectConfig('{ "split": { "tool": "yes" } }')
+    try {
+      const plugin = await Prism({ directory: dir, client: stubClient } as never)
+      expect(Object.keys(plugin.tool as Record<string, unknown>)).toContain("split_task")
+      const dispose = plugin.dispose as (() => Promise<void>) | undefined
+      await dispose?.()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
 })

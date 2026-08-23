@@ -10,7 +10,10 @@ export function resolveServerUrl(
 ): string {
   const configuredPort = env.OPENCODE_PORT
   const parsedPort = configuredPort ? Number(configuredPort) : DEFAULT_SERVER_PORT
-  const fallbackUrl = `http://localhost:${DEFAULT_SERVER_PORT}`
+  // 127.0.0.1 instead of localhost: on Windows "localhost" can resolve to
+  // ::1 first, and a server bound to 127.0.0.1 only is then unreachable via
+  // the hinted URL. A provided ctx.serverUrl is passed through unchanged.
+  const fallbackUrl = `http://127.0.0.1:${DEFAULT_SERVER_PORT}`
 
   if (rawServerUrl) {
     try {
@@ -30,5 +33,5 @@ export function resolveServerUrl(
   if (!Number.isInteger(parsedPort) || parsedPort <= 0 || parsedPort > 65535) {
     return fallbackUrl
   }
-  return `http://localhost:${parsedPort}`
+  return `http://127.0.0.1:${parsedPort}`
 }

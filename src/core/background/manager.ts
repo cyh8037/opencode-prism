@@ -5,6 +5,11 @@ import {
   MAX_RETRIES,
   MAX_TOOL_CALLS,
   POLLING_INTERVAL_MS,
+  RESUME_ACQUIRE_TIMEOUT_MS,
+  STEERING_ACCEPT_TIMEOUT_MS,
+  STEERING_MAX_DELIVERY_ATTEMPTS,
+  STEERING_SETTLE_GRACE_MS,
+  TASK_INACTIVITY_TIMEOUT_MS,
   TASK_TTL_MS,
   TERMINAL_TASK_RETENTION_MS,
 } from "../../config/constants"
@@ -31,6 +36,7 @@ export interface BackgroundManagerDeps {
   resolveModel: ResolveModelFn
   logger?: typeof log
   pollingIntervalMs?: number
+  resumeAcquireTimeoutMs?: number
 }
 
 interface ForwardedEvent {
@@ -82,12 +88,20 @@ export class BackgroundManager {
   private tasksByParentSession = new Map<string, Set<string>>()
   private queuesByKey = new Map<string, QueueItem[]>()
   private processingKeys = new Set<string>()
-  private pendingByParent = new Map<string, Set<string>>()
   private notificationQueueByParent = new Map<string, Promise<void>>()
+  /** Terminal tasks parked in resume()'s concurrency wait, cancellable by id. */
+  private resumingTaskIds = new Set<string>()
+  /** Tasks with an idle-settle in flight: the event path and the polling
+   *  sweep can observe the same idle transition, and a concurrent second
+   *  settle would complete a task whose steering round just launched. */
+  private settlingTaskIds = new Set<string>()
   private terminalListeners = new Set<(task: BgTask) => void>()
+  /** In-flight waitForTasks waiters, woken on shutdown. */
+  private waitFinishers = new Set<() => void>()
   private concurrency: ConcurrencyManager
   private pollingInterval?: ReturnType<typeof setInterval>
   private pollingInFlight = false
+  private resumeAcquireTimeoutMs: number
   private shutdownTriggered = false
   /** Running tasks already warned about exceeding the TTL (warn once). */
   private ttlWarned = new Set<string>()
@@ -96,6 +110,7 @@ export class BackgroundManager {
   constructor(private deps: BackgroundManagerDeps) {
     this.concurrency = new ConcurrencyManager(deps.config.background.concurrency ?? DEFAULT_CONCURRENCY)
     this.logger = deps.logger ?? log
+    this.resumeAcquireTimeoutMs = deps.resumeAcquireTimeoutMs ?? RESUME_ACQUIRE_TIMEOUT_MS
   }
 
   onTaskTerminal(listener: (task: BgTask) => void): void {
@@ -187,12 +202,6 @@ export class BackgroundManager {
     // --parallel) would otherwise flood the TUI with N "Started" toasts.
     if (this.getTasksByParentSession(input.parentSessionId).length === 1) {
       this.showToast("Prism background task", `Started: ${task.description} (${task.id})`, "info", 4000)
-    }
-
-    if (input.parentSessionId) {
-      const pending = this.pendingByParent.get(input.parentSessionId) ?? new Set<string>()
-      pending.add(task.id)
-      this.pendingByParent.set(input.parentSessionId, pending)
     }
 
     const key = this.concurrencyKeyFor(model)
@@ -309,6 +318,22 @@ export class BackgroundManager {
 
     this.startPolling()
 
+    // Steering queued while the task was still pending joins the LAUNCH
+    // round — a corrective message must not wait out the entire first round.
+    // Written back onto task.parts so the same-model retry path replays it.
+    const launchParts: Array<Record<string, unknown>> = [
+      ...(input.parts ?? [{ type: "text", text: input.prompt, synthetic: true }]),
+    ]
+    const pendingSteering = task.steeringQueue?.splice(0, task.steeringQueue.length) ?? []
+    if (pendingSteering.length > 0) {
+      launchParts.push(...pendingSteering.map((text) => ({ type: "text", text, synthetic: true })))
+      task.parts = launchParts
+      this.logger("[prism] merging queued steering into the launch round", {
+        taskId: task.id,
+        count: pendingSteering.length,
+      })
+    }
+
     // The prompt API's model reference is { providerID, modelID } — the
     // { id, providerID } shape session.create accepts is rejected here with
     // 400 (Missing key ["model"]["modelID"]).
@@ -320,10 +345,12 @@ export class BackgroundManager {
       tools: {
         bg_spawn: false,
         bg_cancel: false,
+        bg_send: false,
+        bg_wait: false,
         question: false,
       },
       ...(input.system ? { system: input.system } : {}),
-      parts: input.parts ?? [{ type: "text", text: input.prompt, synthetic: true }],
+      parts: launchParts,
     }
     if (input.agent) {
       promptBody.agent = input.agent
@@ -389,6 +416,9 @@ export class BackgroundManager {
   }
 
   private async tryRetry(task: BgTask, errorInfo: { name?: string; message?: string; statusCode?: number }): Promise<boolean> {
+    // Shutdown clears the queues; re-queueing here would strand the task as a
+    // forever-pending object nothing will ever start.
+    if (this.shutdownTriggered) return false
     const retryable = shouldRetryError(errorInfo)
     if (!retryable) return false
     if (task.retries >= MAX_RETRIES) {
@@ -430,6 +460,10 @@ export class BackgroundManager {
 
     task.retries += 1
     task.queuedAt = new Date()
+    // stale-prune anchors pending tasks on startedAt ?? queuedAt — a first
+    // start 30 minutes ago would otherwise get the retry cancelled as a
+    // "queued task exceeded the TTL" the moment it re-queues.
+    task.startedAt = undefined
 
     const key = this.concurrencyKeyFor(model)
     const queue = this.queuesByKey.get(key) ?? []
@@ -458,14 +492,17 @@ export class BackgroundManager {
   }
 
   private async abortSession(sessionID: string, reason: string): Promise<void> {
-    try {
-      await Promise.race([
-        this.deps.client.session.abort({ path: { id: sessionID } }),
-        new Promise((resolve) => setTimeout(resolve, ABORT_TIMEOUT_MS)),
-      ])
-    } catch (error) {
-      this.logger(`[prism] session abort failed during ${reason}`, { sessionID, error })
-    }
+    // The race only bounds the WAIT. Converting the abort's own rejection
+    // into a log here means a failure landing after the timeout is still
+    // recorded (and never surfaces as an unhandled rejection) — Promise.race
+    // would otherwise swallow it without a trace.
+    const abort = this.deps.client.session.abort({ path: { id: sessionID } }).then(
+      () => undefined,
+      (error) => {
+        this.logger(`[prism] session abort failed during ${reason}`, { sessionID, error })
+      },
+    )
+    await Promise.race([abort, new Promise((resolve) => setTimeout(resolve, ABORT_TIMEOUT_MS))])
   }
 
   handleEvent(event: ForwardedEvent): void {
@@ -519,8 +556,8 @@ export class BackgroundManager {
     if (event.type === "session.idle" && sessionID) {
       const task = this.findBySession(sessionID)
       if (task && task.status === "running") {
-        void this.validateAndComplete(task, "session.idle event").catch((error) => {
-          this.logger("[prism] validateAndComplete failed", { taskId: task.id, error })
+        void this.settleIdleTask(task, "session.idle event").catch((error) => {
+          this.logger("[prism] settleIdleTask failed", { taskId: task.id, error })
         })
       }
       return
@@ -629,14 +666,207 @@ export class BackgroundManager {
     }
   }
 
-  private async validateAndComplete(task: BgTask, source: string): Promise<void> {
+  // Idle-boundary settlement: the single gate through which a running task
+  // either (a) is still waiting for output, (b) starts a queued steering
+  // round, or (c) completes. Guarded per task: the event path and the sweep
+  // both land here for the same idle transition, and racing settles would
+  // complete a task whose steering round just launched.
+  private async settleIdleTask(task: BgTask, source: string): Promise<void> {
     if (task.status !== "running" || !task.sessionId) return
-    const hasOutput = await this.validateSessionHasOutput(task.sessionId, task)
-    if (!hasOutput) {
-      this.logger("[prism] session idle but no output yet, waiting", { taskId: task.id })
+    if (this.settlingTaskIds.has(task.id)) return
+    this.settlingTaskIds.add(task.id)
+    try {
+      const hasOutput = await this.validateSessionHasOutput(task.sessionId, task)
+      if (!hasOutput) {
+        this.logger("[prism] session idle but no output yet, waiting", { taskId: task.id })
+        return
+      }
+      if (await this.deliverSteering(task)) return
+      if (task.status !== "running") return // settled (cancel/error) while we awaited
+      if (!(await this.confirmStillIdle(task))) return
+      // A message may have queued while the confirmation call was in flight —
+      // send() only checks status === "running", which still held. Completing
+      // now would silently drop it (finalize clears the queue) after the
+      // caller was already told "已排队"; hand it to the next idle boundary.
+      if (task.steeringQueue && task.steeringQueue.length > 0) return
+      await this.completeTask(task, source)
+    } finally {
+      this.settlingTaskIds.delete(task.id)
+    }
+  }
+
+  // Fresh, per-session completion confirmation. The caller's idle signal can
+  // be stale by the time we get here: the sweep iterates a status snapshot
+  // taken seconds earlier (earlier settles stall on aborts and gate
+  // dispatches), and an idle snapshot from BEFORE a steering round was
+  // accepted must never complete the task. Completion therefore re-reads the
+  // status at decision time and only proceeds on a confirmed idle session.
+  private async confirmStillIdle(task: BgTask): Promise<boolean> {
+    // The status map itself can lag acceptance (the server marks busy
+    // slightly after promptAsync resolves): the grace window bridges that
+    // regardless of what a fresh read says.
+    if (task.lastSteeringDeliveredAt) {
+      const sinceMs = Date.now() - task.lastSteeringDeliveredAt.getTime()
+      if (sinceMs < STEERING_SETTLE_GRACE_MS) {
+        this.logger("[prism] steering round recently accepted, deferring completion", {
+          taskId: task.id,
+          sinceMs,
+        })
+        return false
+      }
+    }
+    try {
+      const response = await this.deps.client.session.status()
+      const map = response.data
+      if (!map || typeof map !== "object") return false
+      const type = (map as SessionStatusMap)[task.sessionId!]?.type
+      // Absent entries ARE the idle state (the map only lists non-idle
+      // sessions); anything else is left to the next sweep.
+      if (type === undefined || type === "idle") return true
+      this.logger("[prism] session not idle on fresh check, deferring completion", {
+        taskId: task.id,
+        type,
+      })
+      return false
+    } catch (error) {
+      // Fail closed: completing (and aborting) on unverifiable state is the
+      // exact bug this check exists to prevent.
+      this.logger("[prism] fresh status check failed, deferring completion", { taskId: task.id, error })
+      return false
+    }
+  }
+
+  // Deliver queued steering messages as ONE continuation round, at the idle
+  // boundary and before completion is declared — the "message queued for
+  // delivery at its next tool round" semantic, bounded to round boundaries
+  // (the finest granularity a plugin can observe). Acceptance is AWAITED
+  // (unlike launch): only after the server accepted the prompt is the mutex
+  // released, so the next sweep cannot re-enter settle and complete the task
+  // before the round starts. Returns true when a round was launched (or a
+  // failed delivery was re-queued) — the caller must NOT complete the task.
+  private async deliverSteering(task: BgTask): Promise<boolean> {
+    const queue = task.steeringQueue
+    if (!queue || queue.length === 0 || !task.sessionId) return false
+
+    const sessionID = task.sessionId
+    const messages = queue.splice(0, queue.length)
+    task.steeringAttempts = (task.steeringAttempts ?? 0) + 1
+
+    const promptBody: Record<string, unknown> = {
+      tools: { bg_spawn: false, bg_cancel: false, bg_send: false, bg_wait: false, question: false },
+      parts: messages.map((text) => ({ type: "text", text, synthetic: true })),
+    }
+    if (task.agent) promptBody.agent = task.agent
+    if (task.model) {
+      promptBody.model = {
+        providerID: task.model.providerID,
+        modelID: task.model.modelID,
+      }
+    }
+
+    this.logger("[prism] delivering steering messages", { taskId: task.id, count: messages.length })
+
+    let accepted = false
+    let failureReason: string | undefined
+    let acceptanceTimer: ReturnType<typeof setTimeout> | undefined
+    try {
+      const acceptance = await Promise.race([
+        this.deps.client.session
+          .promptAsync({
+            path: { id: sessionID },
+            body: promptBody,
+            query: { directory: task.directory ?? this.deps.directory },
+          })
+          .then((result) => ({ ok: true as const, result })),
+        // A hung call would stall the sweep inside the settle mutex; racing
+        // it treats a late landing as a delivery failure (the message is
+        // re-queued, worst case delivered twice — never silently lost).
+        new Promise<{ ok: false }>((resolve) => {
+          acceptanceTimer = setTimeout(() => resolve({ ok: false }), STEERING_ACCEPT_TIMEOUT_MS)
+        }),
+      ]).finally(() => {
+        if (acceptanceTimer) clearTimeout(acceptanceTimer)
+      })
+      if (acceptance.ok) {
+        const errorInfo = errorInfoFromResult(acceptance.result)
+        if (errorInfo) failureReason = errorInfo.message ?? JSON.stringify(errorInfo)
+        else accepted = true
+      } else {
+        failureReason = `prompt acceptance timed out after ${STEERING_ACCEPT_TIMEOUT_MS}ms`
+      }
+    } catch (error) {
+      failureReason = error instanceof Error ? error.message : String(error)
+    }
+
+    // The task may have settled (cancelled, or errored into a retry) while we
+    // awaited acceptance — the message went to a session that no longer
+    // belongs to this round. Terminal tasks discard silently: no success
+    // toast, no anchor resets, and the failure path must not resurrect the
+    // queue. Anything non-terminal (a retry still pending, or already
+    // relaunched on a fresh session) instead re-queues the batch: the
+    // acceptance was for a session the manager itself is retiring, and a
+    // pending relaunch merges queued steering into its first round while a
+    // relaunched task delivers it at its next idle boundary — dropping it
+    // here would lose a message the caller saw "已排队" for.
+    if (task.status !== "running" || task.sessionId !== sessionID) {
+      this.logger("[prism] task settled while steering delivery was in flight", {
+        taskId: task.id,
+        status: task.status,
+      })
+      if (!TERMINAL_STATUSES.has(task.status)) {
+        task.steeringQueue = [...messages, ...(task.steeringQueue ?? [])]
+      }
+      return true
+    }
+
+    if (!accepted) {
+      this.handleSteeringDeliveryFailure(task, messages, failureReason ?? "unknown delivery failure")
+      return true
+    }
+
+    // The round was accepted: refresh the lifecycle anchors and restart the
+    // tool budget — steering is user-driven continuation, not a runaway
+    // loop, so the circuit-breaker budget counts per round.
+    task.steeringAttempts = 0
+    task.lastSteeringDeliveredAt = new Date()
+    task.startedAt = new Date()
+    this.ttlWarned.delete(task.id)
+    task.progress = {
+      toolCalls: 0,
+      // Keep the part-id set: late part.updated events from the previous
+      // round would otherwise count against the fresh budget.
+      toolPartIds: task.progress?.toolPartIds,
+      lastUpdate: new Date(),
+      lastTool: task.progress?.lastTool,
+    }
+    this.showToast("Prism background task", `补充指令已投递: ${task.description} (${task.id})`, "info", 4000)
+    return true
+  }
+
+  // A failed delivery re-queues the messages for the next idle boundary —
+  // deliberately NOT the launch retry path, which aborts the child and
+  // discards its accumulated context. Past the attempt cap the batch is
+  // dropped and the task settles normally on the next idle check; messages
+  // queued AFTER this delivery started have never been tried and survive.
+  // A dead child surfaces through the status map (session.deleted / error).
+  private handleSteeringDeliveryFailure(task: BgTask, messages: string[], reason: string): void {
+    this.logger("[prism] steering delivery failed", {
+      taskId: task.id,
+      reason,
+      attempts: task.steeringAttempts,
+    })
+    if ((task.steeringAttempts ?? 0) >= STEERING_MAX_DELIVERY_ATTEMPTS) {
+      task.steeringAttempts = 0
+      this.showToast(
+        "Prism background task",
+        `补充指令投递失败已放弃（${reason.slice(0, 80)}）: ${task.description} (${task.id})`,
+        "error",
+        6000,
+      )
       return
     }
-    await this.completeTask(task, source)
+    task.steeringQueue = [...messages, ...(task.steeringQueue ?? [])]
+    this.showToast("Prism background task", `补充指令投递失败，将重试: ${task.description} (${task.id})`, "warning", 4000)
   }
 
   private finalizeTask(task: BgTask, status: BgTask["status"], error?: string): void {
@@ -647,6 +877,10 @@ export class BackgroundManager {
     // The run is over: parts (image data URLs can be multi-MB) and the tool
     // dedupe set are only needed while the task can still launch or retry.
     task.parts = undefined
+    // Cancel/error supersede any queued steering (settle delivers before
+    // completing, so a terminal task has nothing deliverable left anyway).
+    task.steeringQueue = undefined
+    task.steeringAttempts = 0
     if (task.progress) task.progress.toolPartIds = undefined
     if (task.concurrencyKey) {
       this.concurrency.release(task.concurrencyKey)
@@ -665,10 +899,14 @@ export class BackgroundManager {
   }
 
   private async completeTask(task: BgTask, source: string): Promise<void> {
+    // The task may have settled (e.g. cancelled) while confirmStillIdle's
+    // status call was in flight — notifyParent would then duplicate the
+    // cancellation notice.
+    if (TERMINAL_STATUSES.has(task.status)) return
     // Reserve the parent gate BEFORE flipping status: between the flip and the
-    // wake landing, hasActiveChildTasks() would already report false. The
-    // reservation only covers the flip-to-notification queue window; the
-    // actual gate dispatch happens after release. Release is
+    // wake landing, the batch would already look fully settled to any
+    // concurrent check. The reservation only covers the flip-to-notification
+    // queue window; the actual gate dispatch happens after release. Release is
     // scoped to this reservation's source: when two completions overlap, an
     // earlier holder's release must not clear the later holder's reservation.
     const reservationSource = `background-completion:${task.id}`
@@ -689,7 +927,16 @@ export class BackgroundManager {
 
   async cancelTask(taskId: string, options?: { source?: string; reason?: string; skipNotification?: boolean }): Promise<boolean> {
     const task = this.tasks.get(taskId)
-    if (!task || TERMINAL_STATUSES.has(task.status)) return false
+    if (!task) return false
+    if (TERMINAL_STATUSES.has(task.status)) {
+      // A terminal task parked in resume()'s concurrency wait cannot be
+      // cancelled (it already finished) — but its stuck bg_send call can and
+      // must be unblocked.
+      if (this.resumingTaskIds.delete(taskId)) {
+        this.concurrency.cancelWaiter(task.concurrencyGroup, taskId)
+      }
+      return false
+    }
 
     const source = options?.source ?? "cancel"
 
@@ -736,6 +983,71 @@ export class BackgroundManager {
     }
   }
 
+  /** Send a follow-up to a task. Running/pending: the message is queued and
+   *  delivered as one round at the child's next idle boundary — mid-run
+   *  steering that never interrupts the child and keeps its context.
+   *  Terminal: identical to resume (continue the finished child session). */
+  async send(taskId: string, message: string): Promise<{ task: BgTask; queued: boolean; queueLength: number }> {
+    const task = this.tasks.get(taskId)
+    if (!task) throw new Error(`task not found: ${taskId}`)
+    if (this.shutdownTriggered) throw new Error("background manager is shutting down, cannot send messages")
+    if (task.status === "running" || task.status === "pending") {
+      task.steeringQueue = [...(task.steeringQueue ?? []), message]
+      this.logger("[prism] steering message queued", {
+        taskId: task.id,
+        queueLength: task.steeringQueue.length,
+      })
+      return { task, queued: true, queueLength: task.steeringQueue.length }
+    }
+    const resumed = await this.resume(taskId, message)
+    return { task: resumed, queued: false, queueLength: 0 }
+  }
+
+  /** Resolve when every given task reaches a terminal state, or when the
+   *  timeout lapses. Pruned/unknown ids resolve immediately (nothing to wait
+   *  for); the caller decides how to report them. */
+  async waitForTasks(taskIds: string[], timeoutMs: number): Promise<{ tasks: BgTask[]; timedOut: boolean }> {
+    const ids = new Set(taskIds)
+    const settled = () => {
+      for (const id of ids) {
+        const task = this.tasks.get(id)
+        // Absent = pruned or unknown; terminal tasks are only pruned long
+        // after settling, so absence never hides unfinished work here.
+        if (task && !TERMINAL_STATUSES.has(task.status)) return false
+      }
+      return true
+    }
+
+    if (settled()) return { tasks: this.snapshotTasks(ids), timedOut: false }
+
+    return new Promise((resolve) => {
+      const finish = (timedOut: boolean) => {
+        this.terminalListeners.delete(listener)
+        this.waitFinishers.delete(wake)
+        clearTimeout(timer)
+        resolve({ tasks: this.snapshotTasks(ids), timedOut })
+      }
+      const listener = () => {
+        if (settled()) finish(false)
+      }
+      // shutdown() wakes in-flight waiters instead of leaving them hung on
+      // their own timeout (bounded, but up to BG_WAIT_MAX_MS).
+      const wake = () => finish(true)
+      const timer = setTimeout(() => finish(true), Math.max(0, timeoutMs))
+      this.terminalListeners.add(listener)
+      this.waitFinishers.add(wake)
+    })
+  }
+
+  private snapshotTasks(ids: Set<string>): BgTask[] {
+    const tasks: BgTask[] = []
+    for (const id of ids) {
+      const task = this.tasks.get(id)
+      if (task) tasks.push(task)
+    }
+    return tasks
+  }
+
   async resume(taskId: string, prompt: string): Promise<BgTask> {
     const task = this.tasks.get(taskId)
     if (!task || !task.sessionId) {
@@ -745,7 +1057,37 @@ export class BackgroundManager {
       throw new Error(`task ${taskId} is currently running and cannot accept a continuation prompt`)
     }
 
-    await this.concurrency.acquire(task.concurrencyGroup, taskId)
+    const key = task.concurrencyGroup
+    // A saturated group would park this wait forever (running tasks past the
+    // TTL are only warned, never killed), and a terminal task cannot be
+    // cancelled out of the wait the normal way — bound it so bg_send
+    // returns an error instead of hanging the tool round.
+    this.resumingTaskIds.add(taskId)
+    try {
+      const outcome = await Promise.race([
+        this.concurrency.acquire(key, taskId).then(
+          () => "acquired" as const,
+          () => "cancelled" as const,
+        ),
+        new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), this.resumeAcquireTimeoutMs)),
+      ])
+      if (outcome === "timeout") {
+        // The waiter may have been handed a slot in the same instant the
+        // timeout fired; failing to return it would permanently shrink the
+        // group's effective limit.
+        if (!this.concurrency.cancelWaiter(key, taskId)) {
+          this.concurrency.release(key)
+        }
+        throw new Error(
+          `任务 ${taskId} 所在模型组的并发槽已满（等待 ${Math.round(this.resumeAcquireTimeoutMs / 1000)} 秒超时），请稍后重试，或用 /bg status 查看占用中的任务`,
+        )
+      }
+      if (outcome === "cancelled") {
+        throw new Error(`任务 ${taskId} 的恢复等待已被取消（任务已取消或插件正在关闭）`)
+      }
+    } finally {
+      this.resumingTaskIds.delete(taskId)
+    }
     task.concurrencyKey = task.concurrencyGroup
     task.status = "running"
     task.completedAt = undefined
@@ -759,9 +1101,18 @@ export class BackgroundManager {
 
     this.startPolling()
 
+    // Residual steering messages (e.g. queued while the task errored out)
+    // join the continuation round instead of waiting for another boundary.
+    const queued = task.steeringQueue ?? []
+    task.steeringQueue = []
+    task.steeringAttempts = 0
+
     const promptBody: Record<string, unknown> = {
-      tools: { bg_spawn: false, bg_cancel: false, question: false },
-      parts: [{ type: "text", text: prompt, synthetic: true }],
+      tools: { bg_spawn: false, bg_cancel: false, bg_send: false, bg_wait: false, question: false },
+      parts: [
+        ...queued.map((text) => ({ type: "text", text, synthetic: true })),
+        { type: "text", text: prompt, synthetic: true },
+      ],
     }
     if (task.agent) promptBody.agent = task.agent
     if (task.model) {
@@ -789,11 +1140,6 @@ export class BackgroundManager {
 
   private notifyParent(task: BgTask): Promise<void> {
     return this.enqueueNotificationForParent(task.parentSessionId, async () => {
-      const pending = this.pendingByParent.get(task.parentSessionId)
-      if (pending) {
-        pending.delete(task.id)
-        if (pending.size === 0) this.pendingByParent.delete(task.parentSessionId)
-      }
       const remaining = this.getTasksByParentSession(task.parentSessionId).filter(
         (t) => t.status === "running" || t.status === "pending",
       ).length
@@ -957,10 +1303,7 @@ export class BackgroundManager {
           // unknown future statuses are skipped rather than assumed done.
           if (sessionStatus !== undefined && sessionStatus !== "idle") continue
 
-          const hasOutput = await this.validateSessionHasOutput(task.sessionId, task)
-          if (!hasOutput) continue
-
-          await this.completeTask(task, "polling (idle)")
+          await this.settleIdleTask(task, "polling (idle)")
         } catch (error) {
           this.logger("[prism] polling iteration failed for task (swallowed)", { taskId: task.id, error })
         }
@@ -985,6 +1328,24 @@ export class BackgroundManager {
     const now = Date.now()
     for (const task of this.tasks.values()) {
       if (task.status === "running" || task.status === "pending") {
+        // Inactivity watchdog runs before the TTL logic: a silent hang and a
+        // long-running task look identical to the TTL (same anchor age), but
+        // only the former has a stale lastUpdate. Cancelling here must skip
+        // the TTL branch too — its warn-only toast would claim the task
+        // "仍在继续" right after the kill.
+        if (task.status === "running") {
+          const lastActivity = task.progress?.lastUpdate
+          if (lastActivity && now - lastActivity.getTime() > TASK_INACTIVITY_TIMEOUT_MS) {
+            this.logger("[prism] inactivity watchdog: cancelling silent task", { taskId: task.id })
+            void this.cancelTask(task.id, {
+              source: "inactivity-watchdog",
+              reason: `子任务无任何输出活动超过 ${Math.round(TASK_INACTIVITY_TIMEOUT_MS / 60_000)} 分钟，已由看门狗取消（疑似挂起）`,
+            }).catch((error) => {
+              this.logger("[prism] watchdog cancel failed", { taskId: task.id, error })
+            })
+            continue
+          }
+        }
         const anchor = task.startedAt ?? task.queuedAt
         if (anchor && now - anchor.getTime() > TASK_TTL_MS) {
           if (task.status === "pending") {
@@ -1038,8 +1399,16 @@ export class BackgroundManager {
     this.tasksByParentSession.clear()
     this.queuesByKey.clear()
     this.processingKeys.clear()
-    this.pendingByParent.clear()
     this.notificationQueueByParent.clear()
+    this.settlingTaskIds.clear()
     this.terminalListeners.clear()
+    for (const wake of this.waitFinishers) {
+      try {
+        wake()
+      } catch (error) {
+        this.logger("[prism] wait finisher failed on shutdown (swallowed)", { error })
+      }
+    }
+    this.waitFinishers.clear()
   }
 }

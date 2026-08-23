@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { isAbsolute, resolve } from "node:path"
-import { VISION_IMAGE_MAX_BYTES } from "../../config/constants"
+import { VISION_IMAGE_BATCH_MAX_BYTES, VISION_IMAGE_MAX_BYTES } from "../../config/constants"
 import { log } from "../../shared/log"
 import type { ImageAttachment } from "./detector"
 
@@ -31,12 +31,14 @@ function isLocalPath(url: string): boolean {
 }
 
 // Relative paths resolve against the opencode project directory. Backslashes
-// are normalized in the relative case so ".\shot.png" typed on Windows also
-// resolves on the POSIX host running the server.
-function expandLocalPath(url: string, baseDir: string): string {
-  if (url.startsWith("~/")) return resolve(homedir(), url.slice(2))
-  if (isAbsolute(url) || url.startsWith("\\\\") || /^[A-Za-z]:[\\/]/.test(url)) return url
-  return resolve(baseDir, url.replace(/\\/g, "/"))
+// are normalized FIRST — exactly like isLocalPath — so a Windows-typed
+// "~\shot.png" hits the home branch instead of resolving to
+// <baseDir>/~/shot.png, and ".\shot.png" resolves on a POSIX host too.
+export function expandLocalPath(url: string, baseDir: string, home: string = homedir()): string {
+  const normalized = url.replace(/\\/g, "/")
+  if (normalized.startsWith("~/")) return resolve(home, normalized.slice(2))
+  if (isAbsolute(normalized) || /^[A-Za-z]:\//.test(normalized)) return url
+  return resolve(baseDir, normalized)
 }
 
 // Magic-byte sniff for the four supported image formats. Real files always
@@ -75,7 +77,7 @@ function normalizeLocalImage(image: ImageAttachment, baseDir: string): ImageAtta
     }
     const bytes = statSync(file).size
     if (bytes > VISION_IMAGE_MAX_BYTES) {
-      log(`[prism] vision: image exceeds 8MB, skipping`, { url: image.url, bytes })
+      log(`[prism] vision: image exceeds ${VISION_IMAGE_MAX_BYTES / 1_048_576}MB, skipping`, { url: image.url, bytes })
       return null
     }
     const buffer = readFileSync(file)
@@ -91,7 +93,7 @@ function normalizeLocalImage(image: ImageAttachment, baseDir: string): ImageAtta
   }
 }
 
-// data: URLs carry their bytes inline, so the same 8MB cap and magic-byte
+// data: URLs carry their bytes inline, so the same size cap and magic-byte
 // sniff as file/remote sources apply — a claimed mime is never trusted.
 function normalizeDataUrl(image: ImageAttachment): ImageAttachment | null {
   const match = image.url.match(/^data:([^;,]*)(;[^,]*)?,(.*)$/s)
@@ -103,13 +105,13 @@ function normalizeDataUrl(image: ImageAttachment): ImageAttachment | null {
   // Pre-check on the base64 length (4 chars per 3 bytes) so an oversized
   // payload is rejected before the decode allocates.
   if (payload.length > Math.ceil((VISION_IMAGE_MAX_BYTES / 3) * 4)) {
-    log(`[prism] vision: data URL exceeds 8MB, skipping`, { url: image.url.slice(0, 64) })
+    log(`[prism] vision: data URL exceeds ${VISION_IMAGE_MAX_BYTES / 1_048_576}MB, skipping`, { url: image.url.slice(0, 64) })
     return null
   }
   try {
     const bytes = new Uint8Array(Buffer.from(payload, "base64"))
     if (bytes.byteLength > VISION_IMAGE_MAX_BYTES) {
-      log(`[prism] vision: data URL exceeds 8MB, skipping`, { url: image.url.slice(0, 64) })
+      log(`[prism] vision: data URL exceeds ${VISION_IMAGE_MAX_BYTES / 1_048_576}MB, skipping`, { url: image.url.slice(0, 64) })
       return null
     }
     const mime = sniffImageMime(bytes)
@@ -155,9 +157,21 @@ export async function normalizeImageUrl(
       log(`[prism] vision: failed to fetch image (${response.status})`, { url: image.url })
       return null
     }
+    // Reject on the declared size before buffering the body — a huge (or
+    // maliciously slow) response would otherwise be downloaded in full
+    // before the post-read check rejects it. Absent/chunked Content-Length
+    // falls through to that check.
+    const declaredLength = Number(response.headers.get("content-length"))
+    if (Number.isFinite(declaredLength) && declaredLength > VISION_IMAGE_MAX_BYTES) {
+      log(`[prism] vision: image exceeds ${VISION_IMAGE_MAX_BYTES / 1_048_576}MB (Content-Length), skipping`, {
+        url: image.url,
+        bytes: declaredLength,
+      })
+      return null
+    }
     const bytes = new Uint8Array(await response.arrayBuffer())
     if (bytes.byteLength > VISION_IMAGE_MAX_BYTES) {
-      log(`[prism] vision: image exceeds 8MB, skipping`, { url: image.url, bytes: bytes.byteLength })
+      log(`[prism] vision: image exceeds ${VISION_IMAGE_MAX_BYTES / 1_048_576}MB, skipping`, { url: image.url, bytes: bytes.byteLength })
       return null
     }
     const mime = sniffImageMime(bytes)
@@ -174,5 +188,26 @@ export async function normalizeImageUrl(
 
 export async function normalizeImageBatch(images: ImageAttachment[], baseDir?: string): Promise<ImageAttachment[]> {
   const normalized = await Promise.all(images.map((image) => normalizeImageUrl(image, baseDir)))
-  return normalized.filter((image): image is ImageAttachment => image !== null)
+  // Providers cap the WHOLE inline request (Gemini at 20MB), and base64
+  // inflates payloads ~33% — four per-image-maximum images would exceed it.
+  // Measure the encoded payload (what actually goes on the wire) and keep
+  // the earliest images that fit, dropping the tail like any other invalid
+  // image so the batch still proceeds.
+  const kept: ImageAttachment[] = []
+  let encodedBytes = 0
+  for (const image of normalized) {
+    if (image === null) continue
+    const comma = image.url.indexOf(",")
+    const bytes = image.url.length - comma - 1
+    if (encodedBytes + bytes > VISION_IMAGE_BATCH_MAX_BYTES) {
+      log(`[prism] vision: batch exceeds ${VISION_IMAGE_BATCH_MAX_BYTES / 1_048_576}MB, dropping remaining images`, {
+        kept: kept.length,
+        encodedBytes,
+      })
+      break
+    }
+    kept.push(image)
+    encodedBytes += bytes
+  }
+  return kept
 }

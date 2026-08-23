@@ -39,4 +39,11 @@ describe("parseJsonc", () => {
   test("keeps non-trailing commas", () => {
     expect(parseJsonc(`{"a": [1, 2]}`)).toEqual({ a: [1, 2] })
   })
+
+  // Windows Notepad / PowerShell 5 save UTF-8 with a BOM; JSON.parse rejects
+  // the \uFEFF outright, which used to void the whole config file.
+  test("strips a leading UTF-8 BOM", () => {
+    expect(parseJsonc("\uFEFF{\"a\": 1,}")).toEqual({ a: 1 })
+    expect(parseJsonc("\uFEFF// comment\r\n{\"a\": 1}")).toEqual({ a: 1 })
+  })
 })

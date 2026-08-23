@@ -1,10 +1,6 @@
-import { MAX_SUBTASKS } from "../config/constants"
 import type { BackgroundManager } from "../core/background/manager"
 import type { BgTask } from "../core/background/types"
-import type { SplitService } from "../core/split/service"
-import type { VisionPipeline } from "../core/vision/pipeline"
-import { guessImageMime } from "../core/vision/detector"
-import { VISION_NO_MODEL_HINT } from "../core/vision/interpreter"
+import type { PrismClient } from "../core/client-types"
 
 type CommandInput = { command: string; sessionID: string; arguments: string }
 type CommandOutput = { parts: Array<{ type: string; text?: string; [key: string]: unknown }> }
@@ -20,10 +16,13 @@ function formatTaskTable(manager: BackgroundManager, sessionID: string): string 
     .map((task) => {
       const model = task.model ? `${task.model.providerID}/${task.model.modelID}` : "-"
       const toolCalls = task.progress?.toolCalls ?? 0
-      return `| \`${task.id}\` | ${task.description} | ${task.status} | ${model} | ${toolCalls} tool calls |`
+      const queued = task.steeringQueue?.length ?? 0
+      return `| \`${task.id}\` | ${task.description} | ${task.status} | ${model} | ${toolCalls} tool calls | ${
+        queued > 0 ? `${queued} 条待投递` : "-"
+      } |`
     })
     .join("\n")
-  return `| task_id | 描述 | 状态 | 模型 | 工具调用 |\n|---|---|---|---|---|\n${rows}`
+  return `| task_id | 描述 | 状态 | 模型 | 工具调用 | 排队指令 |\n|---|---|---|---|---|---|\n${rows}`
 }
 
 function formatTaskOutput(manager: BackgroundManager, taskID: string, fullSession: boolean, serverUrl: string): string {
@@ -60,80 +59,29 @@ function checkTaskOwnership(
   return { ok: true, task }
 }
 
-const FLAG_PATTERN = /--(dry-run|sequential)\b|--max(?:\s+|=)(\d+)/g
-
-// /vision <path/URL ... | last> [--goal <text>]: everything after --goal is
-// the goal (it may contain spaces); the rest splits into image references.
-function parseVisionArgs(argumentsText: string): { targets: string[]; goal?: string } {
-  let goal: string | undefined
-  let remainder = argumentsText
-  const goalMatch = remainder.match(/--goal(?:=|\s+)([\s\S]+)$/)
-  if (goalMatch) {
-    goal = goalMatch[1]!.trim()
-    remainder = remainder.slice(0, goalMatch.index)
-  }
-  const targets = remainder.trim().split(/\s+/).filter(Boolean)
-  return { targets, goal }
+// Immediate feedback for subcommands that await network work in this hook
+// (cancel → abort, send → resume). The command's output only lands after the
+// hook returns, so without this the TUI shows nothing for the whole wait.
+// Best-effort, same pattern as the manager's toasts.
+function showToast(client: PrismClient, message: string): void {
+  const toast = client.tui.showToast?.({
+    body: { title: "Prism", message, variant: "info", duration: 4000 },
+  })
+  if (toast) void toast.catch(() => {})
 }
 
-function parseSplitArgs(argumentsText: string): {
-  task: string
-  dryRun: boolean
-  sequential: boolean
-  max?: number
-} {
-  let dryRun = false
-  let sequential = false
-  let max: number | undefined
-  let task = argumentsText
-  for (const match of argumentsText.matchAll(FLAG_PATTERN)) {
-    if (match[1] === "dry-run") dryRun = true
-    if (match[1] === "sequential") sequential = true
-    if (match[2]) {
-      // Clamp to the planner bounds; garbage values are ignored. The planner
-      // prompt promises "2 到 N" subtasks, so 0/1 would contradict it.
-      const parsedMax = Number(match[2])
-      if (Number.isInteger(parsedMax)) max = Math.min(Math.max(parsedMax, 2), MAX_SUBTASKS)
-    }
-    task = task.replace(match[0], "")
-  }
-  return { task: task.trim(), dryRun, sequential, max }
-}
-
-// Deterministic subcommands run natively in the hook (status/output/cancel and
-// the full /split orchestration); free-form descriptions fall through to the
-// command template + bg_spawn tools.
+// Deterministic subcommands run natively in the hook (status/output/cancel);
+// everything else — /bg and /split task descriptions — falls through to the
+// command template, where the main model calls bg_spawn / split_task with
+// full streaming feedback. No LLM work ever runs inside this hook: it would
+// block the TUI for the whole round.
 export function createCommandExecuteBeforeHook(args: {
   manager: BackgroundManager
-  splitService: SplitService
   serverUrl: string
-  vision: VisionPipeline
+  client: PrismClient
 }) {
   return async (input: CommandInput, output: CommandOutput): Promise<void> => {
     const argumentsText = input.arguments.trim()
-
-    if (input.command === "vision") {
-      const { targets, goal } = parseVisionArgs(argumentsText)
-      if (targets.length === 0) {
-        pushText(output, "用法: /vision <图片路径/URL ... | last> [--goal <关注点>]\nlast = 解读本会话最近的一张图片")
-        return
-      }
-      // "last" resolves the most recent image message of THIS session — a
-      // user pasting an image has no URL the command arguments could carry.
-      if (targets.length === 1 && targets[0] === "last") {
-        const result = await args.vision.lookLatest(input.sessionID, goal)
-        if (result.notFound) {
-          pushText(output, "当前会话没有找到任何图片消息。请改用图片的本地路径/URL")
-        } else {
-          pushText(output, result.text ?? VISION_NO_MODEL_HINT)
-        }
-        return
-      }
-      const images = targets.map((target) => ({ mime: guessImageMime(target), url: target }))
-      const text = await args.vision.look(input.sessionID, images, goal)
-      pushText(output, text ?? VISION_NO_MODEL_HINT)
-      return
-    }
 
     if (input.command === "bg") {
       if (argumentsText === "status" || argumentsText === "list") {
@@ -159,18 +107,21 @@ export function createCommandExecuteBeforeHook(args: {
           pushText(output, owned.error)
           return
         }
+        showToast(args.client, `正在取消任务 \`${taskID}\`…`)
         const cancelled = await args.manager.cancelTask(taskID, { source: "/bg cancel" })
         pushText(output, cancelled ? `已取消任务 \`${taskID}\`` : `取消失败: 任务不存在或已结束 (${taskID})`)
         return
       }
       if (argumentsText === "cancel") {
+        showToast(args.client, "正在取消当前会话的全部后台任务…")
         await args.manager.cancelAllByParentSession(input.sessionID, "/bg cancel")
         pushText(output, "已取消当前会话的全部后台任务")
         return
       }
-      // resume <task_id> <追问>: continue a finished task's child session in
-      // place — the child keeps its context, no re-launch needed.
-      const resumeMatch = argumentsText.match(/^resume\s+(\S+)\s+([\s\S]+)$/)
+      // resume|send <task_id> <追问/补充指令>: continue a finished task's
+      // child session in place, or queue a steering message for a running
+      // one (delivered at its current round's end, never interrupting it).
+      const resumeMatch = argumentsText.match(/^(?:resume|send)\s+(\S+)\s+([\s\S]+)$/)
       if (resumeMatch) {
         const taskID = resumeMatch[1]!
         const owned = checkTaskOwnership(args.manager, input.sessionID, taskID)
@@ -179,10 +130,22 @@ export function createCommandExecuteBeforeHook(args: {
           return
         }
         try {
-          await args.manager.resume(taskID, resumeMatch[2]!)
-          pushText(output, `任务 \`${taskID}\` 已恢复运行（追问已发送到其子会话），结束后会收到通知`)
+          // send() queues instantly for running/pending tasks, but a terminal
+          // task resumes — which can wait up to 15s on a saturated group.
+          if (owned.task.status !== "running" && owned.task.status !== "pending") {
+            showToast(args.client, `正在恢复任务 \`${taskID}\`（如并发槽紧张需等待数秒）…`)
+          }
+          const result = await args.manager.send(taskID, resumeMatch[2]!)
+          if (result.queued) {
+            pushText(
+              output,
+              `补充指令已排队，将在任务 \`${taskID}\` 当前回合结束后投递（不打断执行，队列长度 ${result.queueLength}）。完成后会收到通知`,
+            )
+          } else {
+            pushText(output, `任务 \`${taskID}\` 已恢复运行（追问已发送到其子会话），结束后会收到通知`)
+          }
         } catch (error) {
-          pushText(output, `恢复失败: ${error instanceof Error ? error.message : String(error)}`)
+          pushText(output, `发送失败: ${error instanceof Error ? error.message : String(error)}`)
         }
         return
       }
@@ -213,30 +176,17 @@ export function createCommandExecuteBeforeHook(args: {
           pushText(output, owned.error)
           return
         }
+        showToast(args.client, `正在取消任务 \`${taskID}\`…`)
         const cancelled = await args.manager.cancelTask(taskID, { source: "/split cancel" })
         pushText(output, cancelled ? `已取消任务 \`${taskID}\`` : "取消失败: 任务不存在或已结束")
         return
       }
       if (argumentsText === "cancel") {
+        showToast(args.client, "正在取消当前会话的全部后台任务…")
         await args.manager.cancelAllByParentSession(input.sessionID, "/split cancel")
         pushText(output, "已取消当前会话的全部后台任务")
         return
       }
-
-      const { task, dryRun, sequential, max } = parseSplitArgs(argumentsText)
-      if (!task) {
-        pushText(output, "用法: /split <任务描述> [--dry-run] [--sequential] [--max <n>]")
-        return
-      }
-      const outcome = await args.splitService.split({
-        sessionID: input.sessionID,
-        task,
-        dryRun,
-        sequential,
-        maxSubtasks: max,
-      })
-      pushText(output, outcome.message)
-      return
     }
   }
 }

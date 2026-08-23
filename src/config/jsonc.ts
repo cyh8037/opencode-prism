@@ -87,5 +87,9 @@ export function stripJsonc(source: string): string {
 }
 
 export function parseJsonc(source: string): unknown {
-  return JSON.parse(stripJsonc(source))
+  // Windows editors (Notepad, PowerShell 5's UTF8 encoding) commonly save a
+  // UTF-8 BOM; JSON.parse rejects the leading \uFEFF outright, which would
+  // silently void the entire config file.
+  const text = source.charCodeAt(0) === 0xfeff ? source.slice(1) : source
+  return JSON.parse(stripJsonc(text))
 }
