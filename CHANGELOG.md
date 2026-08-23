@@ -2,7 +2,7 @@
 
 本文件记录每个发布版本中**用户可感知**的变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.4.0-beta.0] - 2026-08-23
 
 ### 破坏性变更
 
