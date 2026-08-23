@@ -161,6 +161,21 @@ export class BackgroundManager {
     return model ? `${model.providerID}/${model.modelID}` : ""
   }
 
+  // Tool filters for child prompts. The nested bg_* tools and question are
+  // always disabled (they would recurse or block on a non-interactive
+  // child); vision_look is removed too when the vision feature is disabled
+  // entirely, so bg_spawn's read-image guidance never points at a dead tool.
+  private childToolFilters(): Record<string, boolean> {
+    return {
+      bg_spawn: false,
+      bg_cancel: false,
+      bg_send: false,
+      bg_wait: false,
+      question: false,
+      ...(this.deps.config.vision.enabled ? {} : { vision_look: false }),
+    }
+  }
+
   async launch(input: LaunchInput): Promise<BgTask> {
     // Shutdown clears the queues but an in-flight processKey loop still holds
     // its array reference; refusing new work here keeps dispose a hard stop.
@@ -342,13 +357,7 @@ export class BackgroundManager {
         providerID: model.providerID,
         modelID: model.modelID,
       },
-      tools: {
-        bg_spawn: false,
-        bg_cancel: false,
-        bg_send: false,
-        bg_wait: false,
-        question: false,
-      },
+      tools: this.childToolFilters(),
       ...(input.system ? { system: input.system } : {}),
       parts: launchParts,
     }
@@ -753,7 +762,7 @@ export class BackgroundManager {
     task.steeringAttempts = (task.steeringAttempts ?? 0) + 1
 
     const promptBody: Record<string, unknown> = {
-      tools: { bg_spawn: false, bg_cancel: false, bg_send: false, bg_wait: false, question: false },
+      tools: this.childToolFilters(),
       parts: messages.map((text) => ({ type: "text", text, synthetic: true })),
     }
     if (task.agent) promptBody.agent = task.agent
@@ -1108,7 +1117,7 @@ export class BackgroundManager {
     task.steeringAttempts = 0
 
     const promptBody: Record<string, unknown> = {
-      tools: { bg_spawn: false, bg_cancel: false, bg_send: false, bg_wait: false, question: false },
+      tools: this.childToolFilters(),
       parts: [
         ...queued.map((text) => ({ type: "text", text, synthetic: true })),
         { type: "text", text: prompt, synthetic: true },

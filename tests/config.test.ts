@@ -9,6 +9,34 @@ describe("parseConfig", () => {
     const config = parseConfig({})
     expect(config.vision.model).toBe("")
     expect(config.vision.mode).toBe("sync")
+    expect(config.vision.enabled).toBe(true)
+  })
+
+  test("vision.enabled=false and an explicit tools: [] survive parsing", () => {
+    const config = parseConfig({ vision: { enabled: false, tools: [] } })
+    expect(config.vision.enabled).toBe(false)
+    expect(config.vision.tools).toEqual([])
+  })
+
+  test("the legacy mode value 'background' falls back per-field, keeping the valid siblings", () => {
+    const config = parseConfig({ vision: { mode: "background", model: "anthropic/claude-sonnet-4-5" } })
+    expect(config.vision.mode).toBe("sync")
+    expect(config.vision.model).toBe("anthropic/claude-sonnet-4-5")
+    expect(config.vision.enabled).toBe(true)
+  })
+
+  test("array element issues salvage the valid elements instead of dropping the field", () => {
+    // Dropping the whole tools field would revert to undefined = "all tools
+    // trigger" — the opposite of the user's narrowing intent.
+    const config = parseConfig({ vision: { tools: ["read", ""] } })
+    expect(config.vision.tools).toEqual(["read"])
+  })
+
+  test("a section that is not an object falls back wholesale", () => {
+    const config = parseConfig({ vision: 42 })
+    expect(config.vision.enabled).toBe(true)
+    expect(config.vision.model).toBe("")
+    expect(config.vision.mode).toBe("sync")
   })
 
   test("valid partial configs merge onto defaults", () => {
@@ -17,7 +45,7 @@ describe("parseConfig", () => {
     expect(config.vision.model).toBe("")
   })
 
-  test("an invalid section falls back to its defaults but keeps the others", () => {
+  test("an invalid field falls back to its default while the other sections survive", () => {
     const config = parseConfig({
       vision: { model: "not a provider/model reference" },
       background: { concurrency: 3 },
@@ -100,7 +128,7 @@ describe("loadConfig", () => {
       )
       const { config, warnings } = loadConfig(dir, { PRISM_CONFIG: join(dir, "unused.jsonc") })
       expect(warnings).toHaveLength(1)
-      expect(warnings[0]).toContain("invalid sections fell back")
+      expect(warnings[0]).toContain("invalid fields fell back")
       expect(config.background.concurrency).toBe(3)
       expect(config.vision.model).toBe("")
     } finally {

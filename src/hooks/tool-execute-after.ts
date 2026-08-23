@@ -10,8 +10,14 @@ export function createToolExecuteAfterHook(args: { config: PrismConfig; pipeline
     input: { tool: string; sessionID: string; callID?: string },
     output: { title: string; output: string; metadata: unknown },
   ): Promise<void> => {
+    // Same gate exists in getVisionModel (index.ts) and pipeline.onToolOutput —
+    // the triple redundancy is deliberate, and each site's comment names the
+    // others so no single "simplification" silently reopens the feature.
+    if (!args.config.vision.enabled) return
+    // undefined = inspect every tool's output; an explicit array (including
+    // an empty one) = only the listed tools trigger interpretation.
     const tools = args.config.vision.tools
-    if (tools && tools.length > 0 && !tools.includes(input.tool)) return
+    if (Array.isArray(tools) && !tools.includes(input.tool)) return
 
     const images = extractImageAttachments(output as unknown as Record<string, unknown>)
     if (images.length === 0) return

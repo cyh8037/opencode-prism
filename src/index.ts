@@ -15,7 +15,7 @@ import { createCommandExecuteBeforeHook } from "./hooks/command-execute-before"
 import { createBgTools } from "./tools/bg"
 import { createSplitTool } from "./tools/split"
 import { createVisionLookTool } from "./tools/vision-look"
-import { BG_COMMAND, SPLIT_COMMAND, type PrismCommandDefinition } from "./commands/templates"
+import { createBgCommand, createSplitCommand, type PrismCommandDefinition } from "./commands/templates"
 import { log } from "./shared/log"
 import { guardHook } from "./shared/hook-guard"
 import { resolveServerUrl } from "./shared/server-url"
@@ -134,8 +134,13 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
   const modelTracker = new CurrentModelTracker()
 
   // Explicit model wins; otherwise inherit the session's current model when
-  // it accepts images; an invalid vision.model stays permanently off.
+  // it accepts images; an invalid vision.model stays permanently off. The
+  // enabled switch short-circuits everything — registration and the
+  // tool.execute.after hook (tool-execute-after.ts) gate too; this third gate
+  // covers the pipeline's manual paths (vision_look is unregistered when
+  // disabled, so this is defense in depth, not dead code).
   const getVisionModel = (sessionID: string): ResolvedModel | undefined => {
+    if (!config.vision.enabled) return undefined
     if (visionModel) return visionModel
     if (visionRefInvalid) return undefined
     const snapshot = modelTracker.get(sessionID)
@@ -176,18 +181,23 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
       const cfg = configInput as { command?: Record<string, PrismCommandDefinition> }
       cfg.command = {
         ...(cfg.command ?? {}),
-        bg: BG_COMMAND,
+        // vision.enabled drops the read-image guidance from both templates:
+        // it references vision_look, which is unregistered when disabled.
+        bg: createBgCommand(config.vision.enabled),
         // split.tool gates BOTH split entries: the command's task mode runs
         // through the split_task tool (template-instructed), so without the
         // tool a registered command could not execute — do not register it.
-        ...(config.split.tool ? { split: SPLIT_COMMAND } : {}),
+        ...(config.split.tool ? { split: createSplitCommand(config.vision.enabled) } : {}),
       }
     },
     tool: {
-      ...createBgTools(manager),
+      ...createBgTools(manager, { visionEnabled: config.vision.enabled }),
       // Read once at plugin load: toggling it requires restarting opencode.
       ...(config.split.tool ? createSplitTool(splitService) : {}),
-      vision_look: createVisionLookTool(vision),
+      // vision.enabled gates registration the same way split.tool does: a
+      // disabled feature must not leave a tool the model can call and fail
+      // with, and children (whose prompts prism builds) lose vision_look too.
+      ...(config.vision.enabled ? { vision_look: createVisionLookTool(vision) } : {}),
     },
     // Every hook is guarded: a throwing plugin hook is published by opencode
     // as Session.Event.Error and rendered as an error in the TUI, so Prism

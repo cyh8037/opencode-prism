@@ -97,6 +97,67 @@ describe("plugin init resilience", () => {
     expect(off.toolNames).toContain("bg_spawn")
   })
 
+  // vision.enabled gates the tool registration the same way split.tool does:
+  // a disabled feature must not leave a callable-but-dead vision_look, and
+  // the bg tool descriptions AND command templates must stop pointing
+  // children at it (a child told to call an unregistered tool would hit
+  // "tool not found").
+  test("vision.enabled=false unregisters vision_look but keeps the other tools", async () => {
+    const init = async (contents: string | null) => {
+      const dir = withProjectConfig(contents)
+      try {
+        const plugin = await Prism({ directory: dir, client: stubClient } as never)
+        const dispose = plugin.dispose as (() => Promise<void>) | undefined
+        await dispose?.()
+        return Object.keys(plugin.tool as Record<string, unknown>)
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }
+
+    const on = await init(null)
+    expect(on).toContain("vision_look")
+    expect(on).toContain("bg_spawn")
+    expect(on).toContain("split_task")
+
+    const off = await init('{ "vision": { "enabled": false } }')
+    expect(off).not.toContain("vision_look")
+    // neighboring tools are unaffected by the switch
+    expect(off).toContain("bg_spawn")
+    expect(off).toContain("split_task")
+  })
+
+  // The command templates carry the read-image guidance verbatim to the main
+  // model; with vision disabled the guidance must vanish from BOTH /bg and
+  // /split, or the model would direct children at a removed tool.
+  test("vision.enabled=false drops the vision_look guidance from the command templates", async () => {
+    const init = async (contents: string | null) => {
+      const dir = withProjectConfig(contents)
+      try {
+        const plugin = await Prism({ directory: dir, client: stubClient } as never)
+        const dispose = plugin.dispose as (() => Promise<void>) | undefined
+        await dispose?.()
+        const cfg: Record<string, unknown> = { model: "openai/gpt-5.6-sol" }
+        await (plugin.config as (c: unknown) => Promise<void>)(cfg)
+        const commands = (cfg as { command?: Record<string, { template: string }> }).command ?? {}
+        return {
+          bgTemplate: commands.bg?.template ?? "",
+          splitTemplate: commands.split?.template ?? "",
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }
+
+    const on = await init(null)
+    expect(on.bgTemplate).toContain("vision_look")
+    expect(on.splitTemplate).toContain("vision_look")
+
+    const off = await init('{ "vision": { "enabled": false } }')
+    expect(off.bgTemplate).not.toContain("vision_look")
+    expect(off.splitTemplate).not.toContain("vision_look")
+  })
+
   // An invalid split section falls back to its own defaults (tool on) — the
   // same per-section resilience vision/background already have.
   test("an invalid split section falls back to the default instead of disabling the tool", async () => {

@@ -55,10 +55,12 @@ function findProjectConfig(startDir: string): string | null {
 }
 
 // Merge a partial config onto the built-in defaults and validate. Partial
-// overrides are allowed at any depth (deep merge, later wins). Sections that
-// fail validation fall back to their own defaults instead of discarding the
-// whole config: a typo in vision must not reset the user's background
-// settings. Human-readable warnings are pushed to the optional collector so
+// overrides are allowed at any depth (deep merge, later wins). Fields that
+// fail validation revert to their OWN defaults instead of discarding the
+// whole config: a stale vision.mode must not reset the user's vision.model
+// settings, nor a typo in vision reset the background settings. A section
+// that is not an object at all has no fields to salvage and falls back
+// wholesale. Human-readable warnings are pushed to the optional collector so
 // callers can surface them (e.g. a startup toast); parseConfig itself never
 // throws.
 export function parseConfig(partial: Record<string, unknown>, warnings: string[] = []): PrismConfig {
@@ -70,7 +72,7 @@ export function parseConfig(partial: Record<string, unknown>, warnings: string[]
   const issues = parsed.error.issues
     .map((issue) => `  - ${issue.path.join(".") || "(root)"}: ${issue.message}`)
     .join("\n")
-  warnings.push(`config validation failed, invalid sections fell back to defaults:\n${issues}`)
+  warnings.push(`config validation failed, invalid fields fell back to their defaults:\n${issues}`)
 
   const result: PrismConfig = { ...defaults }
   for (const key of ["vision", "background", "split"] as const) {
@@ -79,6 +81,41 @@ export function parseConfig(partial: Record<string, unknown>, warnings: string[]
     const sectionParsed = prismConfigSchema.shape[key].safeParse(value)
     if (sectionParsed.success) {
       ;(result as Record<typeof key, unknown>)[key] = sectionParsed.data
+      continue
+    }
+    // A non-object section has no fields to salvage — keep its defaults
+    // wholesale (previous behavior).
+    if (!isRecord(value)) continue
+
+    // Field-level fallback: drop every first-level field that failed, then
+    // re-validate the remainder merged onto the section's own defaults. Each
+    // invalid field reverts to its own default while valid siblings survive.
+    // Element-level issues inside an ARRAY field (e.g. one bad entry in
+    // vision.tools) salvage the valid elements instead — dropping the whole
+    // field would revert to its default, which for vision.tools means "all
+    // tools trigger", the opposite of the user's narrowing intent.
+    // The isRecord guard proves the runtime shape but TS keeps the section
+    // union here (no member has an index signature) — restore the record type
+    // so the deletion below can index freely.
+    const cleaned = { ...(value as Record<string, unknown>) }
+    const invalidIndices = new Map<string, Set<number>>()
+    for (const issue of sectionParsed.error.issues) {
+      const [field, index] = issue.path
+      if (typeof field !== "string") continue
+      if (typeof index === "number" && Array.isArray(cleaned[field])) {
+        const indices = invalidIndices.get(field) ?? new Set<number>()
+        indices.add(index)
+        invalidIndices.set(field, indices)
+      } else {
+        delete cleaned[field]
+      }
+    }
+    for (const [field, indices] of invalidIndices) {
+      cleaned[field] = (cleaned[field] as unknown[]).filter((_, i) => !indices.has(i))
+    }
+    const retried = prismConfigSchema.shape[key].safeParse(deepMerge(defaults[key], cleaned))
+    if (retried.success) {
+      ;(result as Record<typeof key, unknown>)[key] = retried.data
     }
   }
   return result

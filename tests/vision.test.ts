@@ -205,7 +205,7 @@ describe("lastAssistantText", () => {
   })
 })
 
-function createVisionHarness(mode: "sync" | "background" = "sync") {
+function createVisionHarness(mode: "sync" | "async" = "sync") {
   const childSessions = new Map<string, { prompts: unknown[]; createdModel: unknown }>()
   let childCounter = 0
   const client: PrismClient = {

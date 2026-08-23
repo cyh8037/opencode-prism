@@ -142,9 +142,13 @@ export class VisionPipeline {
     if (this.deps.background.isChildSession(input.sessionID) || this.interpretationSessions.has(input.sessionID)) {
       return
     }
+    // Belt and suspenders: the hook (tool-execute-after.ts) and getVisionModel
+    // (index.ts) each gate too — a disabled feature must stay closed even if
+    // either caller drifts.
+    if (!this.deps.config.vision.enabled) return
     const mode = this.deps.config.vision.mode
 
-    if (mode === "background") {
+    if (mode === "async") {
       // Tool outputs always follow an LLM call, so the capability snapshot
       // already exists — the sync gate is enough.
       const model = this.deps.getVisionModel(input.sessionID)
