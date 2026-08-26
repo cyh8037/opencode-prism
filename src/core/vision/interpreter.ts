@@ -33,6 +33,22 @@ export function makeVisionInstruction(goal?: string): string {
   return `${VISION_INSTRUCTION}\n重点关注：${trimmed}\n只回答与关注点相关的内容。`
 }
 
+// Interpretation children must not run agentic tool loops. The child model
+// gets the same global toolset (plugin tools register for every session), and
+// a confused child calling vision_look on its own injected image spawns an
+// unbounded chain of interpretation grandchildren (2026-08-25 incident: 26+
+// children in 60s). Mirrors the background manager's childToolFilters —
+// interpretation only needs text back.
+const VISION_CHILD_TOOL_FILTERS: Record<string, boolean> = {
+  bg_spawn: false,
+  bg_cancel: false,
+  bg_send: false,
+  bg_wait: false,
+  split_task: false,
+  vision_look: false,
+  question: false,
+}
+
 // Shared user-facing hint for the manual interpretation surface
 // (vision_look tool) when no vision model is available.
 export const VISION_NO_MODEL_HINT =
@@ -159,7 +175,7 @@ export async function runVisionInterpretation(args: {
     const promptError = await client.session
       .promptAsync({
         path: { id: sessionID },
-        body: { system: VISION_SYSTEM_PROMPT, parts },
+        body: { system: VISION_SYSTEM_PROMPT, parts, tools: VISION_CHILD_TOOL_FILTERS },
         query: { directory },
       })
       .then((result) => errorInfoFromResult(result)?.message ?? null)

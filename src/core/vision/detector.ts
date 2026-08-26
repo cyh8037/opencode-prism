@@ -35,8 +35,9 @@ export function extractImageAttachments(output: Record<string, unknown>): ImageA
   return attachments
 }
 
-// Extract image parts from a chat.message input. OpenCode represents images
-// as file parts: { type: "file", mime: "image/png", url: ... }.
+// Extract image file parts from a session message (lookLatest scans session
+// history for these). OpenCode represents images as file parts:
+// { type: "file", mime: "image/png", url: ... }.
 export function extractImageParts(parts: unknown): ImageAttachment[] {
   if (!Array.isArray(parts)) return []
   const images: ImageAttachment[] = []
@@ -78,6 +79,11 @@ export function guessImageMime(url: string): string {
 // references — callers detect them and fall back to the session's latest
 // image message instead.
 const IMAGE_PLACEHOLDER_RE = /^\[Image \d+\]$/
+
+// Case-insensitive check for the "last" sentinel with trimmed whitespace.
+export function isLastSentinel(ref: string): boolean {
+  return ref.trim().toLowerCase() === "last"
+}
 
 // Split reference lists into attachment placeholders and real (path/URL/data
 // URL) references. "last" is a real reference here: the sentinel is handled

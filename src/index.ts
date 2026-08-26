@@ -11,6 +11,7 @@ import { SplitService } from "./core/split/service"
 import { createToolExecuteAfterHook } from "./hooks/tool-execute-after"
 import { createChatParamsHook } from "./hooks/chat-params"
 import { createEventHook } from "./hooks/event"
+import { createChatMessageHook } from "./hooks/chat-message"
 import { createCommandExecuteBeforeHook } from "./hooks/command-execute-before"
 import { createBgTools } from "./tools/bg"
 import { createSplitTool } from "./tools/split"
@@ -204,6 +205,13 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
     // swallows its own failures into the file log instead.
     "tool.execute.after": guardHook("tool.execute.after", createToolExecuteAfterHook({ config, pipeline: vision })),
     "chat.params": guardHook("chat.params", createChatParamsHook(modelTracker)),
+    // Pasted-image hint path (vision.chatImages): inject a "call vision_look"
+    // reminder into the user message before the model's turn — zero blocking,
+    // the model performs the actual interpretation via the tool.
+    "chat.message": guardHook(
+      "chat.message",
+      createChatMessageHook({ config, pipeline: vision, background: manager, tracker: modelTracker }),
+    ),
     "command.execute.before": guardHook(
       "command.execute.before",
       createCommandExecuteBeforeHook({ manager, serverUrl: attachServerUrl, client }),

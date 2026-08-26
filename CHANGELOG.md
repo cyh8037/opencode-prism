@@ -2,6 +2,13 @@
 
 本文件记录每个发布版本中**用户可感知**的变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 修复
+
+- **`vision_look` 解读子会话递归风暴**：解读子会话继承全量工具集，子会话模型（无法读图时）可能调用 `vision_look` 解读自己收到的图片，无限生成解读子会话（实测 60 秒 26+ 个）。修复：解读子会话禁用全部 Prism 工具（`tools: {vision_look: false, ...}`）；`vision_look` 拒绝在解读子会话内嵌套执行。
+- **`vision_look` 参数兼容小模型**：`images` 支持 `string | string[]`（小模型常把 `["last"]` 输出为 `"last"`）；`"last"` 哨兵大小写不敏感且容忍首尾空格；`["last", 路径]` 混用时不再把 `"last"` 当文件路径导致 `ENOENT`，而是以 `"last"` 优先并注明忽略的显式引用。
+
 ## [0.4.0-beta.0] - 2026-08-23
 
 ### 破坏性变更

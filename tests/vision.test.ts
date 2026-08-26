@@ -10,8 +10,10 @@ import { normalizeImageUrl } from "../src/core/vision/image-utils"
 // accepts it — fake base64 like "abc" is rejected by the magic-byte check.
 const FAKE_PNG_URL = `data:image/png;base64,${Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString("base64")}`
 import { createVisionLookTool } from "../src/tools/vision-look"
+import { createChatMessageHook } from "../src/hooks/chat-message"
 import { VisionPipeline } from "../src/core/vision/pipeline"
 import { BackgroundManager } from "../src/core/background/manager"
+import { CurrentModelTracker } from "../src/core/vision/model-tracker"
 import { PromptGate } from "../src/core/prompt-gate"
 import { parseConfig } from "../src/config/load"
 import type { PrismClient } from "../src/core/client-types"
@@ -540,9 +542,348 @@ describe("vision_look tool", () => {
     expect(result).toContain("图表")
     expect(result).toContain("已忽略 1 个 [Image N] 占位符")
   })
+
+  test('supports single string image argument (e.g. images: "last")', async () => {
+    const harness = createVisionHarness("sync")
+    harness.client.session.messages = async () => ({
+      data: [
+        { info: { role: "user" }, parts: [{ type: "file", mime: "image/png", url: FAKE_PNG_URL }] },
+        { info: { role: "assistant" }, parts: [{ type: "text", text: "解读：字符串参数成功", state: { status: "completed" } }] },
+      ],
+    })
+    const tool = createVisionLookTool(harness.pipeline)
+    const result = await tool.execute(
+      { images: "last" as never, goal: "test" },
+      { sessionID: "parent" } as never,
+    )
+    expect(result).toContain("字符串参数成功")
+  })
+
+  test('supports case-insensitive and whitespace-padded " Last "', async () => {
+    const harness = createVisionHarness("sync")
+    harness.client.session.messages = async () => ({
+      data: [
+        { info: { role: "user" }, parts: [{ type: "file", mime: "image/png", url: FAKE_PNG_URL }] },
+        { info: { role: "assistant" }, parts: [{ type: "text", text: "解读：大小写兼容成功", state: { status: "completed" } }] },
+      ],
+    })
+    const tool = createVisionLookTool(harness.pipeline)
+    const result = await tool.execute(
+      { images: [" Last "] },
+      { sessionID: "parent" } as never,
+    )
+    expect(result).toContain("大小写兼容成功")
+  })
+
+  test('mixed "last" and placeholders delegates to lookLatest without crashing', async () => {
+    const harness = createVisionHarness("sync")
+    harness.client.session.messages = async () => ({
+      data: [
+        { info: { role: "user" }, parts: [{ type: "file", mime: "image/png", url: FAKE_PNG_URL }] },
+        { info: { role: "assistant" }, parts: [{ type: "text", text: "解读：混合哨兵成功", state: { status: "completed" } }] },
+      ],
+    })
+    const tool = createVisionLookTool(harness.pipeline)
+    const result = await tool.execute(
+      { images: ["last", "[Image 1]"] },
+      { sessionID: "parent" } as never,
+    )
+    expect(result).toContain("混合哨兵成功")
+  })
+
+  test('mixed "last" and explicit path: "last" wins, explicit path gets a note', async () => {
+    const harness = createVisionHarness("sync")
+    harness.client.session.messages = async () => ({
+      data: [
+        { info: { role: "user" }, parts: [{ type: "file", mime: "image/png", url: FAKE_PNG_URL }] },
+        { info: { role: "assistant" }, parts: [{ type: "text", text: "解读：哨兵优先成功", state: { status: "completed" } }] },
+      ],
+    })
+    const tool = createVisionLookTool(harness.pipeline)
+    const result = await tool.execute(
+      { images: ["last", "./screenshot.png"] },
+      { sessionID: "parent" } as never,
+    )
+    expect(result).toContain("哨兵优先成功")
+    expect(result).toContain("已忽略 1 个显式路径/URL")
+  })
+
+  test('single string real path (non-sentinel) is interpreted directly', async () => {
+    const harness = createVisionHarness("sync")
+    const tool = createVisionLookTool(harness.pipeline)
+    const result = await tool.execute(
+      { images: FAKE_PNG_URL },
+      { sessionID: "parent" } as never,
+    )
+    expect(result).not.toContain("视觉解读失败")
+  })
+
+  // 2026-08-25 recursion incident: an interpretation child called vision_look
+  // on its own injected image, spawning an unbounded chain of grandchildren.
+  // The tool must refuse nested interpretation instead of creating a child.
+  test("vision_look inside an interpretation child refuses and does not nest", async () => {
+    const harness = createVisionHarness("sync")
+    // Block the interpretation child's result poll so it stays in the
+    // in-flight set while the nested vision_look call is made.
+    let releasePoll!: () => void
+    let pollBlocked!: () => void
+    const blocked = new Promise<void>((resolve) => (pollBlocked = resolve))
+    const releasePromise = new Promise<void>((resolve) => (releasePoll = resolve))
+    harness.client.session.messages = async (...args: Parameters<PrismClient["session"]["messages"]>) => {
+      const sessionID = args[0]?.path?.id
+      if (sessionID !== "parent") {
+        // interpretation child's result poll: hold it in-flight, then answer
+        pollBlocked()
+        await releasePromise
+      }
+      return {
+        data: [
+          { info: { role: "user" }, parts: [{ type: "file", mime: "image/png", url: FAKE_PNG_URL }] },
+          { info: { role: "assistant" }, parts: [{ type: "text", text: "解读：这是第一层", state: { status: "completed" } }] },
+        ],
+      }
+    }
+
+    const tool = createVisionLookTool(harness.pipeline)
+    const pending = tool.execute({ images: "last" }, { sessionID: "parent" } as never)
+    await blocked // interpretation child created and now polling
+
+    const childID = Array.from(harness.childSessions.keys())[0]!
+    const before = harness.childSessions.size
+    const nested = await tool.execute({ images: "last" }, { sessionID: childID } as never)
+    expect(nested).toContain("嵌套解读")
+    expect(harness.childSessions.size).toBe(before)
+
+    releasePoll()
+    await pending
+  })
+
+  // Async-mode background vision task children keep vision_look enabled and
+  // carry their own injected image; a model that cannot see the image could
+  // lookLatest its own session. The guard must cover them too.
+  test("vision_look inside a background task child refuses and does not nest", async () => {
+    const harness = createVisionHarness("async")
+    const task = await harness.background.launch({
+      description: "vision task",
+      prompt: "解读图片",
+      parentSessionId: "parent",
+    })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    if (!task.sessionId) throw new Error("task never claimed a session")
+
+    const before = harness.childSessions.size
+    const tool = createVisionLookTool(harness.pipeline)
+    const result = await tool.execute({ images: "last" }, { sessionID: task.sessionId } as never)
+    expect(result).toContain("嵌套解读")
+    expect(harness.childSessions.size).toBe(before) // no nested interpretation child
+  })
+
+  // A relay model may serialize the array form as a JSON string
+  // ("[\"last\"]" instead of ["last"]) — the sentinel must still resolve.
+  test('images: "[\"last\"]" (serialized array) delegates to lookLatest', async () => {
+    const harness = createVisionHarness("sync")
+    harness.client.session.messages = async () => ({
+      data: [
+        { info: { role: "user" }, parts: [{ type: "file", mime: "image/png", url: FAKE_PNG_URL }] },
+        { info: { role: "assistant" }, parts: [{ type: "text", text: "解读：序列化数组成功", state: { status: "completed" } }] },
+      ],
+    })
+    const tool = createVisionLookTool(harness.pipeline)
+    const result = await tool.execute(
+      { images: '["last"]' },
+      { sessionID: "parent" } as never,
+    )
+    expect(result).toContain("序列化数组成功")
+  })
+
+  test('images: "[\"<data-url>\"]" (serialized array of a real ref) interprets directly', async () => {
+    const harness = createVisionHarness("sync")
+    const tool = createVisionLookTool(harness.pipeline)
+    const result = await tool.execute(
+      { images: `["${FAKE_PNG_URL}"]` },
+      { sessionID: "parent" } as never,
+    )
+    expect(result).not.toContain("视觉解读失败")
+  })
+
+  test('images: "[last]" (bare unquoted array literal) delegates to lookLatest', async () => {
+    const harness = createVisionHarness("sync")
+    harness.client.session.messages = async () => ({
+      data: [
+        { info: { role: "user" }, parts: [{ type: "file", mime: "image/png", url: FAKE_PNG_URL }] },
+        { info: { role: "assistant" }, parts: [{ type: "text", text: "解读：裸数组哨兵成功", state: { status: "completed" } }] },
+      ],
+    })
+    const tool = createVisionLookTool(harness.pipeline)
+    const result = await tool.execute(
+      { images: "[last]" },
+      { sessionID: "parent" } as never,
+    )
+    expect(result).toContain("裸数组哨兵成功")
+  })
+
+  // The union schema is the small-model compatibility surface; every execute
+  // test bypasses it, so the schema itself needs a parse-level check. The
+  // tool schema comes from the plugin-bundled zod (not this package's zod),
+  // so parse at the field level instead of importing a second zod instance.
+  test("vision_look images schema accepts string and array forms, rejects others", () => {
+    const harness = createVisionHarness("sync")
+    const tool = createVisionLookTool(harness.pipeline)
+    const imagesSchema = (tool.args as unknown as { images: { safeParse(v: unknown): { success: boolean } } }).images
+    expect(imagesSchema.safeParse("last").success).toBe(true)
+    expect(imagesSchema.safeParse(["last"]).success).toBe(true)
+    expect(imagesSchema.safeParse("./a.png").success).toBe(true)
+    expect(imagesSchema.safeParse(["last", "./a.png"]).success).toBe(true)
+    expect(imagesSchema.safeParse([]).success).toBe(false) // array branch enforces min(1)
+    expect(imagesSchema.safeParse(42).success).toBe(false)
+    expect(imagesSchema.safeParse(undefined).success).toBe(false) // required
+  })
+})
+
+describe("chat.message hook (pasted-image hint)", () => {
+  function hintHookFor(harness: ReturnType<typeof createVisionHarness>, chatImages: "auto" | "hint" | false = "hint") {
+    const tracker = new CurrentModelTracker()
+    return {
+      tracker,
+      hook: createChatMessageHook({
+        config: parseConfig({ vision: { mode: "sync", chatImages } }),
+        pipeline: harness.pipeline,
+        background: harness.background,
+        tracker,
+      }),
+    }
+  }
+
+  test("injects a vision_look reminder part for text-only sessions, without interpreting", async () => {
+    const harness = createVisionHarness("sync")
+    const { hook } = hintHookFor(harness)
+    const parts: Array<Record<string, unknown>> = [
+      { type: "text", text: "这里有什么" },
+      { type: "file", mime: "image/png", url: FAKE_PNG_URL },
+    ]
+    const before = harness.childSessions.size
+    await hook({ sessionID: "parent" }, { parts, message: { id: "msg_1" } } as never)
+    const appended = parts[parts.length - 1] as {
+      type?: string
+      text?: string
+      id?: string
+      sessionID?: string
+      messageID?: string
+    }
+    expect(parts).toHaveLength(3)
+    expect(appended.type).toBe("text")
+    expect(appended.text).toContain("请调用 vision_look")
+    expect(appended.text).toContain('images: "last"')
+    // 1.18.23 part contract: id (prt_ prefix) / sessionID / messageID —
+    // missing fields freeze the message save (2026-08-25 incident).
+    expect(appended.id).toMatch(/^prt_/)
+    expect(appended.sessionID).toBe("parent")
+    expect(appended.messageID).toBe("msg_1")
+    // hint is zero-blocking: no interpretation child is created.
+    expect(harness.childSessions.size).toBe(before)
+  })
+
+  test('"auto" (reserved) currently behaves as "hint"', async () => {
+    const harness = createVisionHarness("sync")
+    const { hook } = hintHookFor(harness, "auto")
+    const parts: Array<Record<string, unknown>> = [{ type: "file", mime: "image/png", url: FAKE_PNG_URL }]
+    await hook({ sessionID: "parent" }, { parts, message: { id: "msg_1" } } as never)
+    expect(parts).toHaveLength(2) // reminder injected
+    expect(harness.childSessions.size).toBe(0) // still zero-blocking
+  })
+
+  test("vision-capable sessions get no reminder", async () => {
+    const harness = createVisionHarness("sync")
+    const { tracker, hook } = hintHookFor(harness)
+    tracker.onChatParams({
+      sessionID: "parent",
+      model: { providerID: "openai", id: "gpt-5.6-sol", capabilities: { input: { image: true } } },
+    })
+    const parts: Array<Record<string, unknown>> = [{ type: "file", mime: "image/png", url: FAKE_PNG_URL }]
+    await hook({ sessionID: "parent" }, { parts, message: { id: "msg_1" } } as never)
+    expect(parts).toHaveLength(1)
+  })
+
+  test("chatImages=false disables the reminder", async () => {
+    const harness = createVisionHarness("sync")
+    const { hook } = hintHookFor(harness, false)
+    const parts: Array<Record<string, unknown>> = [{ type: "file", mime: "image/png", url: FAKE_PNG_URL }]
+    await hook({ sessionID: "parent" }, { parts, message: { id: "msg_1" } } as never)
+    expect(parts).toHaveLength(1)
+  })
+
+  test("background child sessions get no reminder (recursion guard)", async () => {
+    const harness = createVisionHarness("sync")
+    const { hook } = hintHookFor(harness)
+    const task = await harness.background.launch({
+      description: "parent task",
+      prompt: "work",
+      parentSessionId: "parent",
+    })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    if (!task.sessionId) throw new Error("task never claimed a session")
+    const parts: Array<Record<string, unknown>> = [{ type: "file", mime: "image/png", url: FAKE_PNG_URL }]
+    await hook({ sessionID: task.sessionId }, { parts, message: { id: "msg_1" } } as never)
+    expect(parts).toHaveLength(1)
+  })
+
+  // Sync interpretation children are created directly by runVisionInterpretation
+  // (outside the background manager) — their injected image message must not
+  // get the reminder, or the child would be instructed to vision_look its own
+  // image (the accident-1 recursion chain, re-armed by the hint text).
+  test("sync interpretation children get no reminder (recursion guard)", async () => {
+    const harness = createVisionHarness("sync")
+    const { hook } = hintHookFor(harness)
+    // Hold an interpretation in flight so its child stays in the guard set.
+    let releasePoll!: () => void
+    let pollBlocked!: () => void
+    const blocked = new Promise<void>((resolve) => (pollBlocked = resolve))
+    const releasePromise = new Promise<void>((resolve) => (releasePoll = resolve))
+    harness.client.session.messages = async (...args: Parameters<PrismClient["session"]["messages"]>) => {
+      const sessionID = args[0]?.path?.id
+      if (sessionID !== "parent") {
+        pollBlocked()
+        await releasePromise
+      }
+      return {
+        data: [
+          { info: { role: "user" }, parts: [{ type: "file", mime: "image/png", url: FAKE_PNG_URL }] },
+          { info: { role: "assistant" }, parts: [{ type: "text", text: "解读：第一层", state: { status: "completed" } }] },
+        ],
+      }
+    }
+    const pending = harness.pipeline.lookLatest("parent")
+    await blocked // interpretation child created and now polling
+
+    const childID = Array.from(harness.childSessions.keys())[0]!
+    const parts: Array<Record<string, unknown>> = [{ type: "file", mime: "image/png", url: FAKE_PNG_URL }]
+    await hook({ sessionID: childID }, { parts, message: { id: "msg_1" } } as never)
+    expect(parts).toHaveLength(1) // no reminder injected
+
+    releasePoll()
+    await pending
+  })
+
+  test("messages without images get no reminder", async () => {
+    const harness = createVisionHarness("sync")
+    const { hook } = hintHookFor(harness)
+    const parts: Array<Record<string, unknown>> = [{ type: "text", text: "纯文字" }]
+    await hook({ sessionID: "parent" }, { parts, message: { id: "msg_1" } } as never)
+    expect(parts).toHaveLength(1)
+  })
 })
 
 describe("runVisionInterpretation", () => {
+  test("interpretation child disables prism tools to prevent recursion", async () => {
+    const { pipeline, childSessions } = createVisionHarness("sync")
+    await pipeline.look("parent", [{ mime: "image/png", url: FAKE_PNG_URL }])
+    const promptBody = Array.from(childSessions.values())[0]?.prompts[0] as Record<string, unknown>
+    const tools = promptBody?.tools as Record<string, boolean> | undefined
+    expect(tools?.vision_look).toBe(false)
+    expect(tools?.bg_spawn).toBe(false)
+    expect(tools?.question).toBe(false)
+  })
+
   test("does not treat a not-yet-busy session as idle (status-map race)", async () => {
     const { runVisionInterpretation } = await import("../src/core/vision/interpreter")
     let statusCalls = 0

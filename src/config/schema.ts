@@ -27,6 +27,14 @@ export const prismConfigSchema = z.object({
       mode: z
         .enum(["sync", "async"])
         .describe("sync = 同步解读并拼入工具输出；async = 投后台任务，完成后通知回注"),
+      // 对话贴图处理方式（零阻塞，纯提醒）：hint = 在模型回合前注入提醒文本，
+      // 告知图片已保存在会话中、请调用 vision_look(["last"]) 读取（默认）；
+      // false = 不注入，完全依赖模型自主调用工具。auto（自动解读并注入结果）
+      // 为预留值，当前版本尚未实现，配置为 auto 时按 hint 行为执行。
+      chatImages: z
+        .union([z.enum(["auto", "hint"]), z.literal(false)])
+        .default("hint")
+        .describe('对话贴图：hint = 注入"请调用 vision_look"提醒（默认）；false = 不注入；auto = 预留（自动解读，未实现）'),
       tools: z
         .array(z.string().min(1))
         .optional()
@@ -36,6 +44,7 @@ export const prismConfigSchema = z.object({
       enabled: true,
       model: "",
       mode: "sync",
+      chatImages: "hint",
     }),
   background: z
     .object({

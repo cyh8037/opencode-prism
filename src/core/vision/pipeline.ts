@@ -51,6 +51,18 @@ export class VisionPipeline {
     this.logger = deps.logger ?? log
   }
 
+  // Whether this session is a prism child (in-flight interpretation child OR
+  // background task child). vision_look must refuse nested interpretations
+  // from them: their own injected image would spawn a chain of interpretation
+  // grandchildren (2026-08-25 incident: 26+ children in 60s). The async-mode
+  // background vision task is also covered — it carries an injected image and
+  // keeps vision_look enabled (childToolFilters retains it when vision is
+  // enabled), so without this check it could lookLatest its own image and
+  // nest a sync interpretation (bounded depth, but a full extra round-trip).
+  isInterpretationSession(sessionID: string): boolean {
+    return this.interpretationSessions.has(sessionID) || this.deps.background.isChildSession(sessionID)
+  }
+
   // Single configured model with one same-model retry on FAST failure
   // (session create/prompt rejected, no output). Timeouts are NOT retried:
   // the model or network is slow, and a second attempt would only block the
