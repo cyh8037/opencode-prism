@@ -46,4 +46,31 @@ describe("parseJsonc", () => {
     expect(parseJsonc("\uFEFF{\"a\": 1,}")).toEqual({ a: 1 })
     expect(parseJsonc("\uFEFF// comment\r\n{\"a\": 1}")).toEqual({ a: 1 })
   })
+
+  // Escape-state parity: an EVEN run of backslashes before the closing quote
+  // leaves the quote unescaped \u2014 it must close the string. A state machine
+  // that miscounts parity swallows the quote and then treats everything
+  // after it (trailing comma, comments, other keys) as string content,
+  // corrupting the whole config.
+  test("even backslash runs before the close quote keep the string closed", () => {
+    // File content: { "p": "C:\\path\\", "n": 1 }
+    expect(parseJsonc(`{ "p": "C:\\\\path\\\\", "n": 1 }`)).toEqual({ p: "C:\\path\\", n: 1 })
+  })
+
+  test("an escaped quote inside the string does not close it", () => {
+    // File content: { "s": "say \"hi\"", "n": 1 }
+    expect(parseJsonc(`{ "s": "say \\"hi\\"", "n": 1 }`)).toEqual({ s: 'say "hi"', n: 1 })
+  })
+
+  test("backslash runs before an escaped quote keep parity across the quote", () => {
+    // The value is a, two backslashes, a quote, b \u2014 JSON-encoded as
+    // "a\\\\\"b" (even backslash run, then an escaped quote, then close).
+    const value = 'a\\\\"b'
+    const source = `{ "s": ${JSON.stringify(value)}, "n": 1 }`
+    expect(parseJsonc(source)).toEqual({ s: value, n: 1 })
+  })
+
+  test("backslashes do not affect comment stripping outside strings", () => {
+    expect(parseJsonc(`{ "p": "C:\\\\path", // note\n "n": 1 }`)).toEqual({ p: "C:\\path", n: 1 })
+  })
 })

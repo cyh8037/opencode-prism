@@ -118,8 +118,25 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
   // (port-0 fallback, OPENCODE_PORT, config).
   const attachServerUrl = resolveServerUrl(serverUrl, process.env, log)
 
-  const resolveModel: ResolveModelFn = (parentSessionID) =>
-    resolveSessionModel(client, parentSessionID, directory, opencodeDefaultModel)
+  // Per-session model tracker: chat.params fires before every LLM call with
+  // the resolved model and its capabilities — the same signal opencode's
+  // runtime uses to accept image parts.
+  const modelTracker = new CurrentModelTracker()
+
+  // Tracker-first resolution: chat.params snapshots the session's model
+  // before every LLM call, so the common case (a session that has already
+  // made calls in this process) resolves from memory with zero network
+  // cost. Known staleness window: the snapshot refreshes only on the next
+  // chat.params, so a /models switch followed by an immediate /bg or
+  // /split (before the parent's next LLM call) resolves the pre-switch
+  // model — accepted as the price of the fast path, self-healing on the
+  // parent's next call. Only when the snapshot is missing (no call made in
+  // this process yet) do we pay the network path.
+  const resolveModel: ResolveModelFn = (parentSessionID) => {
+    const snapshot = modelTracker.get(parentSessionID)
+    if (snapshot) return Promise.resolve(snapshot.model)
+    return resolveSessionModel(client, parentSessionID, directory, opencodeDefaultModel)
+  }
 
   const manager = new BackgroundManager({
     client,
@@ -128,11 +145,6 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
     gate,
     resolveModel,
   })
-
-  // Per-session model tracker: chat.params fires before every LLM call with
-  // the resolved model and its capabilities — the same signal opencode's
-  // runtime uses to accept image parts.
-  const modelTracker = new CurrentModelTracker()
 
   // Explicit model wins; otherwise inherit the session's current model when
   // it accepts images; an invalid vision.model stays permanently off. The
@@ -161,8 +173,7 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
     directory,
     manager,
     gate,
-    resolvePlannerModel: (sessionID) =>
-      resolveSessionModel(client, sessionID, directory, opencodeDefaultModel),
+    resolvePlannerModel: (sessionID) => resolveModel(sessionID),
   })
 
   return {

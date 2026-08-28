@@ -3,6 +3,8 @@ import {
   DEFAULT_CONCURRENCY,
   MAX_NOTIFICATION_RESULT_CHARS,
   MAX_RETRIES,
+  MAX_STEERING_MSG_BYTES,
+  MAX_STEERING_QUEUE_LEN,
   MAX_TOOL_CALLS,
   POLLING_INTERVAL_MS,
   RESUME_ACQUIRE_TIMEOUT_MS,
@@ -18,6 +20,7 @@ import type { ResolvedModel } from "../../models"
 import { isAgentNotFoundError, shouldRetryError, type ErrorInfo } from "../../models"
 import { errorInfoFromResult } from "../../shared/api-result"
 import { log } from "../../shared/log"
+import { sanitizeSystemReminder } from "../../shared/sanitize"
 import { collectAssistantText } from "../assistant-text"
 import type { PrismClient } from "../client-types"
 import type { PromptGate } from "../prompt-gate"
@@ -58,6 +61,23 @@ function resolveEventSessionID(properties: Record<string, unknown> | undefined):
   return undefined
 }
 
+// Byte-safe truncation for steering messages: slicing at a character count
+// can cut mid-UTF-8 (a lone continuation byte breaks the provider request),
+// so the message is trimmed to fit MAX_STEERING_MSG_BYTES whole characters.
+function truncateSteeringMessage(message: string): string {
+  const maxBytes = MAX_STEERING_MSG_BYTES
+  if (Buffer.byteLength(message, "utf8") <= maxBytes) return message
+  let length = 0
+  let bytes = 0
+  for (const char of message) {
+    const charBytes = Buffer.byteLength(char, "utf8")
+    if (bytes + charBytes > maxBytes) break
+    bytes += charBytes
+    length += char.length
+  }
+  return message.slice(0, length)
+}
+
 function formatDuration(startedAt: Date | undefined, completedAt: Date | undefined): string {
   if (!startedAt || !completedAt) return "-"
   const seconds = Math.max(0, Math.round((completedAt.getTime() - startedAt.getTime()) / 1000))
@@ -71,11 +91,17 @@ function formatDuration(startedAt: Date | undefined, completedAt: Date | undefin
 function buildTaskTable(tasks: BgTask[], includeResults = true): string {
   const rows = tasks
     .map((task) => {
-      const error = task.error ? ` - ${task.error.slice(0, 120)}` : ""
+      // Every field embedded in the notification template is untrusted text —
+      // description comes from the parent conversation, error from the
+      // provider — so all of them get the close-tag escape, not just
+      // resultText.
+      const description = sanitizeSystemReminder(task.description)
+      const error = task.error ? ` - ${sanitizeSystemReminder(task.error.slice(0, 120))}` : ""
       const attempts = task.retries > 0 ? ` (${task.retries + 1} attempts)` : ""
-      const result = includeResults && task.resultText ? `\n   结果: ${task.resultText.slice(0, 200)}` : ""
+      const result =
+        includeResults && task.resultText ? `\n   结果: ${sanitizeSystemReminder(task.resultText.slice(0, 200))}` : ""
       return (
-        `- \`${task.id}\` ${task.description}: ${task.status.toUpperCase()} ` +
+        `- \`${task.id}\` ${description}: ${task.status.toUpperCase()} ` +
         `(${formatDuration(task.startedAt, task.completedAt)})${attempts}${error}${result}`
       )
     })
@@ -157,6 +183,13 @@ export class BackgroundManager {
     return this.findBySession(sessionID) !== undefined
   }
 
+  /** The task owning a child session, or undefined when the session is not a
+   *  bg-task child. Lets the vision pipeline tell an async vision task apart
+   *  from an ordinary subtask (see BgTask.taskType). */
+  getTaskBySession(sessionID: string): BgTask | undefined {
+    return this.findBySession(sessionID)
+  }
+
   private concurrencyKeyFor(model: ResolvedModel | undefined): string {
     return model ? `${model.providerID}/${model.modelID}` : ""
   }
@@ -204,6 +237,7 @@ export class BackgroundManager {
       parts: input.parts,
       system: input.system,
       agent: input.agent,
+      taskType: input.taskType ?? "default",
       model,
       retries: 0,
       status: "pending",
@@ -485,6 +519,10 @@ export class BackgroundManager {
         system: task.system,
         parentSessionId: task.parentSessionId,
         agent: task.agent,
+        // A vision task stays a vision task across the retry: the relaunched
+        // child carries the same injected image, and the recursion guard
+        // must keep treating it as an interpretation session.
+        taskType: task.taskType,
       },
       model,
     })
@@ -684,21 +722,27 @@ export class BackgroundManager {
     if (task.status !== "running" || !task.sessionId) return
     if (this.settlingTaskIds.has(task.id)) return
     this.settlingTaskIds.add(task.id)
+    // Pin the session for this whole settle: every awaited step below can
+    // observe a same-model retry (which clears task.sessionId and re-queues
+    // the task as pending). Completing after that would race the relaunch —
+    // the task would flip to "completed" while the retry queue still holds a
+    // launch item for it.
+    const sessionID = task.sessionId
     try {
-      const hasOutput = await this.validateSessionHasOutput(task.sessionId, task)
+      const hasOutput = await this.validateSessionHasOutput(sessionID, task)
       if (!hasOutput) {
         this.logger("[prism] session idle but no output yet, waiting", { taskId: task.id })
         return
       }
       if (await this.deliverSteering(task)) return
-      if (task.status !== "running") return // settled (cancel/error) while we awaited
-      if (!(await this.confirmStillIdle(task))) return
+      if (task.status !== "running" || task.sessionId !== sessionID) return // settled while we awaited
+      if (!(await this.confirmStillIdle(sessionID, task))) return
       // A message may have queued while the confirmation call was in flight —
       // send() only checks status === "running", which still held. Completing
       // now would silently drop it (finalize clears the queue) after the
       // caller was already told "已排队"; hand it to the next idle boundary.
       if (task.steeringQueue && task.steeringQueue.length > 0) return
-      await this.completeTask(task, source)
+      await this.completeTask(task, source, sessionID)
     } finally {
       this.settlingTaskIds.delete(task.id)
     }
@@ -710,7 +754,9 @@ export class BackgroundManager {
   // dispatches), and an idle snapshot from BEFORE a steering round was
   // accepted must never complete the task. Completion therefore re-reads the
   // status at decision time and only proceeds on a confirmed idle session.
-  private async confirmStillIdle(task: BgTask): Promise<boolean> {
+  // sessionID is the session pinned by the caller's settle — NOT a live read
+  // of task.sessionId, which a concurrent same-model retry may have cleared.
+  private async confirmStillIdle(sessionID: string, task: BgTask): Promise<boolean> {
     // The status map itself can lag acceptance (the server marks busy
     // slightly after promptAsync resolves): the grace window bridges that
     // regardless of what a fresh read says.
@@ -728,7 +774,7 @@ export class BackgroundManager {
       const response = await this.deps.client.session.status()
       const map = response.data
       if (!map || typeof map !== "object") return false
-      const type = (map as SessionStatusMap)[task.sessionId!]?.type
+      const type = (map as SessionStatusMap)[sessionID]?.type
       // Absent entries ARE the idle state (the map only lists non-idle
       // sessions); anything else is left to the next sweep.
       if (type === undefined || type === "idle") return true
@@ -907,11 +953,25 @@ export class BackgroundManager {
     if (!this.hasRunningTasks()) this.stopPolling()
   }
 
-  private async completeTask(task: BgTask, source: string): Promise<void> {
+  private async completeTask(task: BgTask, source: string, expectedSessionID: string): Promise<void> {
     // The task may have settled (e.g. cancelled) while confirmStillIdle's
     // status call was in flight — notifyParent would then duplicate the
     // cancellation notice.
     if (TERMINAL_STATUSES.has(task.status)) return
+    // A same-model retry re-queues the task (status -> pending, sessionId
+    // cleared) while a settle is in flight. status "pending" passes the
+    // terminal check above, so completing here would flip a task the retry
+    // queue is about to relaunch — with the retry's child then aborted
+    // mid-run by this completion's abortSession. Exit instead and let the
+    // retry own the task.
+    if (task.status !== "running" || !task.sessionId) return
+    // Identity check against the session the settle pinned: the retry may
+    // have already relaunched the task on a FRESH child (status "running"
+    // again, sessionId = the new child) by the time we get here. The idle
+    // confirmation was for the OLD session — completing now would mark the
+    // task done and abort its just-relaunched child mid-run. Only complete
+    // when the task still owns the session this settle confirmed idle.
+    if (task.sessionId !== expectedSessionID) return
     // Reserve the parent gate BEFORE flipping status: between the flip and the
     // wake landing, the batch would already look fully settled to any
     // concurrent check. The reservation only covers the flip-to-notification
@@ -1001,14 +1061,33 @@ export class BackgroundManager {
     if (!task) throw new Error(`task not found: ${taskId}`)
     if (this.shutdownTriggered) throw new Error("background manager is shutting down, cannot send messages")
     if (task.status === "running" || task.status === "pending") {
-      task.steeringQueue = [...(task.steeringQueue ?? []), message]
+      // The queue lives on the task for its whole lifecycle, so an unbounded
+      // stream of bg_send calls would balloon memory; the cap rejects new
+      // sends while the current backlog is still undelivered.
+      const queueLength = task.steeringQueue?.length ?? 0
+      if (queueLength >= MAX_STEERING_QUEUE_LEN) {
+        throw new Error(
+          `任务 ${taskId} 的补充指令队列已满（${MAX_STEERING_QUEUE_LEN} 条未投递），请等待下一轮投递后再发送`,
+        )
+      }
+      // The queued text is injected into the child's prompt verbatim — a
+      // multi-MB message would overflow the context window. Truncate with a
+      // log instead of rejecting: the caller already saw the send succeed.
+      const effective = truncateSteeringMessage(message)
+      if (effective !== message) {
+        this.logger("[prism] steering message truncated to MAX_STEERING_MSG_BYTES", {
+          taskId: task.id,
+          originalBytes: Buffer.byteLength(message, "utf8"),
+        })
+      }
+      task.steeringQueue = [...(task.steeringQueue ?? []), effective]
       this.logger("[prism] steering message queued", {
         taskId: task.id,
         queueLength: task.steeringQueue.length,
       })
       return { task, queued: true, queueLength: task.steeringQueue.length }
     }
-    const resumed = await this.resume(taskId, message)
+    const resumed = await this.resume(taskId, truncateSteeringMessage(message))
     return { task: resumed, queued: false, queueLength: 0 }
   }
 
@@ -1188,7 +1267,14 @@ export class BackgroundManager {
           buildTaskTable(siblingTasks, !fullResult),
         ]
         if (fullResult) {
-          lines.push("", "完整结果:", truncated ? resultText.slice(0, MAX_NOTIFICATION_RESULT_CHARS) : resultText)
+          // The result is untrusted child output embedded inside the
+          // <system-reminder> block — escape the close tag so a hostile or
+          // accidental "</system-reminder>" cannot break out of it.
+          lines.push(
+            "",
+            "完整结果:",
+            sanitizeSystemReminder(truncated ? resultText.slice(0, MAX_NOTIFICATION_RESULT_CHARS) : resultText),
+          )
           if (truncated) {
             lines.push("", `（结果过长已截断，用 bg_output("${task.id}") 查看完整结果）`)
           }

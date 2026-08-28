@@ -658,15 +658,17 @@ describe("vision_look tool", () => {
     await pending
   })
 
-  // Async-mode background vision task children keep vision_look enabled and
-  // carry their own injected image; a model that cannot see the image could
-  // lookLatest its own session. The guard must cover them too.
-  test("vision_look inside a background task child refuses and does not nest", async () => {
+  // Async-mode background vision task children (taskType "vision") keep
+  // vision_look enabled and carry their own injected image; a model that
+  // cannot see the image could lookLatest its own session. The guard must
+  // cover them too.
+  test("vision_look inside a vision task child refuses and does not nest", async () => {
     const harness = createVisionHarness("async")
     const task = await harness.background.launch({
       description: "vision task",
       prompt: "解读图片",
       parentSessionId: "parent",
+      taskType: "vision",
     })
     await new Promise((resolve) => setTimeout(resolve, 100))
     if (!task.sessionId) throw new Error("task never claimed a session")
@@ -676,6 +678,36 @@ describe("vision_look tool", () => {
     const result = await tool.execute({ images: "last" }, { sessionID: task.sessionId } as never)
     expect(result).toContain("嵌套解读")
     expect(harness.childSessions.size).toBe(before) // no nested interpretation child
+  })
+
+  // Ordinary background subtasks (taskType "default") carry no injected image
+  // and MAY call vision_look on images of their own — the recursion guard
+  // refuses interpretation contexts (sync children + vision tasks), not every
+  // prism child. Regression for the 0.4.0-era blanket isChildSession guard
+  // that made every subtask's vision_look fail with the nesting error.
+  test("vision_look inside an ordinary background subtask interprets instead of refusing", async () => {
+    const harness = createVisionHarness("async")
+    const task = await harness.background.launch({
+      description: "subtask",
+      prompt: "工作",
+      parentSessionId: "parent",
+    })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    if (!task.sessionId) throw new Error("task never claimed a session")
+
+    // The subtask's session has a pasted image; lookLatest must find it and
+    // run the interpretation (one nested child), not refuse.
+    harness.client.session.messages = async () => ({
+      data: [
+        { info: { role: "user" }, parts: [{ type: "file", mime: "image/png", url: FAKE_PNG_URL }] },
+        { info: { role: "assistant" }, parts: [{ type: "text", text: "解读：子任务读图成功", state: { status: "completed" } }] },
+      ],
+    })
+    const before = harness.childSessions.size
+    const tool = createVisionLookTool(harness.pipeline)
+    const result = await tool.execute({ images: "last" }, { sessionID: task.sessionId } as never)
+    expect(result).toContain("子任务读图成功")
+    expect(harness.childSessions.size).toBe(before + 1) // exactly one nested interpretation child
   })
 
   // A relay model may serialize the array form as a JSON string

@@ -115,37 +115,46 @@ export class SplitService {
       sequential: request.sequential,
     })
 
-    void run.done.then(async () => {
-      const text = buildSplitReport(run.tasksByPlanID, plans, run.skippedPlanIDs)
-      const dispatch = () =>
-        this.deps.gate.dispatch({
-          sessionID: request.sessionID,
-          source: "split-aggregation",
-          text,
-        })
-      let result = await dispatch()
-      if (result.status === "failed") {
-        // The aggregation is the only record of the whole run — callers do not
-        // re-enqueue, so give it one more chance after a pause.
-        this.logger("[prism] split: aggregation dispatch failed, retrying once", {
-          sessionID: request.sessionID,
-          error: result.error,
-        })
-        await new Promise((resolve) => setTimeout(resolve, 2_000))
-        result = await dispatch()
+    // .catch on the tail: an unexpected throw in this callback (Invariant #1 —
+    // hooks never escape, but this is a fire-and-forget promise chain outside
+    // any hook) would surface as an unhandled rejection in the host process,
+    // whose stderr leaks into the TUI. The aggregation is best-effort; a throw
+    // must not crash the process.
+    void run.done
+      .then(async () => {
+        const text = buildSplitReport(run.tasksByPlanID, plans, run.skippedPlanIDs)
+        const dispatch = () =>
+          this.deps.gate.dispatch({
+            sessionID: request.sessionID,
+            source: "split-aggregation",
+            text,
+          })
+        let result = await dispatch()
         if (result.status === "failed") {
-          // The report is the only record of the SKIPPED plans (the per-task
-          // batch notices never mention unlaunched ones) — once it is lost to
-          // the parent conversation, the log file is the only place it can
-          // still be recovered from.
-          this.logger("[prism] split: aggregation dispatch failed permanently (report lost to chat, preserved below)", {
+          // The aggregation is the only record of the whole run — callers do not
+          // re-enqueue, so give it one more chance after a pause.
+          this.logger("[prism] split: aggregation dispatch failed, retrying once", {
             sessionID: request.sessionID,
             error: result.error,
-            report: text,
           })
+          await new Promise((resolve) => setTimeout(resolve, 2_000))
+          result = await dispatch()
+          if (result.status === "failed") {
+            // The report is the only record of the SKIPPED plans (the per-task
+            // batch notices never mention unlaunched ones) — once it is lost to
+            // the parent conversation, the log file is the only place it can
+            // still be recovered from.
+            this.logger("[prism] split: aggregation dispatch failed permanently (report lost to chat, preserved below)", {
+              sessionID: request.sessionID,
+              error: result.error,
+              report: text,
+            })
+          }
         }
-      }
-    })
+      })
+      .catch((error) => {
+        this.logger("[prism] split: aggregation failed (swallowed)", { sessionID: request.sessionID, error })
+      })
 
     return {
       kind: "launched",

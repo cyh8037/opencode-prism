@@ -1,4 +1,5 @@
 import { MAX_SUBTASKS } from "../../config/constants"
+import { sanitizeSystemReminder } from "../../shared/sanitize"
 import type { BgTask, LaunchInput } from "../background/types"
 import type { BackgroundManager } from "../background/manager"
 import type { SubTaskPlan } from "./plan-schema"
@@ -184,24 +185,30 @@ export function buildSplitReport(
   skippedPlanIDs: Map<string, string> = new Map(),
 ): string {
   const lines = ["<system-reminder>", "[PRISM SPLIT REPORT]", ""]
+  // plan.title comes from the planner LLM and task.error from the provider —
+  // untrusted text embedded in the template, escaped like the results.
+  const esc = sanitizeSystemReminder
   for (const plan of plans) {
+    const title = esc(plan.title)
     const skippedDep = skippedPlanIDs.get(plan.id)
     if (skippedDep) {
       if (skippedDep === LAUNCH_FAILED) {
-        lines.push(`- ${plan.id} ${plan.title}: 启动失败（未能创建后台任务，详见插件日志）`)
+        lines.push(`- ${plan.id} ${title}: 启动失败（未能创建后台任务，详见插件日志）`)
       } else {
-        lines.push(`- ${plan.id} ${plan.title}: SKIPPED (上游 ${skippedDep} 失败，未启动)`)
+        lines.push(`- ${plan.id} ${title}: SKIPPED (上游 ${esc(skippedDep)} 失败，未启动)`)
       }
       continue
     }
     const task = tasksByPlanID.get(plan.id)
     if (!task) {
-      lines.push(`- ${plan.id} ${plan.title}: 未启动`)
+      lines.push(`- ${plan.id} ${title}: 未启动`)
       continue
     }
-    const error = task.error ? `: ${task.error.slice(0, 120)}` : ""
-    const result = task.resultText ? `\n  结果: ${task.resultText.slice(0, 200)}` : ""
-    lines.push(`- ${plan.id} ${plan.title}: ${task.status.toUpperCase()}${error}${result}`)
+    const error = task.error ? `: ${esc(task.error.slice(0, 120))}` : ""
+    // Untrusted subtask output embedded in the <system-reminder> block —
+    // escape the close tag so it cannot break out of the template.
+    const result = task.resultText ? `\n  结果: ${esc(task.resultText.slice(0, 200))}` : ""
+    lines.push(`- ${plan.id} ${title}: ${task.status.toUpperCase()}${error}${result}`)
   }
   lines.push("", "整合子任务结果，完成整体任务的验证与收尾。", "</system-reminder>")
   return lines.join("\n")

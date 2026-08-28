@@ -12,10 +12,6 @@ export class ConcurrencyManager {
 
   constructor(private limit: number) {}
 
-  getLimit(): number {
-    return this.limit
-  }
-
   async acquire(key: string, taskId?: string): Promise<void> {
     if (this.limit === Infinity) return
 

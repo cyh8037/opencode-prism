@@ -58,6 +58,12 @@ export const STEERING_MAX_DELIVERY_ATTEMPTS = 3
 // delivery (earlier settles can stall it for seconds). Must exceed
 // POLLING_INTERVAL_MS plus one slow settle.
 export const STEERING_SETTLE_GRACE_MS = 8_000
+// Per-task steering queue bounds: the queue lives on the task object for its
+// whole lifecycle, so unbounded growth from frequent bg_send calls would
+// balloon memory — and the queued text is later injected into the child
+// prompt, so a single oversized message can overflow the context window.
+export const MAX_STEERING_QUEUE_LEN = 10
+export const MAX_STEERING_MSG_BYTES = 32 * 1024
 // bg_wait: default block time and hard cap for one tool call.
 export const BG_WAIT_DEFAULT_MS = 120_000
 export const BG_WAIT_MAX_MS = 600_000

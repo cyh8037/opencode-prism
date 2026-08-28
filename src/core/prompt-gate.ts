@@ -31,6 +31,11 @@ interface SessionState {
   recent?: { dedupeKey: string; heldUntil: number }
   /** Serializes dispatches: a concurrent caller queues instead of dropping. */
   dispatchChain: Promise<unknown>
+  /** Aborted when the session is cleared: in-flight waitForIdle /
+   *  waitForReservation loops and the dispatch retry chain must stop
+   *  immediately instead of polling a session that no longer exists
+   *  (a deleted session's requests would all be wasted). */
+  abortController: AbortController
 }
 
 function hashText(text: string): string {
@@ -70,7 +75,7 @@ export class PromptGate {
   private getState(sessionID: string): SessionState {
     let state = this.state.get(sessionID)
     if (!state) {
-      state = { dispatchChain: Promise.resolve() }
+      state = { dispatchChain: Promise.resolve(), abortController: new AbortController() }
       this.state.set(sessionID, state)
     }
     return state
@@ -120,11 +125,15 @@ export class PromptGate {
 
   // Wait until the session is not busy (or settle timeout), so the injected
   // message lands between turns instead of colliding with an in-flight prompt.
-  private async waitForIdle(sessionID: string): Promise<boolean> {
+  // Abort-aware: the session may be cleared (deleted) mid-wait — stop polling
+  // immediately rather than burning status calls on a dead session.
+  private async waitForIdle(state: SessionState, sessionID: string): Promise<boolean> {
+    const abortSignal = state.abortController.signal
     const settleMs = this.options.idleSettleMs ?? SESSION_IDLE_SETTLE_MS
     const pollMs = this.options.idlePollMs ?? 500
     const deadline = Date.now() + settleMs
     while (Date.now() < deadline) {
+      if (abortSignal.aborted) return false
       if (!(await this.isSessionBusy(sessionID))) return true
       await sleep(pollMs)
     }
@@ -135,10 +144,12 @@ export class PromptGate {
   // window (bounded by ABORT_TIMEOUT_MS), so waiting it out almost always
   // succeeds; on timeout the dispatch proceeds rather than being dropped.
   private async waitForReservation(state: SessionState): Promise<boolean> {
+    const abortSignal = state.abortController.signal
     const waitMs = this.options.reservationWaitMs ?? GATE_RESERVATION_WAIT_MS
     const pollMs = this.options.reservationPollMs ?? GATE_RESERVATION_POLL_MS
     const deadline = Date.now() + waitMs
     while (Date.now() < deadline) {
+      if (abortSignal.aborted) return false
       if (!state.reservation) return true
       await sleep(pollMs)
     }
@@ -158,32 +169,30 @@ export class PromptGate {
     source: string
     state: SessionState
     text: string
-    parts?: Array<Record<string, unknown>>
-    mode: "async" | "sync"
     queueBehavior: "defer" | "enqueue"
     dedupeKey: string
     dedupeMs: number
   }): Promise<GateDispatchResult> {
-    const { sessionID, source, state, text, parts, mode, queueBehavior, dedupeKey, dedupeMs } = args
+    const { sessionID, source, state, text, queueBehavior, dedupeKey, dedupeMs } = args
 
-    const body = parts
-      ? { parts }
-      : { parts: [{ type: "text", text, synthetic: true }] }
+    const body = { parts: [{ type: "text", text, synthetic: true }] }
 
-    const dispatch = (): Promise<unknown> => {
-      if (mode === "sync") {
-        return this.client.session.prompt({ path: { id: sessionID }, body })
-      }
-      return this.client.session.promptAsync({ path: { id: sessionID }, body })
-    }
+    const dispatch = (): Promise<unknown> => this.client.session.promptAsync({ path: { id: sessionID }, body })
 
     const retryDelayMs = this.options.dispatchRetryDelayMs ?? GATE_DISPATCH_RETRY_DELAY_MS
     let lastError: unknown
 
     for (let attempt = 1; attempt <= GATE_DISPATCH_ATTEMPTS; attempt++) {
+      // The session was cleared (deleted) while this dispatch was queued
+      // behind the chain — every further status call and prompt attempt would
+      // target a dead session. Stop instead of retrying.
+      if (state.abortController.signal.aborted) {
+        return { status: "failed", error: new Error("gate state cleared (session gone)") }
+      }
+
       if (state.reservation) {
         const cleared = await this.waitForReservation(state)
-        if (!cleared && state.reservation) {
+        if (!cleared && state.reservation && !state.abortController.signal.aborted) {
           log(`[prism] gate: reservation still held after wait, dispatching anyway`, {
             sessionID,
             source,
@@ -192,16 +201,27 @@ export class PromptGate {
         }
       }
 
+      // The session may have been cleared while we waited out a reservation.
+      if (state.abortController.signal.aborted) {
+        return { status: "failed", error: new Error("gate state cleared (session gone)") }
+      }
+
       if (state.recent && state.recent.dedupeKey === dedupeKey && Date.now() < state.recent.heldUntil) {
         return { status: "duplicate" }
       }
 
       try {
         if (queueBehavior === "defer") {
-          const idle = await this.waitForIdle(sessionID)
-          if (!idle) {
+          const idle = await this.waitForIdle(state, sessionID)
+          if (!idle && !state.abortController.signal.aborted) {
             log(`[prism] gate: session still busy after settle, dispatching anyway`, { sessionID, source })
           }
+        }
+
+        // The session was cleared while we waited for idle — dispatching now
+        // would target a deleted session.
+        if (state.abortController.signal.aborted) {
+          return { status: "failed", error: new Error("gate state cleared (session gone)") }
         }
 
         const result = await dispatch()
@@ -243,12 +263,10 @@ export class PromptGate {
     sessionID: string
     source: string
     text: string
-    parts?: Array<Record<string, unknown>>
-    mode?: "async" | "sync"
     /** defer: wait for session idle before dispatching; enqueue: dispatch immediately */
     queueBehavior?: "defer" | "enqueue"
   }): Promise<GateDispatchResult> {
-    const { sessionID, source, text, parts, mode = "async", queueBehavior = "defer" } = args
+    const { sessionID, source, text, queueBehavior = "defer" } = args
     const state = this.getState(sessionID)
     const dedupeKey = hashText(text)
     const dedupeMs = this.options.semanticDedupeMs ?? PARENT_WAKE_DEDUPE_MS
@@ -263,18 +281,24 @@ export class PromptGate {
     // previously be dropped, silently losing a wake.
     const run = state.dispatchChain
       .catch(() => undefined) // a failed dispatch must not block the queue
-      .then(() =>
-        this.dispatchNow({ sessionID, source, state, text, parts, mode, queueBehavior, dedupeKey, dedupeMs }),
-      )
+      .then(() => this.dispatchNow({ sessionID, source, state, text, queueBehavior, dedupeKey, dedupeMs }))
     state.dispatchChain = run.catch(() => undefined)
     return run
   }
 
   clear(sessionID: string): void {
+    // Abort first: in-flight waits (waitForIdle / waitForReservation) and the
+    // dispatch retry chain listen on the signal and must not keep polling a
+    // session that is gone. The state entry itself is then dropped; a later
+    // dispatch gets a fresh state with a fresh controller.
+    this.state.get(sessionID)?.abortController.abort()
     this.state.delete(sessionID)
   }
 
   clearAll(): void {
+    for (const state of this.state.values()) {
+      state.abortController.abort()
+    }
     this.state.clear()
   }
 }

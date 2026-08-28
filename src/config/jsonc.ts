@@ -6,6 +6,7 @@
 export function stripJsonc(source: string): string {
   let output = ""
   let inString = false
+  let inEscape = false
   let inLineComment = false
   let inBlockComment = false
 
@@ -29,9 +30,15 @@ export function stripJsonc(source: string): string {
     }
     if (inString) {
       output += char
-      if (char === "\\") {
-        output += next ?? ""
-        i++
+      // Escape-state machine: a backslash escapes the NEXT character
+      // whatever it is (a quote, another backslash, a plain letter). The
+      // parity of the backslash run decides whether the following quote
+      // closes the string — explicit state makes "C:\\path\\" (even run)
+      // close at its final quote while "\\\"" stays an escaped quote.
+      if (inEscape) {
+        inEscape = false
+      } else if (char === "\\") {
+        inEscape = true
       } else if (char === '"') {
         inString = false
       }

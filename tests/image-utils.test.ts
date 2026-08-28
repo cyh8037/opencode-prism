@@ -123,6 +123,46 @@ describe("normalizeImageUrl remote size limits", () => {
   })
 })
 
+describe("normalizeImageUrl streaming truncation", () => {
+  // Chunked responses carry no Content-Length, so the header check cannot
+  // reject them — the streaming reader must. A naive arrayBuffer() would
+  // buffer the whole (arbitrarily large) body into memory before rejecting.
+  test("a chunked body over the cap aborts the download, never buffering it", async () => {
+    let cancelled = false
+    const chunk = new Uint8Array(1024 * 1024) // 1MB chunks
+    // An ENDLESS chunked stream (never closed): only the reader's cancel at
+    // the cap ends the test — if the cap logic regressed, the read would
+    // hang and the test would fail by timeout instead of silently passing.
+    // (Calling close() in the source would make reader.cancel() a no-op per
+    // the streams spec, so the cancel callback could never fire.)
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(chunk)
+      },
+      cancel() {
+        cancelled = true
+      },
+    })
+    stubFetch(() => new Response(stream, { status: 200 }))
+    const result = await normalizeImageUrl({ mime: "image/png", url: "https://example.com/chunked.png" })
+    expect(result).toBeNull()
+    expect(cancelled).toBe(true) // the reader cancelled the transfer at the cap
+  })
+
+  test("a chunked body within the cap is still read and accepted", async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(PNG_BYTES)
+        controller.close()
+      },
+    })
+    stubFetch(() => new Response(stream, { status: 200 }))
+    const result = await normalizeImageUrl({ mime: "image/png", url: "https://example.com/small-chunked.png" })
+    expect(result?.mime).toBe("image/png")
+    expect(result?.url.startsWith("data:image/png;base64,")).toBe(true)
+  })
+})
+
 describe("normalizeImageBatch total cap", () => {
   // Providers cap the whole inline request (Gemini at 20MB) — the cap is on
   // the encoded payload, and the images that fit are kept, the tail dropped.

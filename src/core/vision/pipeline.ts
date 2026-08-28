@@ -51,16 +51,24 @@ export class VisionPipeline {
     this.logger = deps.logger ?? log
   }
 
-  // Whether this session is a prism child (in-flight interpretation child OR
-  // background task child). vision_look must refuse nested interpretations
-  // from them: their own injected image would spawn a chain of interpretation
-  // grandchildren (2026-08-25 incident: 26+ children in 60s). The async-mode
-  // background vision task is also covered — it carries an injected image and
-  // keeps vision_look enabled (childToolFilters retains it when vision is
-  // enabled), so without this check it could lookLatest its own image and
-  // nest a sync interpretation (bounded depth, but a full extra round-trip).
+  // Whether this session is an interpretation context where vision_look must
+  // refuse nested interpretations. Two kinds qualify:
+  //  1. in-flight sync interpretation children (interpretationSessions) — the
+  //     recursion guard for their own injected image (2026-08-25 incident:
+  //     26+ children in 60s);
+  //  2. async background vision tasks (taskType "vision") — they carry an
+  //     injected image and keep vision_look enabled (childToolFilters retains
+  //     it when vision is enabled), so without this check they could lookLatest
+  //     their own image and nest a sync interpretation (bounded depth, but a
+  //     full extra round-trip).
+  // Ordinary background subtasks (taskType "default") are deliberately NOT
+  // interpretation sessions: their whole point is that they may call
+  // vision_look on images of their own, and their injected prompts carry no
+  // image for the recursion chain to feed on.
   isInterpretationSession(sessionID: string): boolean {
-    return this.interpretationSessions.has(sessionID) || this.deps.background.isChildSession(sessionID)
+    if (this.interpretationSessions.has(sessionID)) return true
+    const task = this.deps.background.getTaskBySession(sessionID)
+    return task?.taskType === "vision"
   }
 
   // Single configured model with one same-model retry on FAST failure
@@ -82,46 +90,55 @@ export class VisionPipeline {
     }
     const instruction = makeVisionInstruction(goal)
 
+    // Track every child this call creates so the trigger guard can see them
+    // while any interpretation is in flight (the recursion window). Entries
+    // are removed in the finally below — AFTER the whole call (all retries)
+    // is over. The previous per-attempt cleanup could leave a stale entry if
+    // the call threw between the child's creation and the delete, and could
+    // remove an entry while a late part event from the just-aborted child
+    // was still landing; keeping the set valid for the full call bounds
+    // those windows.
     let lastReason: VisionFailureReason = "internal-error"
-    for (let attempt = 0; attempt <= 1; attempt++) {
-      // Track this call's children so the trigger guard can see them while
-      // the interpretation is in flight (the recursion window).
-      const createdThisCall: string[] = []
-      let outcome: InterpretationOutcome = { text: null, reason: "internal-error" }
-      try {
-        outcome = await runVisionInterpretation({
-          client: this.deps.client,
-          directory: this.deps.directory,
-          parentSessionID,
-          images,
+    const createdThisCall: string[] = []
+    try {
+      for (let attempt = 0; attempt <= 1; attempt++) {
+        let outcome: InterpretationOutcome = { text: null, reason: "internal-error" }
+        try {
+          outcome = await runVisionInterpretation({
+            client: this.deps.client,
+            directory: this.deps.directory,
+            parentSessionID,
+            images,
+            model,
+            instruction,
+            timeoutMs: this.deps.interpretTimeoutMs ?? VISION_SYNC_TIMEOUT_MS,
+            onSessionCreated: (sessionID) => {
+              this.interpretationSessions.add(sessionID)
+              createdThisCall.push(sessionID)
+            },
+          })
+        } catch (error) {
+          this.logger("[prism] vision: interpretation threw", { model, error })
+        }
+        if (outcome.text !== null) return { text: outcome.text, reason: null }
+        lastReason = outcome.reason ?? "internal-error"
+        if (lastReason === "timeout" || lastReason === "invalid-images") {
+          this.logger("[prism] vision: interpretation failed, not retrying", { model, reason: lastReason })
+          return { text: null, reason: lastReason }
+        }
+
+        this.logger("[prism] vision: interpretation failed fast, retrying with the same model", {
           model,
-          instruction,
-          timeoutMs: this.deps.interpretTimeoutMs ?? VISION_SYNC_TIMEOUT_MS,
-          onSessionCreated: (sessionID) => {
-            this.interpretationSessions.add(sessionID)
-            createdThisCall.push(sessionID)
-          },
+          reason: lastReason,
+          attempt: attempt + 1,
         })
-      } catch (error) {
-        this.logger("[prism] vision: interpretation threw", { model, error })
       }
+      return { text: null, reason: lastReason }
+    } finally {
       for (const sessionID of createdThisCall) {
         this.interpretationSessions.delete(sessionID)
       }
-      if (outcome.text !== null) return { text: outcome.text, reason: null }
-      lastReason = outcome.reason ?? "internal-error"
-      if (lastReason === "timeout" || lastReason === "invalid-images") {
-        this.logger("[prism] vision: interpretation failed, not retrying", { model, reason: lastReason })
-        return { text: null, reason: lastReason }
-      }
-
-      this.logger("[prism] vision: interpretation failed fast, retrying with the same model", {
-        model,
-        reason: lastReason,
-        attempt: attempt + 1,
-      })
     }
-    return { text: null, reason: lastReason }
   }
 
   // Cap the batch at MAX_IMAGES_PER_BATCH. Extras are dropped with a log AND
@@ -243,6 +260,11 @@ export class VisionPipeline {
         parts,
         system: VISION_SYSTEM_PROMPT,
         parentSessionId: sessionID,
+        // Marks this child as an interpretation session: it carries an
+        // injected image and keeps vision_look enabled, and the recursion
+        // guard (isInterpretationSession) refuses nested interpretations
+        // from it — it must not look at its own injected image.
+        taskType: "vision",
         // Pin the gate-checked model: the child must use exactly the model
         // we verified can see images, not a freshly re-resolved one.
         model,

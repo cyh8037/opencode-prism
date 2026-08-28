@@ -40,15 +40,19 @@ export const subTaskPlanArraySchema = z
         }
       }
     }
-    // cycle check via Kahn on the dependency graph
-    const indegree = new Map(plans.map((plan) => [plan.id, plan.dependsOn.length]))
+    // cycle check via Kahn on the dependency graph. dependsOn entries are
+    // deduplicated per plan: a duplicate like ["a", "a"] would otherwise
+    // inflate the indegree and never reach zero, falsely reporting a cycle
+    // for an acyclic graph.
+    const uniqueDeps = plans.map((plan) => [...new Set(plan.dependsOn)])
+    const indegree = new Map(plans.map((plan, index) => [plan.id, uniqueDeps[index]!.length]))
     const dependents = new Map<string, string[]>(plans.map((plan) => [plan.id, []]))
-    for (const plan of plans) {
-      for (const dep of plan.dependsOn) {
-        dependents.get(dep)?.push(plan.id)
+    for (let i = 0; i < plans.length; i++) {
+      for (const dep of uniqueDeps[i]!) {
+        dependents.get(dep)?.push(plans[i]!.id)
       }
     }
-    const queue = plans.filter((plan) => plan.dependsOn.length === 0).map((plan) => plan.id)
+    const queue = plans.filter((plan, index) => uniqueDeps[index]!.length === 0).map((plan) => plan.id)
     let visited = 0
     while (queue.length > 0) {
       const id = queue.shift()!

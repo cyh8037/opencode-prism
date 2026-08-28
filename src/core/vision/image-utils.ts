@@ -160,7 +160,7 @@ export async function normalizeImageUrl(
     // Reject on the declared size before buffering the body — a huge (or
     // maliciously slow) response would otherwise be downloaded in full
     // before the post-read check rejects it. Absent/chunked Content-Length
-    // falls through to that check.
+    // falls through to the streaming check below.
     const declaredLength = Number(response.headers.get("content-length"))
     if (Number.isFinite(declaredLength) && declaredLength > VISION_IMAGE_MAX_BYTES) {
       log(`[prism] vision: image exceeds ${VISION_IMAGE_MAX_BYTES / 1_048_576}MB (Content-Length), skipping`, {
@@ -169,11 +169,8 @@ export async function normalizeImageUrl(
       })
       return null
     }
-    const bytes = new Uint8Array(await response.arrayBuffer())
-    if (bytes.byteLength > VISION_IMAGE_MAX_BYTES) {
-      log(`[prism] vision: image exceeds ${VISION_IMAGE_MAX_BYTES / 1_048_576}MB, skipping`, { url: image.url, bytes: bytes.byteLength })
-      return null
-    }
+    const bytes = await readBodyBounded(response, image.url)
+    if (bytes === null) return null
     const mime = sniffImageMime(bytes)
     if (!mime) {
       log(`[prism] vision: remote response is not a supported image, skipping`, { url: image.url, bytes: bytes.byteLength })
@@ -184,6 +181,49 @@ export async function normalizeImageUrl(
     log(`[prism] vision: image fetch failed`, { url: image.url, error })
     return null
   }
+}
+
+// Stream the response body with a hard byte cap. response.arrayBuffer()
+// buffers the ENTIRE body first — a chunked response without a Content-Length
+// header (or one lying about it) would pull an arbitrarily large file into
+// memory before any size check could reject it. Reading chunk by chunk stops
+// the download the moment the cap is crossed: reader.cancel() aborts the
+// transfer, nothing beyond VISION_IMAGE_MAX_BYTES is ever allocated.
+async function readBodyBounded(response: Response, url: string): Promise<Uint8Array | null> {
+  const reader = response.body?.getReader()
+  if (!reader) {
+    log(`[prism] vision: response has no readable body, skipping`, { url })
+    return null
+  }
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      total += value.byteLength
+      if (total > VISION_IMAGE_MAX_BYTES) {
+        log(`[prism] vision: image exceeds ${VISION_IMAGE_MAX_BYTES / 1_048_576}MB, aborting download`, {
+          url,
+          bytes: total,
+        })
+        await reader.cancel().catch(() => {})
+        return null
+      }
+      chunks.push(value)
+    }
+  } catch (error) {
+    log(`[prism] vision: image download interrupted`, { url, error })
+    await reader.cancel().catch(() => {})
+    return null
+  }
+  const bytes = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return bytes
 }
 
 export async function normalizeImageBatch(images: ImageAttachment[], baseDir?: string): Promise<ImageAttachment[]> {

@@ -23,6 +23,13 @@ export interface BgTask {
   /** System prompt for the child session. */
   system?: string
   agent?: string
+  /** Kind of child session. "vision" marks an async vision interpretation
+   *  task (its prompt carries an injected image and it keeps vision_look
+   *  enabled); "default" is every other background task. The pipeline's
+   *  recursion guard treats only "vision" children as interpretation
+   *  sessions, so ordinary subtasks may call vision_look on their own
+   *  images while a vision child cannot look at its injected one. */
+  taskType?: "default" | "vision"
   model?: ResolvedModel
   /** Same-model retries already used (max 1). */
   retries: number
@@ -56,6 +63,8 @@ export interface LaunchInput {
   system?: string
   parentSessionId: string
   agent?: string
+  /** See BgTask.taskType. Defaults to "default". */
+  taskType?: "default" | "vision"
   /** Pin the child session's model (e.g. the gate-checked vision model). Default: resolve the parent session's current model. */
   model?: ResolvedModel
 }

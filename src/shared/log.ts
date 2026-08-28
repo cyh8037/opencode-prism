@@ -34,16 +34,26 @@ function logFilePath(env: Record<string, string | undefined>): string {
 }
 
 let directoryReady = false
+// Bytes written since the last physical-size check. The check itself is a
+// statSync per ~512KB of logging — cheap enough, and it bounds the file at
+// LOG_ROTATE_BYTES + one interval instead of growing unbounded.
+const LOG_ROTATE_CHECK_BYTES = 512 * 1024
+let bytesSinceCheck = 0
 
-// One-time, at the first write: rotate an oversized log so a long-lived
-// server process cannot grow it unbounded.
-function prepareLogFile(file: string): void {
-  mkdirSync(dirname(file), { recursive: true })
+function rotateIfNeeded(file: string): void {
   try {
     if (statSync(file).size > LOG_ROTATE_BYTES) renameSync(file, `${file}.1`)
   } catch {
     // missing file (normal first run) or rotation race — both harmless
   }
+}
+
+// Rotation is NOT one-time: a long-lived server process writes logs for its
+// whole life, so the size check must run periodically, not just at the first
+// write. The directory creation stays one-time (cheap once it exists).
+function prepareLogFile(file: string): void {
+  mkdirSync(dirname(file), { recursive: true })
+  rotateIfNeeded(file)
 }
 
 function serialize(data: unknown): string {
@@ -62,7 +72,13 @@ export function log(message: string, data?: unknown): void {
       directoryReady = true
     }
     const suffix = data === undefined ? "" : ` ${serialize(data)}`
-    appendFileSync(file, `${new Date().toISOString()} ${message}${suffix}\n`)
+    const line = `${new Date().toISOString()} ${message}${suffix}\n`
+    bytesSinceCheck += Buffer.byteLength(line)
+    if (bytesSinceCheck >= LOG_ROTATE_CHECK_BYTES) {
+      bytesSinceCheck = 0
+      rotateIfNeeded(file)
+    }
+    appendFileSync(file, line)
   } catch {
     // Logging is best-effort: a failure must never surface anywhere.
   }

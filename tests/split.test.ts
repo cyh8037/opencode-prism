@@ -46,6 +46,24 @@ describe("subTaskPlanArraySchema", () => {
     ])
     expect(result.success).toBe(false)
   })
+
+  test("duplicate dependencies are not falsely rejected as a cycle", () => {
+    // Kahn counts indegree from dependsOn: a duplicated entry ["s1", "s1"]
+    // would inflate s2's indegree past the edges the queue actually removes,
+    // leaving it stuck at degree 1 and falsely reporting a cycle.
+    const result = subTaskPlanArraySchema.safeParse([
+      { id: "s1", title: "a", description: "a", dependsOn: [] },
+      { id: "s2", title: "b", description: "b", dependsOn: ["s1", "s1"] },
+    ])
+    expect(result.success).toBe(true)
+  })
+
+  test("self-dependency is rejected as a cycle", () => {
+    const result = subTaskPlanArraySchema.safeParse([
+      { id: "s1", title: "a", description: "a", dependsOn: ["s1"] },
+    ])
+    expect(result.success).toBe(false)
+  })
 })
 
 function createManager(options: { unresolvableModel?: boolean } = {}) {

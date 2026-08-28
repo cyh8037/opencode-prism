@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { mkdtempSync, readFileSync, rmSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { guardHook } from "../src/shared/hook-guard"
@@ -33,6 +33,30 @@ describe("log", () => {
     } finally {
       if (previous === undefined) delete process.env.PRISM_LOG_FILE
       else process.env.PRISM_LOG_FILE = previous
+    }
+  })
+
+  // Regression: rotation used to run only at the first write of the process
+  // (the directoryReady flag), so a long-lived server's log grew past 10MB
+  // forever. The size check must fire periodically for the process's whole
+  // life. ~20KB per call, ~600 calls -> just past the 10MB cap.
+  test("rotates the log file past the size cap, not just at startup", () => {
+    const dir = mkdtempSync(join(tmpdir(), "prism-log-"))
+    const file = join(dir, "prism.log")
+    const previous = process.env.PRISM_LOG_FILE
+    try {
+      process.env.PRISM_LOG_FILE = file
+      const payload = "x".repeat(20_000)
+      for (let i = 0; i < 600; i++) {
+        log("fill", { payload })
+      }
+      expect(existsSync(`${file}.1`)).toBe(true)
+      // the live file is bounded: at most the cap plus one check interval
+      expect(statSync(file).size).toBeLessThan(11 * 1024 * 1024)
+    } finally {
+      if (previous === undefined) delete process.env.PRISM_LOG_FILE
+      else process.env.PRISM_LOG_FILE = previous
+      rmSync(dir, { recursive: true, force: true })
     }
   })
 })

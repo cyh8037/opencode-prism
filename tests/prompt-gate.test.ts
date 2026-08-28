@@ -162,4 +162,36 @@ describe("PromptGate", () => {
     expect(results).toEqual(["dispatched", "duplicate"])
     expect(state.dispatched).toHaveLength(1)
   })
+
+  // The session was deleted (event hook -> gate.clear) while a dispatch was
+  // waiting out its busy window: the wait must abort immediately instead of
+  // polling a dead session for the rest of the settle window, and the
+  // dispatch must fail without ever calling promptAsync on it.
+  test("clear() aborts a dispatch waiting on a busy session: no further polling, no prompt call", async () => {
+    const { client, state } = createMockClient()
+    let statusCalls = 0
+    let promptCalls = 0
+    client.session.status = async () => {
+      statusCalls++
+      return { data: state.busy ? { parent: { type: "busy" } } : {} }
+    }
+    client.session.promptAsync = async () => {
+      promptCalls++
+      return { data: {} }
+    }
+    const gate = new PromptGate(client, { idlePollMs: 10, idleSettleMs: 60_000 })
+    state.busy = true
+    const pending = gate.dispatch({ sessionID: "parent", source: "test", text: "wake" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(statusCalls).toBeGreaterThan(0) // the wait is polling
+
+    gate.clear("parent")
+    const result = await pending
+    expect(result.status).toBe("failed")
+    const callsAtClear = statusCalls
+    const promptAtClear = promptCalls
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(statusCalls).toBe(callsAtClear) // no polling after the clear
+    expect(promptCalls).toBe(promptAtClear) // no prompt ever dispatched
+  })
 })

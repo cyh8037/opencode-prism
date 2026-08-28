@@ -1,7 +1,13 @@
 import { describe, expect, test } from "bun:test"
 import { BackgroundManager } from "../src/core/background/manager"
 import { PromptGate } from "../src/core/prompt-gate"
-import { TERMINAL_TASK_RETENTION_MS, TASK_INACTIVITY_TIMEOUT_MS, TASK_TTL_MS } from "../src/config/constants"
+import {
+  MAX_STEERING_MSG_BYTES,
+  MAX_STEERING_QUEUE_LEN,
+  TERMINAL_TASK_RETENTION_MS,
+  TASK_INACTIVITY_TIMEOUT_MS,
+  TASK_TTL_MS,
+} from "../src/config/constants"
 import { parseConfig } from "../src/config/load"
 import type { PrismClient } from "../src/core/client-types"
 import type { BgTask } from "../src/core/background/types"
@@ -872,6 +878,43 @@ describe("BackgroundManager", () => {
     await manager.shutdown()
   })
 
+  // Regression: a same-model retry that completes DURING the completion
+  // confirmation (confirmStillIdle) used to be settled anyway — the settle's
+  // pre-confirm checks had already passed on the old session, and
+  // completeTask only verified "running" (which the relaunched task is
+  // again), so the just-relaunched child got aborted and the task was marked
+  // completed mid-retry.
+  test("a retry relaunching a fresh session during the confirmation is not settled", async () => {
+    const { manager, client, childSessions } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const firstSession = task.sessionId!
+
+    // While confirmStillIdle's status call is in flight, the same-model
+    // retry completes: the task is running again on a FRESH child.
+    let flipped = false
+    const originalStatus = client.session.status.bind(client.session)
+    client.session.status = async () => {
+      if (!flipped) {
+        flipped = true
+        task.status = "running"
+        task.sessionId = "child_retry"
+        childSessions.set("child_retry", { parentID: "parent", prompts: [], aborted: false })
+      }
+      return originalStatus()
+    }
+
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: firstSession } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    // The task must NOT be settled: the idle confirmation was for the old
+    // session, and completing would abort the fresh child.
+    expect(task.status).toBe("running")
+    expect(task.sessionId).toBe("child_retry")
+    expect(childSessions.get("child_retry")?.aborted).toBe(false)
+    await manager.shutdown()
+  })
+
   // Regression: a same-model retry landing while a steering round's
   // acceptance was in flight used to discard the spliced messages — the
   // relaunch neither merged nor re-delivered them.
@@ -1279,6 +1322,71 @@ describe("BackgroundManager", () => {
     await new Promise((resolve) => setTimeout(resolve, 100))
     await manager.waitForTasks([task.id], 5) // immediate-resolve path
     expect(internals.terminalListeners.size).toBe(baseline)
+    await manager.shutdown()
+  })
+
+  // --- steering queue bounds ---
+
+  test("bg_send past the steering queue cap throws instead of growing unbounded", async () => {
+    const { manager } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    // Wait for the launch round: steering queued while still pending merges
+    // into the launch prompt (startTask splices the queue), which would
+    // otherwise drain the messages mid-loop.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    for (let i = 0; i < MAX_STEERING_QUEUE_LEN; i++) {
+      await manager.send(task.id, `msg ${i}`)
+    }
+    await expect(manager.send(task.id, "overflow")).rejects.toThrow("队列已满")
+    expect(task.steeringQueue?.length).toBe(MAX_STEERING_QUEUE_LEN) // nothing beyond the cap queued
+    await manager.shutdown()
+  })
+
+  test("an oversized steering message is truncated to the byte cap", async () => {
+    const { manager } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    const oversized = "x".repeat(MAX_STEERING_MSG_BYTES + 4096)
+    const result = await manager.send(task.id, oversized)
+    expect(result.queued).toBe(true)
+    expect(Buffer.byteLength(task.steeringQueue?.[0] ?? "", "utf8")).toBeLessThanOrEqual(MAX_STEERING_MSG_BYTES)
+    await manager.shutdown()
+  })
+
+  test("multi-byte steering messages are truncated without splitting a character", async () => {
+    const { manager } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await manager.send(task.id, "界".repeat(20_000)) // 60KB of UTF-8
+    const queued = task.steeringQueue?.[0] ?? ""
+    expect(Buffer.byteLength(queued, "utf8")).toBeLessThanOrEqual(MAX_STEERING_MSG_BYTES)
+    // the truncated string must be valid UTF-8 (no lone continuation byte)
+    expect(Buffer.from(queued, "utf8").toString("utf8")).toBe(queued)
+    await manager.shutdown()
+  })
+
+  // --- taskType across retries ---
+
+  test("a vision task keeps its taskType across a same-model retry", async () => {
+    const { manager, client } = createManager()
+    const original = client.session.promptAsync.bind(client.session)
+    let calls = 0
+    client.session.promptAsync = async (...args: Parameters<PrismClient["session"]["promptAsync"]>) => {
+      calls++
+      if (calls === 1) return { error: { message: "rate limited" }, response: { status: 429 } }
+      return original(...args)
+    }
+    const task = await manager.launch({
+      description: "vision task",
+      prompt: "解读",
+      parentSessionId: "parent",
+      taskType: "vision",
+    })
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    expect(calls).toBe(2) // first prompt rejected -> retried
+    expect(task.status).toBe("running")
+    expect(task.sessionId).toBeDefined()
+    // The relaunch rebuilt its input from the task: the vision marker must
+    // survive, or the recursion guard would no longer recognize the child.
+    expect(task.taskType).toBe("vision")
     await manager.shutdown()
   })
 })
