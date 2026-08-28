@@ -1,24 +1,56 @@
 import { tool, type ToolDefinition } from "@opencode-ai/plugin"
-import { BG_WAIT_DEFAULT_MS, BG_WAIT_MAX_MS } from "../config/constants"
+import { BG_WAIT_DEFAULT_MS, BG_WAIT_MAX_MS, MAX_IMAGES_PER_BATCH } from "../config/constants"
 import type { BackgroundManager } from "../core/background/manager"
+import type { PrismClient } from "../core/client-types"
+import { extractImageParts, type ImageAttachment } from "../core/vision/detector"
+import { errorInfoFromResult } from "../shared/api-result"
+import { log } from "../shared/log"
+
+// 从会话消息历史提取"最后一条用户消息"的图片附件(纯函数,可单测)。
+// 场景:/bg 分析这张图片——用户消息带 file 图片 part(斜杠命令的附件
+// 就是普通消息 part),bg_spawn 的子会话 prompt 需要带上这些图片才能让
+// 子任务 vision_look 读图。
+//
+// 严格只看最后一条用户消息、无图即止:更早消息的图片是旧上下文,跟随
+// 它们会把无关附件注入不相干的子任务(autoTrigger 下模型可随时自主
+// bg_spawn,误注入面更大)。基于早前消息的图片开新后台任务,由 bg 命令
+// 模板引导模型把图片路径显式写进 prompt。
+export function collectLatestUserImages(messages: unknown, max: number): ImageAttachment[] {
+  if (!Array.isArray(messages)) return []
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i] as { info?: { role?: string }; parts?: unknown } | undefined
+    if (message?.info?.role !== "user") continue
+    return extractImageParts(message.parts).slice(0, max)
+  }
+  return []
+}
 
 // LLM-facing tools for the background engine. Commands (/bg, /split) are the
 // primary UX; these tools let the model drive the same engine mid-task.
 export function createBgTools(
   manager: BackgroundManager,
-  opts: { visionEnabled?: boolean } = {},
+  opts: { visionEnabled?: boolean; autoTrigger?: boolean; client?: PrismClient; directory?: string } = {},
 ): Record<string, ToolDefinition> {
   // With the vision feature disabled the child sessions also lose vision_look
   // from their tool lists — the read-image guidance must not point at a tool
   // that would fail with "not found".
   const visionEnabled = opts.visionEnabled ?? true
   const visionGuidance = visionEnabled
-    ? "涉及图片时：子会话收不到附件，请在 prompt 中包含图片的本地路径/URL，并让子任务使用 vision_look 工具读图。"
+    ? "涉及图片时：当前消息中的图片附件会被自动传给子会话（子任务用 vision_look 读图）；图片是本地文件、或任务基于早前消息的图片时，请在 prompt 中包含该图片的本地路径/URL，并让子任务使用 vision_look 工具读图。"
     : ""
+  // 策略 A(background.autoTrigger,插件加载时读取):模型可在描述列出的
+  // 场景下主动调用 bg_spawn,不必等用户显式要求。边界明确写进描述——
+  // 交互性任务/与主会话冲突的工作/破坏性操作不在列。
+  const autoTriggerGuidance =
+    opts.autoTrigger ?? true
+      ? "\n【自主触发准则】以下场景可主动调用（无需用户显式要求），启动后立即告知用户已转入后台：\n1. 耗时的大范围只读调研、代码检索、日志分析、文档查阅；\n2. 独立于当前编辑范围的编译、全量测试、性能压测；\n3. 多个相互独立的子模块任务（同一回合内并行发起多个 bg_spawn）。\n【不适用场景】需要用户实时确认的多轮交互；与当前主会话编辑同一批文件；涉及删除数据、生产环境变更等破坏性操作。无法确定是否适用时，不调用。"
+      : ""
   return {
     bg_spawn: tool({
       description:
-        "启动一个后台子任务（独立会话并行执行）。适合探索、研究、并行实现等可以异步进行的工作。任务结束后父会话会收到汇总通知。" + visionGuidance,
+        "启动一个后台子任务（独立会话并行执行）。适合探索、研究、并行实现等可以异步进行的工作。任务结束后父会话会收到汇总通知。" +
+        autoTriggerGuidance +
+        visionGuidance,
       args: {
         description: tool.schema.string().describe("任务简述，用于通知和状态展示"),
         prompt: tool.schema.string().describe("子任务的完整指令"),
@@ -26,9 +58,46 @@ export function createBgTools(
       },
       async execute(args: { description: string; prompt: string; agent?: string }, ctx) {
         try {
+          // 图片跟随(/bg 分析这张图片):把父会话最后一条用户消息的图片
+          // 附件注入子会话 prompt——子会话保留 vision_look,可对自有
+          // 图片读图。按 vision.enabled 门控:视觉完全关闭(不变量 #6)时
+          // 子会话没有 vision_look,附加图片只会制造读不了的死附件。
+          // 查询失败/无图时静默跳过(普通任务不受影响)。
+          let parts: Array<Record<string, unknown>> | undefined
+          if (args.prompt) {
+            parts = [{ type: "text", text: args.prompt, synthetic: true }]
+          }
+          if (opts.client && visionEnabled) {
+            try {
+              // 不变量 #7:4xx/5xx 解析为 { error } 而不是 reject,必须用
+              // errorInfoFromResult 判错;降级(跳过传图)必须留日志。
+              const response = await opts.client.session.messages({
+                path: { id: ctx.sessionID },
+                query: opts.directory ? { directory: opts.directory } : undefined,
+              })
+              const failure = errorInfoFromResult(response)
+              if (failure) {
+                log("[prism] bg_spawn: image follow skipped (messages query failed)", {
+                  sessionID: ctx.sessionID,
+                  error: failure.message,
+                })
+              } else {
+                const images = collectLatestUserImages(response.data, MAX_IMAGES_PER_BATCH)
+                if (images.length > 0) {
+                  parts = [
+                    ...(parts ?? []),
+                    ...images.map((image) => ({ type: "file", mime: image.mime, url: image.url })),
+                  ]
+                }
+              }
+            } catch (error) {
+              log("[prism] bg_spawn: image follow failed (skipped)", { sessionID: ctx.sessionID, error })
+            }
+          }
           const task = await manager.launch({
             description: args.description,
             prompt: args.prompt,
+            parts,
             parentSessionId: ctx.sessionID,
             agent: args.agent,
           })

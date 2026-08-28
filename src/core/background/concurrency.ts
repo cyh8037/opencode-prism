@@ -9,12 +9,20 @@ interface QueueEntry {
 export class ConcurrencyManager {
   private counts = new Map<string, number>()
   private queues = new Map<string, QueueEntry[]>()
+  private limit: number
 
-  constructor(private limit: number) {}
+  // 不变式在边界声明:limit 必须是有限正整数。生产路径的传入值来自 schema
+  // 校验后的配置(z.number().int().min(1),zod 默认拒绝非有限数),所以
+  // Infinity/NaN 只有直接构造(测试、未来调用者)才可能到达——那是调用者
+  // bug,fail fast 而不是在 acquire 里防御一个不可达状态。
+  constructor(limit: number) {
+    if (!Number.isFinite(limit) || limit < 1) {
+      throw new Error(`concurrency limit must be a finite positive number, got: ${limit}`)
+    }
+    this.limit = limit
+  }
 
   async acquire(key: string, taskId?: string): Promise<void> {
-    if (this.limit === Infinity) return
-
     const current = this.counts.get(key) ?? 0
     if (current < this.limit) {
       this.counts.set(key, current + 1)
@@ -86,5 +94,19 @@ export class ConcurrencyManager {
     }
     this.queues.clear()
     this.counts.clear()
+  }
+
+  /** 只读占用快照(看板 header 的并发池指示):仅列出有实际占用或排队的
+   *  模型组(active > 0)。release 到 0 的键不显示——看板 header 承诺
+   *  "仅显示有任务的模型组"。limit 恒为有限正整数(构造断言)。 */
+  snapshot(): Array<{ key: string; active: number; limit: number }> {
+    const keys = new Set<string>([...this.counts.keys(), ...this.queues.keys()])
+    const rows: Array<{ key: string; active: number; limit: number }> = []
+    for (const key of keys) {
+      const active = this.counts.get(key) ?? 0
+      if (active === 0) continue
+      rows.push({ key, active, limit: this.limit })
+    }
+    return rows.sort((a, b) => a.key.localeCompare(b.key))
   }
 }

@@ -8,6 +8,7 @@ import { BackgroundManager, type ResolveModelFn } from "./core/background/manage
 import { VisionPipeline } from "./core/vision/pipeline"
 import { CurrentModelTracker } from "./core/vision/model-tracker"
 import { SplitService } from "./core/split/service"
+import { SplitRunRegistry } from "./core/split/registry"
 import { createToolExecuteAfterHook } from "./hooks/tool-execute-after"
 import { createChatParamsHook } from "./hooks/chat-params"
 import { createEventHook } from "./hooks/event"
@@ -168,11 +169,16 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
     getVisionModel,
   })
 
+  // /split status 看板的数据源:runSplit 的 tasksByPlanID/skippedPlanIDs
+  // 只活在 service 局部,登记后 command hook 才能读到(见 registry.ts)。
+  const splitRegistry = new SplitRunRegistry()
+
   const splitService = new SplitService({
     client,
     directory,
     manager,
     gate,
+    registry: splitRegistry,
     resolvePlannerModel: (sessionID) => resolveModel(sessionID),
   })
 
@@ -203,7 +209,15 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
       }
     },
     tool: {
-      ...createBgTools(manager, { visionEnabled: config.vision.enabled }),
+      // autoTrigger (策略 A)与 visionEnabled 同模式:插件加载时读取,切换
+      // 需重启 opencode。client 供 bg_spawn 图片跟随(/bg 分析图片)读取
+      // 父会话最近消息。
+      ...createBgTools(manager, {
+        visionEnabled: config.vision.enabled,
+        autoTrigger: config.background.autoTrigger,
+        client,
+        directory,
+      }),
       // Read once at plugin load: toggling it requires restarting opencode.
       ...(config.split.tool ? createSplitTool(splitService) : {}),
       // vision.enabled gates registration the same way split.tool does: a
@@ -225,7 +239,7 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
     ),
     "command.execute.before": guardHook(
       "command.execute.before",
-      createCommandExecuteBeforeHook({ manager, serverUrl: attachServerUrl, client }),
+      createCommandExecuteBeforeHook({ manager, serverUrl: attachServerUrl, client, registry: splitRegistry }),
     ),
     event: guardHook("event", createEventHook(manager, modelTracker, gate)),
     dispose: async () => {

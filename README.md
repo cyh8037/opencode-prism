@@ -3,8 +3,8 @@
 OpenCode 插件：视觉自动解读、后台并行 Agent、复杂任务拆分。
 
 - **视觉解读**：工具输出里的图片自动解读并追加到工具输出（落会话历史）；`vision_look` 工具手动解读任意图片（URL / 本地路径 / 会话贴图），支持 `goal` 关注点。未配置模型时继承主会话当前模型
-- **后台并行**：`/bg` 命令与 `bg_*` 工具在独立子会话并行执行（继承主会话模型）；可中途投递补充指令（`bg_send`）、续跑已结束任务、阻塞等待（`bg_wait`）；完成通知与结果自动回注主会话
-- **任务拆分**：`/split` 命令（经主模型调用 `split_task` 工具执行，输入后立即流式反馈）与 `split_task` 工具把复杂任务拆成带依赖的子任务图，各任务在自己的依赖完成后立即启动（ASAP，不等整波），全部完成后汇总回注
+- **后台并行**：`/bg` 命令与 `bg_*` 工具在独立子会话并行执行（继承主会话模型）；支持图片附件自动跟随、中途投递补充指令（`bg_send`）、续跑已结束任务、阻塞等待（`bg_wait`）；完成通知与结果自动回注主会话
+- **任务拆分**：`/split` 命令（经主模型调用 `split_task` 工具执行，输入后立即流式反馈）与 `split_task` 工具把复杂任务拆成带依赖的子任务图，各任务在依赖满足后立即启动（ASAP，不等整波），全部完成后汇总回注
 
 ## 安装
 
@@ -60,7 +60,8 @@ OpenCode 插件：视觉自动解读、后台并行 Agent、复杂任务拆分�
     "tools": ["read"]                            // 可选：只拦这些工具的输出；不填 = 所有工具；[] = 不触发自动解读
   },
   "background": {
-    "concurrency": 5                             // 每个 provider/model 的并行上限
+    "concurrency": 5,                            // 每个 provider/model 的并行上限
+    "autoTrigger": true                          // 模型可自主调用 bg_spawn 把耗时/独立任务放入后台（插件加载时读取，切换需重启）
   },
   "split": {
     "tool": true                                 // split_task 工具与 /split 命令的执行入口；false = 两者都不注册
@@ -95,11 +96,28 @@ OpenCode 插件：视觉自动解读、后台并行 Agent、复杂任务拆分�
 ```text
 /bg 重构 auth 模块并补齐单测                 # 启动一个后台子会话（继承主会话模型）
 /bg 调研三个竞品的定价 --parallel 3          # 拆 3 个并行子任务
-/bg status                                  # 当前会话任务表（状态/模型/工具调用/排队指令）
+/bg 分析当前架构图 [附贴图/截图]              # 自动携带当前消息图片附件至子会话，子任务用 vision_look 读图
+/bg status                                  # 当前会话任务看板（严格字符对齐，进行中在上，已结束折叠为摘要）
+/bg status --all                           # 展开已结束历史任务
+/bg status bg_xxxx                         # 单个任务的独立看板明细
 /bg output bg_ab12cd34                      # 查看结果与错误信息
 /bg output bg_ab12cd34 --full               # 附 opencode attach 提示，可回看完整子会话
 /bg cancel bg_ab12cd34                      # 取消单个任务
 /bg cancel                                  # 取消当前会话的全部任务
+```
+
+**纯文本对齐看板**（`/bg status` 示例）：
+
+```text
+[prism background] 2 running, 1 queued
+
+  ID          TASK                 STATUS     TIME   TOOLS   MODEL
+  bg_a1b2c3d4 重构 auth 模块       RUNNING     42s   12      anthropic/claude-3-7-sonnet
+  bg_e5f6g7h8 跑全量 E2E 测试      RUNNING     18s    3      anthropic/claude-3-7-sonnet
+  bg_j9k0l1m2 压测网关性能         QUEUED       -     -      anthropic/claude-3-7-sonnet
+
+  + 3 已结束: 2 COMPLETED, 1 CANCELLED (使用 /bg status --all 查看全部)
+  Pool: anthropic/claude-3-7-sonnet: 2/5 running
 ```
 
 **中途投递与续跑（steering）**：
@@ -117,13 +135,15 @@ OpenCode 插件：视觉自动解读、后台并行 Agent、复杂任务拆分�
 
 | 工具 | 用法 |
 |---|---|
-| `bg_spawn(description, prompt, agent?)` | 启动后台任务（`agent` 可选，指定 opencode agent） |
+| `bg_spawn(description, prompt, agent?)` | 启动后台任务（`agent` 可选，指定 opencode agent）。**图片跟随**：父会话最后一条用户消息带图片附件时（如 `/bg 分析这张图`），插件自动把图片传给子会话，子任务用 `vision_look` 读图；基于早前消息的图片开新任务时，把该图片的本地路径/URL 写进 prompt |
 | `bg_output(taskId)` | 读取任务结果 |
 | `bg_cancel(taskId)` | 取消任务 |
 | `bg_send(taskId, message)` | 中途投递补充指令（语义同 `/bg send`） |
 | `bg_wait(taskIds?, timeoutMs?)` | 阻塞等待任务终态（缺省 = 当前会话全部未结束任务；默认 120s、上限 600s）——模型总结前等待并行任务完成用 |
 
 **运行规则**：每个 provider/model 并发上限 5（可配）；失败自动**同模型重建会话重试 1 次**（限流/5xx/超时类错误）；排队超 30 分钟自动取消，**运行中超时只告警不取消**，但无任何输出活动超 30 分钟的挂起任务会被看门狗取消；单任务工具调用上限 4000（防失控循环）。
+
+**自主触发（策略 A）**：`background.autoTrigger: true`（默认）时，`bg_spawn` 的工具描述会提示模型在**耗时的大范围只读调研、独立于当前编辑范围的编译/测试/压测、相互独立的子模块任务**等场景下可主动调用（无需用户显式要求），启动后立即告知用户已转入后台；需要用户实时确认的多轮交互、与主会话编辑同一批文件、破坏性操作等场景明确不在列。`false` 时模型只在用户显式要求时启动后台任务。该配置在插件加载时读取，切换需重启 opencode。
 
 ### 任务拆分
 
@@ -132,12 +152,30 @@ OpenCode 插件：视觉自动解读、后台并行 Agent、复杂任务拆分�
 /split 把首页迁移到新设计系统               # 规划 → 按依赖并发执行 → 完成后汇总回注
 /split 大重构 --sequential                  # 串行执行（按计划顺序逐个启动）
 /split 大重构 --max 6                       # 子任务数上限（2-12，越界自动钳制）
-/split status | output <id> | cancel <id> | cancel   # 任务管理同 /bg
+/split status                              # 拆分 DAG 看板（默认只展示进行中的 run，已结束折叠为摘要行）
+/split status --all                       # 展开全部 run 的完整 DAG
+/split status sp_xxxx                    # 查看单个 run 的完整 DAG 明细（折叠摘要行的展开入口）
+/split cancel sp_xxxx                     # 取消整个拆分运行（自动标记未开始与依赖任务为 SKIPPED）
+/split output <id> | cancel <id> | cancel # 单任务管理同 /bg
+```
+
+**DAG 依赖分层看板**（`/split status` 示例）：
+
+```text
+[prism split] sp_7f8a9b0c (1/4 tasks finished)
+
+  Wave 1 (无依赖,立即启动)
+  [t1] 提取通用组件库         COMPLETED (35s, 8 tools)
+  [t2] 升级 Tailwind 配置文件  RUNNING   (15s, 3 tools)
+
+  Wave 2 (依赖前一波,依赖满足即启动)
+  [t3] 重构 Header 组件       BLOCKED   (等待: t1)
+  [t4] 重构 Footer 页面       BLOCKED   (等待: t1, t2)
 ```
 
 - **执行方式**：任务描述由主模型调用 `split_task` 工具执行（输入命令后立即流式响应，规划在工具执行中完成，界面全程有反馈）；旗标由模型对应传参（`--dry-run` → `dry_run`、`--sequential` → `sequential`、`--max N` → `max`）；status / output / cancel 由插件原生执行
-- **流程**：规划器（用主会话模型）拆出带依赖的子任务 DAG → 调度器按依赖 ASAP 启动 → 全部结束后汇总报告回注主会话（含每个子任务的状态、错误与结果预览）
-- **失败级联**：上游子任务失败/取消或**启动失败**时，依赖它的下游全部标记 `SKIPPED`（不基于空结果继续执行），报告中注明原因
+- **流程**：规划器（用主会话模型）拆出带依赖的子任务 DAG → 自动分配运行 ID（`sp_xxxxxxxx`）并按依赖 ASAP 启动调度器 → 全部结束后汇总报告回注主会话（含每个子任务的状态、错误与结果预览）
+- **失败级联与批量取消**：上游子任务失败/取消或启动失败时，依赖它的下游全部标记 `SKIPPED`（不基于空结果继续执行）；使用 `/split cancel sp_xxxx` 可一键取消整组运行
 - **`split_task` 工具**：既是 `/split` 命令的执行入口，也可由主模型自主发起（适合多步骤、多文件、有依赖顺序的复杂任务）；`split.tool: false` 同时关闭工具与 `/split` 命令
 
 ## 模型语义
@@ -162,7 +200,7 @@ OpenCode 插件：视觉自动解读、后台并行 Agent、复杂任务拆分�
 
 ```bash
 bun install
-bun test        # 单测：并发、gate、模型解析、split DAG、视觉管线
+bun test        # 单测：并发、gate、模型解析、split DAG、视觉管线、看板渲染
 bun run typecheck
 bun run build   # dist/index.js
 ```
@@ -176,10 +214,11 @@ src/
 ├── models/             # provider/model 解析、错误分类
 ├── core/
 │   ├── prompt-gate.ts  # 内部消息注入闸门（唯一通道）
-│   ├── background/     # 后台引擎：manager / concurrency / 状态机
-│   ├── vision/         # 视觉管线：detector / interpreter / pipeline
-│   └── split/          # 拆分：planner / scheduler（DAG）/ service
-├── hooks/              # tool.execute.after / chat.params / event / command.execute.before
+│   ├── shared/         # 终端字符宽度 (east-asian)、看板单元格净化等跨模块设施
+│   ├── background/     # 后台引擎：manager / concurrency / visualizer / 状态机
+│   ├── vision/         # 视觉管线：detector / interpreter / pipeline / tracker
+│   └── split/          # 拆分：planner / scheduler（DAG）/ visualizer / registry / service
+├── hooks/              # tool.execute.after / chat.params / chat.message / event / command.execute.before
 ├── tools/              # bg_* 五件套 / vision_look / split_task
 ├── commands/           # /bg /split 命令模板
 └── shared/             # 日志、hook 守卫、server-url、API 结果解析

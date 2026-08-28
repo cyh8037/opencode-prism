@@ -70,6 +70,23 @@ describe("parseConfig", () => {
     expect(warnings).toHaveLength(0)
     expect(config.vision.mode).toBe("sync")
   })
+
+  test("background.autoTrigger defaults to true", () => {
+    const config = parseConfig({})
+    expect(config.background.autoTrigger).toBe(true)
+  })
+
+  test("background.autoTrigger=false survives parsing alongside concurrency", () => {
+    const config = parseConfig({ background: { concurrency: 2, autoTrigger: false } })
+    expect(config.background.concurrency).toBe(2)
+    expect(config.background.autoTrigger).toBe(false)
+  })
+
+  test("an invalid autoTrigger falls back per-field, keeping the valid sibling", () => {
+    const config = parseConfig({ background: { concurrency: 3, autoTrigger: "yes" } })
+    expect(config.background.concurrency).toBe(3)
+    expect(config.background.autoTrigger).toBe(true)
+  })
 })
 
 describe("loadConfig", () => {

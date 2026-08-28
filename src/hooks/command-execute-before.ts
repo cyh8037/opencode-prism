@@ -1,28 +1,15 @@
 import type { BackgroundManager } from "../core/background/manager"
 import type { BgTask } from "../core/background/types"
 import type { PrismClient } from "../core/client-types"
+import { renderBgDashboard } from "../core/background/visualizer"
+import { renderRunDetails, renderSplitRuns } from "../core/split/visualizer"
+import type { SplitRunRegistry } from "../core/split/registry"
 
 type CommandInput = { command: string; sessionID: string; arguments: string }
 type CommandOutput = { parts: Array<{ type: string; text?: string; [key: string]: unknown }> }
 
 function pushText(output: CommandOutput, text: string): void {
   output.parts.push({ type: "text", text, synthetic: true })
-}
-
-function formatTaskTable(manager: BackgroundManager, sessionID: string): string {
-  const tasks = manager.getTasksByParentSession(sessionID)
-  if (tasks.length === 0) return "当前会话没有后台任务。"
-  const rows = tasks
-    .map((task) => {
-      const model = task.model ? `${task.model.providerID}/${task.model.modelID}` : "-"
-      const toolCalls = task.progress?.toolCalls ?? 0
-      const queued = task.steeringQueue?.length ?? 0
-      return `| \`${task.id}\` | ${task.description} | ${task.status} | ${model} | ${toolCalls} tool calls | ${
-        queued > 0 ? `${queued} 条待投递` : "-"
-      } |`
-    })
-    .join("\n")
-  return `| task_id | 描述 | 状态 | 模型 | 工具调用 | 排队指令 |\n|---|---|---|---|---|---|\n${rows}`
 }
 
 function formatTaskOutput(manager: BackgroundManager, taskID: string, fullSession: boolean, serverUrl: string): string {
@@ -79,13 +66,47 @@ export function createCommandExecuteBeforeHook(args: {
   manager: BackgroundManager
   serverUrl: string
   client: PrismClient
+  registry: SplitRunRegistry
 }) {
   return async (input: CommandInput, output: CommandOutput): Promise<void> => {
     const argumentsText = input.arguments.trim()
 
     if (input.command === "bg") {
-      if (argumentsText === "status" || argumentsText === "list") {
-        pushText(output, formatTaskTable(args.manager, input.sessionID))
+      // /bg status bg_xxx:单个任务的表格视图(与 /split status sp_xxx 对称)。
+      // 无论任务是否已结束都以表格展示当前状态(foldCompleted: false),
+      // 不依赖状态更新事件。
+      const taskStatusMatch = argumentsText.match(/^(?:status|list)\s+(bg_\S+)$/)
+      if (taskStatusMatch) {
+        const taskID = taskStatusMatch[1]!
+        const owned = checkTaskOwnership(args.manager, input.sessionID, taskID)
+        if (!owned.ok) {
+          pushText(output, owned.error)
+          return
+        }
+        pushText(
+          output,
+          renderBgDashboard([owned.task], args.manager.getConcurrencySnapshot(), { foldCompleted: false }),
+        )
+        return
+      }
+      if (argumentsText === "status" || argumentsText === "list" || argumentsText === "status --all" || argumentsText === "list --all") {
+        // --all 展开已结束任务(默认折叠为摘要行)
+        const showAll = argumentsText.includes("--all")
+        pushText(
+          output,
+          renderBgDashboard(
+            args.manager.getTasksByParentSession(input.sessionID),
+            args.manager.getConcurrencySnapshot(),
+            { foldCompleted: !showAll },
+          ),
+        )
+        return
+      }
+      // status/list 前缀命中但变体未识别(如 "status --al"、"status xxx --all")
+      // 必须拦下给用法提示:否则会穿透到底部"任务描述"语义,把用户敲错的
+      // 状态查询当成任务 spawn 出去。
+      if (/^(?:status|list)(?:\s|$)/.test(argumentsText)) {
+        pushText(output, "用法: /bg status [--all] 或 /bg status <task_id>(bg_ 前缀,单个任务表格视图)")
         return
       }
       const outputMatch = argumentsText.match(/^(?:output|get)\s+(\S+)(\s+--full)?$/)
@@ -153,8 +174,38 @@ export function createCommandExecuteBeforeHook(args: {
     }
 
     if (input.command === "split") {
-      if (argumentsText === "status" || argumentsText === "list") {
-        pushText(output, formatTaskTable(args.manager, input.sessionID))
+      // /split status sp_xxx:展开单个 run 的完整 DAG 明细(折叠视图的展开
+      // 入口)。status 命名空间三个变体:status(折叠)/ status --all(全展开)/
+      // status sp_xxx(指定 run)——run 的明细是看板,归 status 语义。
+      const runStatusMatch = argumentsText.match(/^(?:status|list)\s+(sp_\S+)$/)
+      if (runStatusMatch) {
+        const runID = runStatusMatch[1]!
+        const run = args.registry.getRun(runID)
+        if (!run) {
+          pushText(output, `拆分任务不存在或已过期: ${runID}`)
+          return
+        }
+        if (run.sessionID !== input.sessionID) {
+          pushText(output, `无权查看其他会话的拆分任务: ${runID}`)
+          return
+        }
+        pushText(output, renderRunDetails(run))
+        return
+      }
+      if (argumentsText === "status" || argumentsText === "list" || argumentsText === "status --all" || argumentsText === "list --all") {
+        // 拆分看板 + 独立任务合并视图(R2):run 的任务在 DAG 区块内展示,
+        // 不属于任何 run 的后台任务以 INDEPENDENT TASKS 区块保留可见性。
+        // 默认折叠全部终态的 run(--all 展开)。
+        const showAll = argumentsText.includes("--all")
+        const runs = args.registry.getRunsByParentSession(input.sessionID)
+        const tasks = args.manager.getTasksByParentSession(input.sessionID)
+        pushText(output, renderSplitRuns(runs, tasks, { foldCompleted: !showAll }))
+        return
+      }
+      // status/list 前缀命中但变体未识别:拦下给用法提示,防止穿透到任务
+      // 描述语义(与 /bg 同理由)。
+      if (/^(?:status|list)(?:\s|$)/.test(argumentsText)) {
+        pushText(output, "用法: /split status [--all] 或 /split status <run_id>(sp_ 前缀,单个 run 的 DAG 明细)")
         return
       }
       const outputMatch = argumentsText.match(/^(?:output|get)\s+(\S+)$/)
@@ -166,6 +217,36 @@ export function createCommandExecuteBeforeHook(args: {
           return
         }
         pushText(output, formatTaskOutput(args.manager, taskID, false, args.serverUrl))
+        return
+      }
+      // /split cancel sp_xxx:按整个 run 取消(遍历该 run 的全部子任务,
+      // 已结束的跳过;未结束的级联 SKIPPED 由调度器处理)。
+      const runCancelMatch = argumentsText.match(/^cancel\s+(sp_\S+)$/)
+      if (runCancelMatch) {
+        const runID = runCancelMatch[1]!
+        const run = args.registry.getRun(runID)
+        if (!run) {
+          pushText(output, `拆分任务不存在或已过期: ${runID}`)
+          return
+        }
+        if (run.sessionID !== input.sessionID) {
+          pushText(output, `无权取消其他会话的拆分任务: ${runID}`)
+          return
+        }
+        showToast(args.client, `正在取消拆分任务 \`${runID}\` 的全部子任务…`)
+        let cancelled = 0
+        for (const task of run.tasksByPlanID.values()) {
+          // 终态任务跳过:manager.cancelTask 对它们返回 false,没必要发起调用
+          if (task.status === "completed" || task.status === "error" || task.status === "cancelled") continue
+          const ok = await args.manager.cancelTask(task.id, { source: "/split cancel run" })
+          if (ok) cancelled++
+        }
+        pushText(
+          output,
+          cancelled > 0
+            ? `已取消拆分任务 \`${runID}\` 的 ${cancelled} 个子任务（其余已完成）`
+            : `拆分任务 \`${runID}\` 的子任务均已结束，无需取消`,
+        )
         return
       }
       const cancelMatch = argumentsText.match(/^(?:cancel)\s+(\S+)$/)

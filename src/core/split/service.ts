@@ -8,12 +8,14 @@ import type { SubTaskPlan } from "./plan-schema"
 import { planSplit } from "./planner"
 import { layerPlans } from "./scheduler"
 import { buildSplitReport, runSplit, type SplitRunResult } from "./scheduler"
+import { SplitRunRegistry } from "./registry"
 
 export interface SplitServiceDeps {
   client: PrismClient
   directory: string
   manager: BackgroundManager
   gate: PromptGate
+  registry: SplitRunRegistry
   resolvePlannerModel: (sessionID: string) => Promise<ResolvedModel | undefined>
   logger?: typeof log
 }
@@ -115,11 +117,41 @@ export class SplitService {
       sequential: request.sequential,
     })
 
+    // 登记到 SplitRunRegistry:/split status 看板的数据源。tasksByPlanID /
+    // skippedPlanIDs 是实时引用,状态在查询时推导;run 结束时标记 settled,
+    // TTL 锚点随之切换(运行中条目永不清理,见 registry.ts 文件头注释)。
+    const registryEntry = this.deps.registry.register({
+      sessionID: request.sessionID,
+      plans,
+      tasksByPlanID: run.tasksByPlanID,
+      skippedPlanIDs: run.skippedPlanIDs,
+      sequential: request.sequential ?? false,
+      settled: false,
+      createdAt: new Date(),
+    })
+
     // .catch on the tail: an unexpected throw in this callback (Invariant #1 —
     // hooks never escape, but this is a fire-and-forget promise chain outside
     // any hook) would surface as an unhandled rejection in the host process,
     // whose stderr leaks into the TUI. The aggregation is best-effort; a throw
     // must not crash the process.
+    // settled 在 fulfill/reject 两条路径都必须落盘:prune 只回收 settled
+    // 条目,run.done 一旦 reject 而 settled 未置位,条目就会永远滞留在
+    // registry(reject 本身由下方聚合链的 .catch 兜底,这里只负责登记)。
+    void run.done.then(
+      () => {
+        registryEntry.settled = true
+        registryEntry.settledAt = new Date()
+      },
+      (error) => {
+        this.logger("[prism] split: run.done rejected; marking registry entry settled", {
+          sessionID: request.sessionID,
+          error,
+        })
+        registryEntry.settled = true
+        registryEntry.settledAt = new Date()
+      },
+    )
     void run.done
       .then(async () => {
         const text = buildSplitReport(run.tasksByPlanID, plans, run.skippedPlanIDs)

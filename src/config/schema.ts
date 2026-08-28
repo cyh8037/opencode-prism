@@ -49,8 +49,12 @@ export const prismConfigSchema = z.object({
   background: z
     .object({
       concurrency: z.number().int().min(1),
+      // 策略 A 自动触发的总开关:true 时 bg_spawn 的工具描述拼接"自主触发
+      // 准则",模型可主动将耗时/独立任务放入后台;false 回退到旧描述,仅按
+      // 用户显式要求启动。插件加载时读取,切换需重启 opencode。
+      autoTrigger: z.boolean().describe("模型可自主调用 bg_spawn 将耗时/独立任务放入后台（默认 true）"),
     })
-    .default({ concurrency: 5 }),
+    .default({ concurrency: 5, autoTrigger: true }),
   split: z
     .object({
       // 单一开关同时门控 split_task 工具与 /split 命令：命令的任务模式借道

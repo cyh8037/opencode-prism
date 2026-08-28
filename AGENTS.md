@@ -1,137 +1,116 @@
-# AGENTS.md
+# AGENTS.md — Prism 仓库 Agent 协作契约
 
-本文件是 AI 代理(Claude Code 等)在本仓库工作的唯一契约。改代码前必读。
+本文件是 AI Agent 在本仓库工作的**最高工程契约**。修改代码与提交前必须严格遵循。
 
-## 项目是什么
+---
 
-**Prism**(`opencode-prism`):OpenCode 插件,三大能力:
-- **视觉解读**:工具输出中的图片自动解读(经 `messages.transform` 两阶段);
-  `vision_look` 工具手动解读任意图片
-- **后台并行**:`/bg` 命令与 `bg_*` 工具在独立子会话并行执行,支持
-  `bg_send` 投递补充指令、`bg_wait` 阻塞等待、完成通知回注主会话
-- **任务拆分**:`/split` / `split_task` 把复杂任务拆成带依赖的子任务图,
-  依赖满足即启动(ASAP),全部完成后汇总回注
+## 1. 项目定位与硬性边界 (Boundaries)
 
-插件边界:**只依赖 `@opencode-ai/plugin` 和 `zod`**(构建时 external)。
-不引入其他运行时依赖;不依赖任何特定 harness 之外的 API。
+**Prism (`opencode-prism`)** 是 OpenCode 的多模型赋能插件，提供三大核心能力：
+- **视觉解读 (`Vision`)**：工具输出附图自动解读（经 `messages.transform` 两阶段） + `vision_look` 手动解读。
+- **后台并行 (`Background`)**：`/bg` 命令与 `bg_*` 工具在独立子会话并行运行，支持 `bg_send` 投递指令、`bg_wait` 阻塞等待、完成通知回注主会话。
+- **任务拆分 (`Split`)**：`/split` / `split_task` 复杂任务依赖图（DAG）调度与合并，依赖满足即启动（ASAP），完成后汇总回注。
 
-## 架构地图
+### 🚨 绝对红线 (Zero-Tolerance Rules)
+1. **零额外运行时依赖**：生产依赖**仅限** `@opencode-ai/plugin` 与 `zod`（构建时 external），严禁引入任何其他 npm 包；不依赖特定 harness 之外的 API。
+2. **Hook 绝不向外抛错**：所有 Hook 必须经 `guardHook` (`src/shared/hook-guard.ts`) 包裹，内部异常仅 `log()` 后吞掉。插件 Hook 抛错会被 OpenCode 发布为会话内错误消息，严重污染 TUI 对话。
+3. **禁止控制台输出**：严禁使用 `console.log/error/info`（会漏进 TUI 界面破坏渲染），统一经 `src/shared/log.ts` 写文件（`PRISM_LOG_FILE` 可覆盖）。
+4. **主会话消息注入唯一入口**：除 Hook 原生返回值外，所有向主会话注入的内部消息**必须走 `PromptGate`** (`src/core/prompt-gate.ts`)，严禁裸调 `client.session.prompt / promptAsync`。
 
-    src/index.ts                    # 插件入口:组装 config → gate → 各服务 → hooks → tools
-    src/config/                     # 多级配置加载与按字段回退校验
-    src/core/prompt-gate.ts         # 内部消息注入门控(见不变量 #2)
-    src/core/background/            # 后台子会话管理器(并发/生命周期核心)
-    src/core/split/                 # 任务拆分:planner → plan-schema → scheduler → service
-    src/core/vision/                # 视觉流水线:pipeline → interpreter → model-tracker → detector
-    src/models/                     # 模型引用解析、错误分类
-    src/hooks/                      # 每个 hook 一个工厂函数 createXxxHook(plugin-input)
-    src/tools/                      # vision_look / bg_* / split_task 工具定义
-    src/commands/                   # /bg、/split 命令模板(config hook 原地注册)
-    src/shared/                     # log、hook-guard、api-result 等横切设施
-    tests/*.test.ts                 # bun:test 单元测试(平铺)
+---
 
-hook 职责速查:
+## 2. 架构心智模型与职责地图 (Mental Model)
 
-| hook | 职责 |
-|---|---|
-| `tool-execute-after` | 自动解读(trigger A):拦截带图片附件的工具输出 |
-| `chat-message` | 贴图提示:给无图模型注入"调 `vision_look`"提醒(零阻塞) |
-| `chat-params` | 只读:喂 `CurrentModelTracker`(当前模型 + 图片能力) |
-| `event` | 转发后台引擎消费的事件子集;`session.deleted` 时清理 gate/tracker 状态 |
-| `command-execute-before` | `/bg`、`/split` 命令入口 |
+```
+src/
+├── index.ts                 # 插件入口: 组装 config → gate → 各服务 → hooks → tools
+├── config/                  # 多级配置加载与按字段回退校验
+├── core/
+│   ├── prompt-gate.ts       # 内部消息注入门控 (同源 reservation / 语义去重 / wait-for-idle / 串行调度 / 拒绝重试)
+│   ├── background/          # 后台子会话管理 (并发控制 / 生命周期调度)
+│   ├── split/               # 任务拆分 (Planner 规划 -> Plan-Schema -> Scheduler 调度 -> Service)
+│   └── vision/              # 视觉流水线 (Pipeline -> Interpreter -> ModelTracker -> Detector)
+├── models/                  # 模型引用解析、错误分类
+├── hooks/                   # Hook 工厂函数 createXxxHook (单一职责)
+├── tools/                   # LLM 可调用工具 (vision_look / bg_* / split_task)
+├── commands/                # /bg, /split 命令模板 (config hook 原地注册)
+└── shared/                  # 日志 (log)、防护 (hook-guard)、API 错误解析 (api-result) 等横切设施
+```
 
-## 架构不变量(改代码前必读,违反 = 破坏行为)
+### 核心 Hook 职责速查
+| Hook | 触发时机 | 核心职责 | 特殊契约 / 注意事项 |
+|---|---|---|---|
+| `command-execute-before` | 用户触发命令 | `/bg`、`/split` 命令拦截入口 | 拦截并转交对应引擎调度 |
+| `tool-execute-after` | 工具执行返回 | 自动解读 (Trigger A)：拦截带图片附件的工具输出 | 受视觉三重门控硬拦截 |
+| `chat-message` | 消息发送前 | 贴图提示：为无图模型注入调用 `vision_look` 提醒（零阻塞） | **必须满足 Part 字段完整性契约** |
+| `chat-params` | 生成对话参数 | 只读：喂 `CurrentModelTracker`（追踪当前模型与多模态能力） | 只读消费，不改参数 |
+| `event` | OpenCode 事件流 | 转发后台引擎消费的事件子集；`session.deleted` 时清理 Gate / Tracker 状态 | 监听会话生命周期 |
+| `config` | 插件初始化 | 原地注册 `/bg`、`/split` 命令模板 | **原地修改 `configInput`，返回值被丢弃** (1.18 验证) |
 
-1. **hook 绝不向插件外抛错**。所有 hook 必须经 `guardHook` 包裹:
-   内部失败只 `log()` 后吞掉——插件 hook 抛错会被 opencode 发布成会话内
-   错误消息,污染对话。`src/shared/hook-guard.ts`
-2. **所有注入主会话的内部消息必须走 `PromptGate`**,禁止裸调
-   `client.session.prompt / promptAsync`。gate 承担:同源 reservation、
-   语义去重(同一通知不重复唤醒)、wait-for-idle(消息落在回合间隙)、
-   dispatchChain 串行化、服务端确认拒绝时的有限重试。
-   `src/core/prompt-gate.ts`
-3. **子会话工具过滤与递归防护**:后台子会话恒禁用 `bg_*` 与 `question`
-   (`manager.ts` 的 `childToolFilters`);`vision_look` 在视觉启用时**保留**
-   (async 后台视觉任务需要解读自己的图片),视觉禁用时才移除。同步解读
-   子会话另用 `VISION_CHILD_TOOL_FILTERS` 禁用全部 Prism 工具 + question。
-   **递归防护的承重机制是运行时守卫 `isInterpretationSession`**
-   (`vision-look` / `pipeline.onToolOutput` / `chat-message` 三处)——工具
-   过滤只是其中一层,删除守卫 = 复发 0.4.0-beta.1 递归风暴事故。
-4. **模型继承按三级回退**:session 对象 → 最新消息的 info.model →
-   config 默认。主会话 `/models` 切换后新任务自动跟随。
-5. **配置按字段回退**:无效字段单独回退默认值,同节其他有效设置保留
-   (如过时的 `vision.mode: "background"` 只回退该字段)。
-   启动时弹配置警告 toast。
-6. **`vision.enabled: false` 是完全关闭**:`vision_look` 不注册、自动解读
-   不触发——区别于"没有可用模型时的自然关闭"。
-7. **Client 调用契约:4xx/5xx 解析为 `{ error }` 而不是 reject**。
-   resolved-but-rejected 不算成功;且 resolved rejection 是**唯一**安全
-   可重试的失败类(thrown error = 请求可能已送达,重试会向主会话重复
-   注入)。所有 client 调用用 `errorInfoFromResult`
-   (`src/shared/api-result.ts`)判定失败。
-8. **vision 门控三重冗余是故意的,禁止"简化"**:`config.vision.enabled`
-   的检查在 `tool-execute-after`、`getVisionModel`(index.ts)、
-   `pipeline.onToolOutput` 三处重复,每处注释互相点名。不要以"重复"为
-   由删任何一处——单点门控会静默重开已关闭的功能。
-9. **依赖 opencode 具体版本行为的代码必须注释注明验证版本**(如
-   `session.status` 的 busy/retry 字段,1.18 验证)。升级
-   `@opencode-ai/plugin` 前必须跑真实环境 QA。
-10. **改在途消息 parts 的注入面(chat-message)不走 gate,但有字段契约**:
-    push 的 part 必须携带 `id`(`prt_` 前缀)/ `sessionID` / `messageID`,
-    否则消息保存死("invalid user part before save",2026-08-25 会话冻结
-    事故)。`messageID` 来自 `output.message.id`(TUI 不发,opencode 在
-    hook 触发前赋值)。`src/hooks/chat-message.ts:46`
-11. **config hook 原地修改 `configInput`,返回值被丢弃**(1.18 验证):
-    新命令只能靠原地改 `configInput.command` 注册,写成 return 会静默
-    失败(命令不出现、无报错)。`src/index.ts:178`
+---
 
-## 约定
+## 3. 核心架构不变量 (Invariants / 承重墙)
 
-- **Bun only**:测试 `bun test`,类型检查 `bun run typecheck`,构建 `bun run build`
-- **strict TS + `noUncheckedIndexedAccess`**,`verbatimModuleSyntax`(type-only 导入用 `type`)
-- 测试用 `bun:test` 的 `describe/test`,`tests/` 平铺,`*.test.ts`
-- 提交信息**无语言强制**(仓库现状为中文),保持 conventional 前缀:
-  `feat:` / `fix:` / `chore:` / `release:`
-- 内部失败的边界约定:能降级就降级,降级路径必须 log
-- 日志只经 `src/shared/log.ts` 写文件(`PRISM_LOG_FILE` 可覆盖),**禁止
-  console.log / console.error**——插件跑在 opencode 服务进程,控制台输出
-  会漏进 TUI 界面
-- 用户可感知的改动(配置项、命令、工具名、行为)必须同步 README 与
-  CHANGELOG[Unreleased],防止文档漂移
+> ⚠️ **警告**：以下设计是多次事故与踩坑后定型的核心机制，**严禁以「代码重构 / 简化 / 消除重复」为由改动**！
 
-## 测试与 QA(硬性契约)
+### 3.1 视觉门控三重冗余 (Triple-Gate Defense)
+- `config.vision.enabled: false` 为完全关闭：`vision_look` 不注册、自动解读不触发。
+- 门控检查在 `tool-execute-after`、`getVisionModel` (`src/index.ts`)、`pipeline.onToolOutput` **三处硬编码重复**，每处注释互相点名。禁止以“去重”为由删减任何一处。
 
-1. **功能实现后必须新会话审查**:实现完一个功能,不得在同一会话内自行
-   审查收尾——必须新开会话进行审查(审查会话有干净的上下文,不受实现
-   过程的路径依赖影响)。审查通过后才允许提交。
-2. **"typecheck 通过" ≠ 完成**。单元测试覆盖不了真实 opencode 的插件
-   行为(hook 触发、子会话生命周期、消息回注)。
-3. 涉及 hook 触发 / 子会话 / 消息注入的改动,必须跑真实环境验证:
-   `scripts/qa/sandbox-run.sh`(沙箱隔离,别污染真实会话)。
-4. **证据写盘**:验证结论写入 `docs/qa/YYYY-MM-DD-<主题>.md`
-   (参考现有 `docs/qa/2026-08-13-sandbox-qa.md`),包含:改动范围、
-   验证步骤、实际输出。没有证据文件的改动不提交。
-5. **单元测试只测纯逻辑**:禁止对 LLM 输出文本、消息时序或真实会话行为
-   做断言(现有测试全为 schema 解析 / 调度 / 配置等纯逻辑)。这类行为
-   由真实环境 QA 覆盖。
+### 3.2 子会话工具隔离与递归防护 (Recursion Defense)
+- **工具列表硬过滤**：
+  - 后台子会话恒禁用 `bg_*` 与 `question`（`manager.ts` 的 `childToolFilters`）；`vision_look` 在视觉启用时保留（支持 async 视觉任务解读自身图片），视觉禁用时移除。
+  - 同步解读子会话使用 `VISION_CHILD_TOOL_FILTERS` 禁用全部 Prism 工具 + `question`。
+- **运行时守卫承重**：递归防护的核心承重墙是运行时守卫 `isInterpretationSession`（在 `vision-look`、`pipeline.onToolOutput`、`chat-message` 三处生效）。**删除守卫必然复发 0.4.0-beta.1 递归风暴事故**。
 
-## 常用命令
+### 3.3 消息构造与客户端调用契约
+- **Chat-Message Part 契约**：在 `chat-message` 中动态 `push` 的 part **必须**携带 `id`（带 `prt_` 前缀）、`sessionID`、`messageID`（取自 `output.message.id`）。缺少字段会导致持久化失败（"invalid user part before save" 导致会话冻结事故，2026-08-25）。
+- **Client 4xx/5xx 契约**：OpenCode Client 调用的 4xx/5xx 错误会被解析为 `{ error }` 而不是 reject。
+  - 必须统一使用 `errorInfoFromResult` (`src/shared/api-result.ts`) 判定失败。
+  - Resolved rejection 是**唯一**安全可重试的失败类；Thrown error 说明请求可能已送达，禁止盲目重试，防止主会话重复注入。
 
-    bun test                  # 全部单元测试
-    bun test tests/vision.test.ts
-    bun run typecheck         # tsc --noEmit
-    bun run build             # bun build → dist/(发布前自动跑)
+### 3.4 模型继承与配置回退
+- **模型继承三级回退链**：`Session 对象` → `最新消息 info.model` → `Config 默认模型`。主会话 `/models` 切换后新任务自动跟随。
+- **配置按字段回退**：无效字段单独回退默认值，同节其他有效设置保留（例如 `vision.mode: "background"` 仅将 mode 回退为默认值，启动时弹出 warning toast）。
+- **版本行为依赖标注**：凡依赖 OpenCode 具体版本行为的代码（如 `session.status` 的 busy/retry 字段，1.18 验证），必须在注释中显式注明验证版本。
 
-## 配置系统
+---
 
-- 优先级:项目 `.prism/prism.jsonc`(自会话目录向上逐级查找至 $HOME,
-  home 自身跳过)> 用户 `~/.prism/prism.jsonc` > 内置默认
-- 项目配置随仓库提交(团队约定);个人偏好不提交
-- 一次性实验:`PRISM_CONFIG=/path/to/config.jsonc`
-- 注意:`vision.mode` 只有 `"sync" | "async"`;旧值 `"background"` 已弃用
+## 4. 开发与测试准则 (Development Standards)
 
-## 发布流程
+### 环境与语言规范
+- **Runtime**：纯 Bun 环境（`bun test` / `bun run typecheck` / `bun run build`）。
+- **TypeScript**：Strict 模式，开启 `noUncheckedIndexedAccess`，必须使用 `verbatimModuleSyntax`（类型导入统一用 `import type`）。
+- **提交规范**：Conventional Commits（`feat:`, `fix:`, `chore:`, `release:`），无语言强制（仓库现状为中文）。
 
-1. `CHANGELOG.md` 记录用户可感知的变化(Keep a Changelog,中文)
-2. 版本号在 `package.json`(如 `0.4.0-beta.2`)
-3. 提交形如 `release: 0.4.0-beta.2` 的独立发布提交
+### 常用命令速查
+```bash
+bun test                  # 运行全部单元测试
+bun test tests/vision.test.ts # 运行特定单测
+bun run typecheck         # 静态类型检查 (tsc --noEmit)
+bun run build             # 构建打包 → dist/
+```
+
+### 测试与 QA 准则（硬性契约）
+1. **"typecheck 通过" ≠ 完成**：单元测试无法覆盖真实的 OpenCode 插件生命周期与注入行为。
+2. **测试严格划界**：
+   - **单元测试 (`tests/*.test.ts`)**：**只测纯逻辑**（Schema 解析、状态机调度、拓扑排序、配置回退规则）。严禁对 LLM 文本输出、消息时序做脆弱断言。
+   - **真实环境 QA (`scripts/qa/sandbox-run.sh`)**：凡涉及 Hook 触发、子会话生命周期、消息回注的改动，**必须在沙箱中跑真实验证**。
+3. **证据写盘交付**：
+   - 真实验证结论必须写入 `docs/qa/YYYY-MM-DD-<主题>.md`（包含改动范围、验证步骤、实际输出）。**无 QA 证据文件不提交代码**。
+4. **文档同步**：用户可感知改动（配置、命令、工具、行为）必须同步更新 `README.md` 与 `CHANGELOG.md` [Unreleased]。
+
+---
+
+## 5. 配置与发布流程
+
+### 配置加载优先级
+1. 项目级 `.prism/prism.jsonc`（自当前工作目录向上逐级查找至 `$HOME`，`$HOME` 自身跳过）
+2. 用户级 `~/.prism/prism.jsonc`
+3. 插件内置默认配置
+*(一次性实验可通过环境变量覆盖：`PRISM_CONFIG=/path/to/config.jsonc`)*
+
+### 发布流程
+1. 更新 `CHANGELOG.md`（遵循 Keep a Changelog 规范，中文）。
+2. 在 `package.json` 更新版本号（如 `0.4.0-beta.2`）。
+3. 提交独立 Release 提交（如 `release: 0.4.0-beta.2`）。

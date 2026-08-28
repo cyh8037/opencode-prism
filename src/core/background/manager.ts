@@ -25,6 +25,7 @@ import { collectAssistantText } from "../assistant-text"
 import type { PrismClient } from "../client-types"
 import type { PromptGate } from "../prompt-gate"
 import { ConcurrencyManager } from "./concurrency"
+import { renderCompactDashboard } from "./visualizer"
 import type { BgTask, LaunchInput, QueueItem, SessionStatusMap } from "./types"
 
 // Resolve the model a child session should use. Implementations read the
@@ -78,35 +79,10 @@ function truncateSteeringMessage(message: string): string {
   return message.slice(0, length)
 }
 
-function formatDuration(startedAt: Date | undefined, completedAt: Date | undefined): string {
-  if (!startedAt || !completedAt) return "-"
-  const seconds = Math.max(0, Math.round((completedAt.getTime() - startedAt.getTime()) / 1000))
-  if (seconds < 60) return `${seconds}s`
-  const minutes = Math.floor(seconds / 60)
-  return `${minutes}m${seconds % 60}s`
-}
-
-// includeResults=false omits the per-row result preview — used when the full
-// result is injected separately so it is not duplicated.
+// 任务表格已看板化(visualizer.ts):字段级 sanitize/换行压平/控制字符剥离
+// 由渲染器统一承担,这里只做结果预览的 includeResults 语义转发。
 function buildTaskTable(tasks: BgTask[], includeResults = true): string {
-  const rows = tasks
-    .map((task) => {
-      // Every field embedded in the notification template is untrusted text —
-      // description comes from the parent conversation, error from the
-      // provider — so all of them get the close-tag escape, not just
-      // resultText.
-      const description = sanitizeSystemReminder(task.description)
-      const error = task.error ? ` - ${sanitizeSystemReminder(task.error.slice(0, 120))}` : ""
-      const attempts = task.retries > 0 ? ` (${task.retries + 1} attempts)` : ""
-      const result =
-        includeResults && task.resultText ? `\n   结果: ${sanitizeSystemReminder(task.resultText.slice(0, 200))}` : ""
-      return (
-        `- \`${task.id}\` ${description}: ${task.status.toUpperCase()} ` +
-        `(${formatDuration(task.startedAt, task.completedAt)})${attempts}${error}${result}`
-      )
-    })
-    .join("\n")
-  return rows
+  return renderCompactDashboard(tasks, { includeResults })
 }
 
 export class BackgroundManager {
@@ -160,6 +136,11 @@ export class BackgroundManager {
       if (task) tasks.push(task)
     }
     return tasks
+  }
+
+  /** 并发池占用快照(/bg status 看板 header 用)。 */
+  getConcurrencySnapshot(): Array<{ key: string; active: number; limit: number }> {
+    return this.concurrency.snapshot()
   }
 
   private addTask(task: BgTask): void {

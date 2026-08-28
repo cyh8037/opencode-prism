@@ -824,6 +824,41 @@ describe("chat.message hook (pasted-image hint)", () => {
     expect(harness.childSessions.size).toBe(0) // still zero-blocking
   })
 
+  test("/bg command turns get a bg_spawn reminder instead of the vision_look hint", async () => {
+    const harness = createVisionHarness("sync")
+    const { hook } = hintHookFor(harness)
+    // opencode 注入的 /bg 命令模板是 user 消息的一部分(2026-08-28 会话
+    // ses_fb868779 实测:模板 + 图片 + 提醒 同一条消息)
+    const parts: Array<Record<string, unknown>> = [
+      { type: "text", text: "你在处理 Prism 的 /bg 命令。" },
+      { type: "text", text: "分析这张图" },
+      { type: "file", mime: "image/jpeg", url: FAKE_PNG_URL },
+    ]
+    await hook({ sessionID: "parent" }, { parts, message: { id: "msg_1" } } as never)
+    const appended = parts[parts.length - 1] as { text?: string }
+    expect(appended.text).toContain("[prism bg]")
+    expect(appended.text).toContain("请调用 bg_spawn")
+    expect(appended.text).toContain("不要用 vision_look 同步解读")
+    expect(appended.text).not.toContain("请调用 vision_look")
+  })
+
+  test("/split command turns get a split_task reminder instead of the vision_look hint", async () => {
+    const harness = createVisionHarness("sync")
+    const { hook } = hintHookFor(harness)
+    const parts: Array<Record<string, unknown>> = [
+      { type: "text", text: "你在处理 Prism 的 /split 命令。" },
+      { type: "file", mime: "image/png", url: FAKE_PNG_URL },
+    ]
+    await hook({ sessionID: "parent" }, { parts, message: { id: "msg_1" } } as never)
+    const appended = parts[parts.length - 1] as { text?: string }
+    expect(appended.text).toContain("[prism split]")
+    expect(appended.text).toContain("请调用 split_task")
+    // split 链路没有图片通道:提醒必须引导路径引用,不能暗示图片自动跟随
+    expect(appended.text).toContain("写进 task 描述")
+    expect(appended.text).not.toContain("自动把")
+    expect(appended.text).not.toContain("请调用 vision_look")
+  })
+
   test("vision-capable sessions get no reminder", async () => {
     const harness = createVisionHarness("sync")
     const { tracker, hook } = hintHookFor(harness)

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { subTaskPlanArraySchema } from "../src/core/split/plan-schema"
 import { buildSplitReport, layerPlans, runSplit } from "../src/core/split/scheduler"
 import { SplitService } from "../src/core/split/service"
+import { SplitRunRegistry } from "../src/core/split/registry"
 import { createSplitTool } from "../src/tools/split"
 import { BackgroundManager } from "../src/core/background/manager"
 import { PromptGate } from "../src/core/prompt-gate"
@@ -173,6 +174,7 @@ describe("SplitService dry-run", () => {
       directory: "/work",
       manager: {} as never,
       gate: new PromptGate(client, { idlePollMs: 10 }),
+      registry: new SplitRunRegistry(),
       resolvePlannerModel: async () => ({ providerID: "openai", modelID: "gpt-5.6-sol" }),
     })
   }

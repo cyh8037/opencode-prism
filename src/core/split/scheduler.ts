@@ -24,7 +24,7 @@ const TERMINAL = new Set(["completed", "error", "cancelled"])
 // Sentinel value in skippedPlanIDs: the plan itself never launched (manager
 // rejected it — unresolvable model, shutdown). Distinct from a plan id so
 // the report can say "启动失败" instead of the misleading "上游 <自己> 失败".
-const LAUNCH_FAILED = "launch-failed"
+export const LAUNCH_FAILED = "launch-failed"
 
 // Topological layering for display (dry-run). Layer N holds every plan whose
 // dependencies all live in earlier layers. NOTE: this matches the runtime's
