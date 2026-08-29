@@ -35,3 +35,24 @@ describe("bg_wait", () => {
     expect(result).toContain("不存在或已过期: bg_ghost")
   })
 })
+
+describe("bg_spawn", () => {
+  test("the return text carries the task id and the native-TUI navigation hint", async () => {
+    const manager = {
+      getTask: () => undefined,
+      getTasksByParentSession: () => [],
+      launch: async () => ({
+        id: "bg_hint1234",
+        description: "demo",
+        model: { providerID: "openai", modelID: "gpt-5.6-sol" },
+      }),
+    } as unknown as BackgroundManager
+    const definition = createBgTools(manager, { visionEnabled: true, autoTrigger: true }).bg_spawn!
+    const result = await definition.execute({ description: "demo", prompt: "work" }, { sessionID: "session" } as never)
+    expect(result).toContain("bg_hint1234")
+    // 措辞是"启动后"（返回时任务实为 queued）,键位写"默认"不写死
+    expect(result).toContain("启动后可")
+    expect(result).toContain("TUI 中按 leader 键（默认 Ctrl+X）")
+    expect(result).toContain("↑ 返回主会话")
+  })
+})

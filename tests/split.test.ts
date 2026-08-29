@@ -241,6 +241,125 @@ describe("SplitService dry-run", () => {
   })
 })
 
+describe("SplitService intent check", () => {
+  const plannerText = JSON.stringify([{ id: "s1", title: "only", description: "work", dependsOn: [] }])
+
+  // 第一个创建的子会话固定为 intent_session，后续为 planner_session；
+  // messages 按会话 id 返回各自的预设文本。
+  function createIntentAwareClient(opts: {
+    intentText: string
+    plannerText?: string
+    createFails?: boolean
+  }): { client: PrismClient; prompts: Array<{ pathId?: string; body?: Record<string, unknown> }> } {
+    const prompts: Array<{ pathId?: string; body?: Record<string, unknown> }> = []
+    let sessionCount = 0
+    const client: PrismClient = {
+      session: {
+        get: async () => ({
+          data: { id: "parent", directory: "/work", model: { id: "gpt-5.6-sol", providerID: "openai" } },
+        }),
+        create: async ({ body }) => {
+          sessionCount++
+          if (opts.createFails && sessionCount === 1) return { error: { message: "refused" } }
+          // 按创建请求的 title 命名会话（而非顺序）：关闭意图识别时第一个
+          // 创建的就是 planner 会话。
+          const title = String((body as Record<string, unknown>).title)
+          return { data: { id: title.includes("intent") ? "intent_session" : "planner_session" } }
+        },
+        abort: async () => {},
+        prompt: async () => {},
+        promptAsync: async ({ path, body }) => {
+          prompts.push({ pathId: path?.id, body: body as Record<string, unknown> })
+        },
+        messages: async ({ path }) => {
+          const text = path?.id === "intent_session" ? opts.intentText : (opts.plannerText ?? "")
+          return {
+            data: text
+              ? [{ info: { role: "assistant" }, parts: [{ type: "text", text, state: { status: "completed" } }] }]
+              : [],
+          }
+        },
+        status: async () => ({ data: {} }),
+      },
+      tui: { showToast: async () => {} },
+    }
+    return { client, prompts }
+  }
+
+  function createService(client: PrismClient): SplitService {
+    return new SplitService({
+      client,
+      directory: "/work",
+      manager: {} as never,
+      gate: new PromptGate(client, { idlePollMs: 10 }),
+      registry: new SplitRunRegistry(),
+      resolvePlannerModel: async () => ({ providerID: "openai", modelID: "gpt-5.6-sol" }),
+      intentCheckEnabled: true,
+    })
+  }
+
+  test("a direct verdict returns skipped-intent without invoking the planner", async () => {
+    const { client, prompts } = createIntentAwareClient({ intentText: '{"intent":"direct","reason":"单步任务"}' })
+    const outcome = await createService(client).split({ sessionID: "parent", task: "修 typo", dryRun: true })
+    expect(outcome.kind).toBe("skipped-intent")
+    expect(outcome.message).toContain("无需拆分")
+    expect(outcome.message).toContain("单步任务")
+    expect(outcome.message).toContain("预览判定")
+    expect(outcome.message).toContain("split.intentCheck=false")
+    // planner 从未被调用:唯一的 prompt 是意图子会话的
+    expect(prompts).toHaveLength(1)
+    expect(prompts[0]!.pathId).toBe("intent_session")
+  })
+
+  test("a non-dry-run direct verdict omits the preview note", async () => {
+    const { client } = createIntentAwareClient({ intentText: '{"intent":"direct"}' })
+    const outcome = await createService(client).split({ sessionID: "parent", task: "修 typo" })
+    expect(outcome.kind).toBe("skipped-intent")
+    expect(outcome.message).not.toContain("预览判定")
+    expect(outcome.message).toContain("无需拆分")
+  })
+
+  test("a split verdict proceeds to the planner", async () => {
+    const { client, prompts } = createIntentAwareClient({ intentText: '{"intent":"split"}', plannerText })
+    const outcome = await createService(client).split({ sessionID: "parent", task: "x", dryRun: true })
+    expect(outcome.kind).toBe("dry-run")
+    expect(outcome.message).not.toContain("意图识别")
+    expect(prompts.some((p) => p.pathId === "planner_session")).toBe(true)
+  })
+
+  test("an intent-session creation failure fails open to the normal flow", async () => {
+    const { client, prompts } = createIntentAwareClient({
+      intentText: '{"intent":"direct"}',
+      plannerText,
+      createFails: true,
+    })
+    const outcome = await createService(client).split({ sessionID: "parent", task: "x", dryRun: true })
+    expect(outcome.kind).toBe("dry-run")
+    expect(prompts.some((p) => p.pathId === "planner_session")).toBe(true)
+  })
+
+  test("unparseable intent output fails open", async () => {
+    const { client } = createIntentAwareClient({ intentText: "直接做吧", plannerText })
+    const outcome = await createService(client).split({ sessionID: "parent", task: "x", dryRun: true })
+    expect(outcome.kind).toBe("dry-run")
+  })
+
+  test("services without intentCheckEnabled skip the check entirely (option absent, not wired)", async () => {
+    const { client, prompts } = createIntentAwareClient({ intentText: '{"intent":"direct"}', plannerText })
+    const service = new SplitService({
+      client,
+      directory: "/work",
+      manager: {} as never,
+      gate: new PromptGate(client, { idlePollMs: 10 }),
+      registry: new SplitRunRegistry(),
+      resolvePlannerModel: async () => ({ providerID: "openai", modelID: "gpt-5.6-sol" }),
+    })
+    const outcome = await service.split({ sessionID: "parent", task: "x", dryRun: true })
+    expect(outcome.kind).toBe("dry-run")
+    expect(prompts.some((p) => p.pathId === "intent_session")).toBe(false)
+  })
+})
+
 describe("split_task tool", () => {
   const ctx = { sessionID: "parent" }
 

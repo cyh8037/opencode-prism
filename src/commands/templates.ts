@@ -1,3 +1,5 @@
+import { BG_SESSION_NAV_HINT } from "../config/constants"
+
 export interface PrismCommandDefinition {
   description: string
   template: string
@@ -30,6 +32,7 @@ export function createBgCommand(visionEnabled: boolean): PrismCommandDefinition 
         : []),
       "- 参数是 status / status <task_id> / output <task_id> / cancel <task_id> / resume|send <task_id> <追问或补充指令> 时：这些子命令由插件原生执行，结果会注入到对话中。直接把注入的结果转达给用户，不要调用任何工具。",
       "- status 注入的是纯文本看板表格：原样转达,保留表格与分层格式,不要改写为列表、不要添加 emoji 或任何符号、不要自行重排。status <task_id> 显示单个任务的表格（无论是否已结束）。",
+      "- 用户想查看后台任务的执行过程时：告知其" + BG_SESSION_NAV_HINT + "（子会话标题以 [bg_ 任务 id] 开头，可用 ←/→ 在多个子任务间切换）。不要通过反复调用 bg_output 轮询过程。",
       "- resume|send 用于给任务补充指令：任务已结束时在其子会话里继续追问（保留上下文）；任务运行中时消息会排队，在其当前回合结束的边界投递，不打断执行。",
       "- 任何时候用户想在后台任务运行期间补充指示、纠正方向，或想在总结前等待并行任务完成：用 bg_send / bg_wait 工具，不要反复轮询 bg_output。",
       "- 后台任务结束后父会话会自动收到汇总通知，不需要你主动轮询。",
@@ -57,7 +60,9 @@ export function createSplitCommand(visionEnabled: boolean): PrismCommandDefiniti
         : []),
       "- 工具返回的是拆分计划（dry-run）：把计划原样展示给用户，等用户确认后再让用户去掉 --dry-run 重新执行。",
       "- 工具返回的是\"拆分计划已启动\"：告诉用户子任务正在后台并行执行，完成后会自动收到汇总通知，不需要轮询。",
+      "- 工具返回的是\"意图识别：无需拆分\"：把原因原样转达给用户，不要改写任务强行重试；用户坚持拆分时提示补充任务细节，或设置 split.intentCheck=false（需重启 opencode）。",
       "- 工具返回的是失败信息：把原因原样转达，不要自行猜测或改写。",
+      "- 拆分子任务同样在 TUI 的子会话导航组内（" + BG_SESSION_NAV_HINT + "，标题以 [bg_ 任务 id] 开头），用户想看某个子任务的执行过程时告知此操作。",
       "- status / output <task_id> / cancel <sp_run_id> / cancel <task_id> 由插件原生执行（结果会注入），直接转达，不要调用任何工具。",
       "- status 注入的是按依赖分层的纯文本看板：原样转达,保留分层结构与依赖标注,不要改写为列表、不要添加 emoji 或任何符号、不要自行合并行。",
       "- cancel <sp_run_id> 取消整个拆分运行（sp_ 前缀，status 看板标题里显示）；cancel <task_id> 取消单个子任务。",

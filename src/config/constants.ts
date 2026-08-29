@@ -77,6 +77,23 @@ export const RESUME_ACQUIRE_TIMEOUT_MS = 15_000
 // split
 export const MAX_SUBTASKS = 12
 export const PLANNER_SYNC_TIMEOUT_MS = 120_000
+// 意图识别（一次性分类子会话）的超时。比规划器短：分类任务轻，超时即
+// fail-open 视为可拆分，不重试（重试只是把 /split 的等待加倍）。
+export const INTENT_CHECK_TIMEOUT_MS = 30_000
+// intent 的 reason 字段是子会话 LLM 输出（不可信文本），进入返回消息/
+// 主会话前按此上限截断（配合 sanitizeTruncate 的控制字符清洗）。
+export const MAX_INTENT_REASON_CHARS = 500
+// 子会话标题中 description 部分的截断上限（[bg_xxxxxxxx] 前缀与 " (prism)"
+// 后缀另计）。TUI 子会话导航视图约按 50 列显示标题，前缀放头部才可见。
+export const MAX_SESSION_TITLE_CHARS = 100
+// bg_spawn 返回文本、/bg 与 /split 命令模板、/bg status 看板共用的子会话
+// 实时查看指引。键位为 TUI 默认值（用户可用 keybinds 覆盖），因此文案写
+// "leader 键（默认 Ctrl+X）"而不写死按键本身。
+// 版本行为依赖：leader 键位、session_child_first(<leader>down)/
+// session_child_cycle(right,left)/session_parent(up) 及 parentID 子会话
+// 分组行为，经 opencode 1.15.0 与 1.18.25 二进制（strings）验证一致。
+export const BG_SESSION_NAV_HINT =
+  "TUI 中按 leader 键（默认 Ctrl+X）后按 ↓ 实时查看子会话输出，←/→ 切换，↑ 返回主会话"
 
 // attach hint (/bg output --full) server port
 export const DEFAULT_SERVER_PORT = 4096

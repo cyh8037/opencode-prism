@@ -60,8 +60,20 @@ export const prismConfigSchema = z.object({
       // 单一开关同时门控 split_task 工具与 /split 命令：命令的任务模式借道
       // 工具执行（模板指示模型调用 split_task），工具不注册时命令无法执行。
       tool: z.boolean().describe("split_task 工具与 /split 命令入口；false 时两者都不注册（默认 true）"),
+      // 拆分前的意图识别（一次性分类子会话，fail-open）：direct 判定返回原因
+      // 并跳过拆分。默认开启——多一跳 LLM 调用的延迟/成本换取防误拆兜底
+      // （autoTrigger 默认同为 true，模型自主触发的拆分默认被此判定兜底）。
+      intentCheck: z
+        .boolean()
+        .describe("拆分前先做意图识别：简单任务判定为无需拆分并返回原因（默认 true；false 可省去判定的一次额外模型调用）"),
+      // 策略 A 同构：true 时 split_task 的工具描述拼接"自主触发准则"，模型可
+      // 主动拆分。爆炸半径大于 bg_spawn（规划器 + N 个子任务），默认由
+      // intentCheck 兜底防误拆。插件加载时读取，切换需重启 opencode。
+      autoTrigger: z
+        .boolean()
+        .describe("模型可根据任务复杂度自主调用 split_task 拆分执行，无需用户输入 /split（默认 true；自主触发的拆分默认被 intentCheck 兜底）"),
     })
-    .default({ tool: true }),
+    .default({ tool: true, intentCheck: true, autoTrigger: true }),
 })
 
 export type PrismConfig = z.infer<typeof prismConfigSchema>

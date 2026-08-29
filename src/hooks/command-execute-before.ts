@@ -238,8 +238,14 @@ export function createCommandExecuteBeforeHook(args: {
         for (const task of run.tasksByPlanID.values()) {
           // 终态任务跳过:manager.cancelTask 对它们返回 false,没必要发起调用
           if (task.status === "completed" || task.status === "error" || task.status === "cancelled") continue
-          const ok = await args.manager.cancelTask(task.id, { source: "/split cancel run" })
+          // skipNotification:逐任务 cancel 的 CANCELLED toast 会在整批取消时
+          // 刷屏;汇总反馈由下方单条 toast + 命令回执 + split 聚合报告承担
+          // (与 cancelAllByParentSession 的既有语义一致)。
+          const ok = await args.manager.cancelTask(task.id, { source: "/split cancel run", skipNotification: true })
           if (ok) cancelled++
+        }
+        if (cancelled > 0) {
+          showToast(args.client, `已取消拆分任务 \`${runID}\` 的 ${cancelled} 个子任务`)
         }
         pushText(
           output,

@@ -87,6 +87,27 @@ describe("parseConfig", () => {
     expect(config.background.concurrency).toBe(3)
     expect(config.background.autoTrigger).toBe(true)
   })
+
+  test("split intentCheck defaults to true and autoTrigger to true", () => {
+    const config = parseConfig({})
+    expect(config.split.tool).toBe(true)
+    expect(config.split.intentCheck).toBe(true)
+    expect(config.split.autoTrigger).toBe(true)
+  })
+
+  test("split fields are all settable and survive parsing", () => {
+    const config = parseConfig({ split: { intentCheck: false, autoTrigger: false } })
+    expect(config.split.intentCheck).toBe(false)
+    expect(config.split.autoTrigger).toBe(false)
+    expect(config.split.tool).toBe(true)
+  })
+
+  test("an invalid split field falls back per-field, keeping the valid siblings", () => {
+    const config = parseConfig({ split: { intentCheck: "yes", autoTrigger: false } })
+    expect(config.split.intentCheck).toBe(true)
+    expect(config.split.autoTrigger).toBe(false)
+    expect(config.split.tool).toBe(true)
+  })
 })
 
 describe("loadConfig", () => {

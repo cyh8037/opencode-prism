@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { renderBgDashboard, renderCompactDashboard } from "../src/core/background/visualizer"
+import { buildChildSessionTitle, renderBgDashboard, renderCompactDashboard } from "../src/core/background/visualizer"
 import { getStringWidth } from "../src/core/shared/width"
 import type { BgTask } from "../src/core/background/types"
 
@@ -47,8 +47,9 @@ describe("renderBgDashboard", () => {
       undefined,
       { foldCompleted: false },
     )
-    const lines = text.split("\n")
-    const widths = lines.map((line) => getStringWidth(line))
+    // 表格行(box-drawing 开头)等宽;Pool/导航指引等注释行不参与对齐
+    const tableLines = text.split("\n").filter((line) => /^[│┌├└]/.test(line))
+    const widths = tableLines.map((line) => getStringWidth(line))
     expect(new Set(widths).size).toBe(1)
   })
 
@@ -86,10 +87,22 @@ describe("renderBgDashboard", () => {
       longPool,
     )
     const lines = text.split("\n")
-    const tableLines = lines.filter((line) => !line.startsWith("Pool:"))
+    // 表格行等宽;注释行(Pool/导航指引)不参与对齐,完整显示超宽内容
+    const tableLines = lines.filter((line) => /^[│┌├└]/.test(line))
     const widths = tableLines.map((line) => getStringWidth(line))
     expect(new Set(widths).size).toBe(1)
     expect(text).toContain("Pool: anthropic/claude-sonnet-4-5 3/5, openai/gpt-5.6-sol 2/5")
+  })
+
+  test("the native-TUI navigation hint sits on the dashboard but not the compact one", () => {
+    const dashboard = renderBgDashboard([
+      makeTask({ id: "bg_aaaa1111", description: "运行中", status: "running" }),
+    ])
+    expect(dashboard).toContain("TUI 中按 leader 键（默认 Ctrl+X）")
+    const compact = renderCompactDashboard([
+      makeTask({ id: "bg_aaaa1111", description: "运行中", status: "running" }),
+    ])
+    expect(compact).not.toContain("leader")
   })
 
   test("newlines inside fields are flattened to spaces", () => {
@@ -182,5 +195,27 @@ describe("renderCompactDashboard", () => {
 
   test("empty state", () => {
     expect(renderCompactDashboard([])).toBe("当前会话没有后台任务。")
+  })
+})
+
+describe("buildChildSessionTitle", () => {
+  test("prefix first, cleaned description, bounded total length", () => {
+    const title = buildChildSessionTitle("bg_12345678", `${"很长的描述".repeat(40)}\n尾\u001b[31m红`)
+    expect(title.startsWith("[bg_12345678] ")).toBe(true)
+    expect(title.endsWith(" (prism)")).toBe(true)
+    expect(title).not.toContain("\n")
+    expect(title).not.toContain("\u001b")
+    // [bg_12345678](11) + " "(1) + 100 码元 + " (prism)"(8)
+    expect(title.length).toBeLessThanOrEqual(122)
+  })
+
+  test("an empty description never produces a double-space title", () => {
+    expect(buildChildSessionTitle("bg_12345678", "")).toBe("[bg_12345678] (prism)")
+    expect(buildChildSessionTitle("bg_12345678", "   ")).toBe("[bg_12345678] (prism)")
+  })
+
+  test("a retried task's title carries the retry number (old child session stays in the nav group)", () => {
+    expect(buildChildSessionTitle("bg_12345678", "demo", 2)).toBe("[bg_12345678] demo (prism, retry 2)")
+    expect(buildChildSessionTitle("bg_12345678", "demo", 0)).toBe("[bg_12345678] demo (prism)")
   })
 })

@@ -33,8 +33,10 @@ export interface PrismSession {
   status(params?: { query?: { directory?: string } }): Promise<{ data?: unknown; error?: unknown }>
 }
 
+export type ToastVariant = "info" | "success" | "warning" | "error"
+
 export interface PrismTui {
-  showToast(params: { body: { title: string; message: string; variant: string; duration: number } }): Promise<unknown>
+  showToast(params: { body: { title: string; message: string; variant: ToastVariant; duration: number } }): Promise<unknown>
 }
 
 export interface PrismClient {

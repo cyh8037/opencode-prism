@@ -20,11 +20,14 @@ function createMockClient(
   noToast = false,
 ): {
   client: PrismClient
-  childSessions: Map<string, { parentID: string; prompts: unknown[]; aborted: boolean }>
+  childSessions: Map<string, { parentID: string; title: string; prompts: unknown[]; aborted: boolean }>
   statusData: Record<string, { type?: string }>
   toasts: Array<{ title: string; message: string; variant: string }>
 } {
-  const childSessions = new Map<string, { parentID: string; prompts: unknown[]; aborted: boolean }>()
+  const childSessions = new Map<
+    string,
+    { parentID: string; title: string; prompts: unknown[]; aborted: boolean }
+  >()
   const toasts: Array<{ title: string; message: string; variant: string }> = []
   let childCounter = 0
   const client: PrismClient = {
@@ -40,6 +43,7 @@ function createMockClient(
         const id = `child_${++childCounter}`
         childSessions.set(id, {
           parentID: String((body as Record<string, unknown>).parentID),
+          title: String((body as Record<string, unknown>).title),
           prompts: [],
           aborted: false,
         })
@@ -266,6 +270,92 @@ describe("BackgroundManager", () => {
     expect(task.resultText).toBe("完整的解读结果")
   })
 
+  // TUI 子会话导航让用户可以切进子会话输入消息：这些非 synthetic 文本会走
+  // 事件路径进入 resultText，但完成时必须以 messages API 的 assistant 文本
+  // 为准，用户的输入不能被当"完整结果"注入主会话。
+  test("user input in the child never survives into the completion result", async () => {
+    const { manager, client } = createManager()
+    client.session.messages = async () => ({
+      data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: "权威最终结果" }] }],
+    })
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    manager.handleEvent({
+      type: "message.part.updated",
+      properties: {
+        sessionID: task.sessionId,
+        part: { id: "user-typed", type: "text", text: "用户切进子会话输入的内容" },
+      },
+    })
+    expect(task.resultText).toBe("用户切进子会话输入的内容") // 运行中预览仍是事件值
+
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: task.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    expect(task.status).toBe("completed")
+    expect(task.resultText).toBe("权威最终结果")
+  })
+
+  // 子会话以纯 tool part 收尾（无任何 completed assistant 文本）时，事件
+  // 路径捕获的用户输入必须被清空——否则会作为"完整结果"注入主会话。
+  test("a tool-only ending clears the event-path value instead of keeping user input", async () => {
+    const { manager, client } = createManager()
+    client.session.messages = async () => ({
+      data: [{ info: { role: "assistant" }, parts: [{ type: "tool", tool: "read", state: { status: "completed" } }] }],
+    })
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    manager.handleEvent({
+      type: "message.part.updated",
+      properties: {
+        sessionID: task.sessionId,
+        part: { id: "user-typed", type: "text", text: "用户切进子会话输入的内容" },
+      },
+    })
+    expect(task.resultText).toBe("用户切进子会话输入的内容")
+
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: task.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    expect(task.status).toBe("completed")
+    expect(task.resultText).toBeUndefined()
+  })
+
+  test("child sessions get a [task id] title with a sanitized, truncated description", async () => {
+    const { manager, childSessions } = createManager()
+    const task = await manager.launch({
+      description: `${"很长的描述".repeat(40)}\n尾行\u001b[31m红`,
+      prompt: "work",
+      parentSessionId: "parent",
+    })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    const session = childSessions.get(task.sessionId!)!
+    expect(session.title.startsWith(`[${task.id}] `)).toBe(true)
+    expect(session.title.endsWith(" (prism)")).toBe(true)
+    expect(session.title).not.toContain("\n")
+    expect(session.title).not.toContain("\u001b")
+    // 前缀 [bg_xxxxxxxx](11) + 空格(1) + 100 码元 + " (prism)"(8)
+    expect(session.title.length).toBeLessThanOrEqual(122)
+  })
+
+  test("child prompts disable split_task alongside the other prism tools", async () => {
+    const { manager, childSessions } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    const tools = (childSessions.get(task.sessionId!)!.prompts[0] as { tools?: Record<string, boolean> })
+      .tools ?? {}
+    expect(tools.split_task).toBe(false)
+    expect(tools.bg_spawn).toBe(false)
+    expect(tools.bg_wait).toBe(false)
+    expect(tools.question).toBe(false)
+    // 视觉启用时 vision_look 保留（缺省 = 未禁用）
+    expect(tools.vision_look).toBeUndefined()
+  })
+
   test("two sibling tasks wake the parent once", async () => {
     const { manager, gate, client } = createManager()
     let wakeCount = 0
@@ -330,6 +420,11 @@ describe("BackgroundManager", () => {
     expect(task.retries).toBe(1)
     expect(task.model).toEqual(SESSION_MODEL)
     expect(childSessions.size).toBe(2)
+    // 旧子会话仅 abort 不删除，会留在 TUI 导航组——重试标题必须带序号区分
+    const retryTitle = Array.from(childSessions.values())
+      .map((session) => session.title)
+      .find((title) => title.includes("(prism, retry"))
+    expect(retryTitle).toBe(`[${task.id}] retry me (prism, retry 1)`)
   })
 
   test("second failure after the retry budget marks the task as error", async () => {
@@ -445,7 +540,7 @@ describe("BackgroundManager", () => {
     expect(task.status).toBe("completed")
   })
 
-  test("a batch shows one start toast and one terminal toast", async () => {
+  test("a batch shows one start toast and a summary settle toast", async () => {
     const { manager, toasts } = createManager()
     const taskA = await manager.launch({ description: "A", prompt: "a", parentSessionId: "parent" })
     const taskB = await manager.launch({ description: "B", prompt: "b", parentSessionId: "parent" })
@@ -454,13 +549,97 @@ describe("BackgroundManager", () => {
     manager.handleEvent({ type: "session.idle", properties: { sessionID: taskA.sessionId } })
     await new Promise((resolve) => setTimeout(resolve, 30))
     // A alone finishing must not toast (B still running)
-    expect(toasts.filter((t) => t.message.includes("COMPLETED"))).toHaveLength(0)
+    expect(toasts.filter((t) => t.message.includes("Started"))).toHaveLength(1)
+    expect(toasts.filter((t) => t.message.includes("成功"))).toHaveLength(0)
 
     manager.handleEvent({ type: "session.idle", properties: { sessionID: taskB.sessionId } })
     await new Promise((resolve) => setTimeout(resolve, 100))
-    const messages = toasts.map((t) => t.message)
-    expect(messages.filter((m) => m.includes("Started"))).toHaveLength(1)
-    expect(messages.filter((m) => m.includes("COMPLETED"))).toHaveLength(1)
+    // Settle summarizes the whole batch: the last-settling task's status must
+    // not leak into the toast (regression — it used to read "COMPLETED: B").
+    const settle = toasts.find((t) => t.message.includes("全部后台任务已结束"))
+    expect(settle?.message).toContain("2 成功")
+    expect(settle?.variant).toBe("success")
+    expect(toasts.filter((t) => t.message.includes("COMPLETED"))).toHaveLength(0)
+  })
+
+  test("a mixed batch toasts the failure with its reason, then settles with an error summary", async () => {
+    const { manager, toasts, client } = createManager()
+    const original = client.session.promptAsync.bind(client.session)
+    client.session.promptAsync = async (...args: Parameters<PrismClient["session"]["promptAsync"]>) => {
+      const parts = (args[0].body as { parts?: Array<{ text?: string }> }).parts ?? []
+      const text = parts.map((part) => part.text ?? "").join("\n")
+      if (text.includes("boom")) throw new Error("rate limit exceeded")
+      return original(...args)
+    }
+    const taskA = await manager.launch({ description: "A", prompt: "boom", parentSessionId: "parent" })
+    const taskB = await manager.launch({ description: "B", prompt: "fine", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(taskA.status).toBe("error")
+
+    // Mid-batch failure: urgent per-task toast carrying the provider reason
+    const failureToast = toasts.find((t) => t.message.includes("ERROR"))
+    expect(failureToast?.message).toContain("A")
+    expect(failureToast?.message).toContain("rate limit exceeded")
+    expect(failureToast?.variant).toBe("error")
+
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: taskB.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    // The settle toast must reflect the WHOLE batch (red), not the green
+    // per-task "COMPLETED: B" the old implementation produced.
+    const settle = toasts.find((t) => t.message.includes("全部后台任务已结束"))
+    expect(settle?.message).toContain("1 成功")
+    expect(settle?.message).toContain("1 失败")
+    expect(settle?.variant).toBe("error")
+    expect(toasts.some((t) => t.message.includes("COMPLETED"))).toBe(false)
+  })
+
+  test("mid-batch cancellation toasts coalesce inside the window; the summary still counts them", async () => {
+    const { manager, toasts } = createManager()
+    const taskA = await manager.launch({ description: "A", prompt: "a", parentSessionId: "parent" })
+    const taskB = await manager.launch({ description: "B", prompt: "b", parentSessionId: "parent" })
+    const taskC = await manager.launch({ description: "C", prompt: "c", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    await manager.cancelTask(taskA.id)
+    await manager.cancelTask(taskB.id) // inside the coalesce window: suppressed
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(toasts.filter((t) => t.message.includes("CANCELLED"))).toHaveLength(1)
+
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: taskC.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    const settle = toasts.find((t) => t.message.includes("全部后台任务已结束"))
+    expect(settle?.message).toContain("1 成功")
+    expect(settle?.message).toContain("2 取消")
+    expect(settle?.variant).toBe("warning")
+  })
+
+  test("a single failing task keeps the per-task toast and appends the reason", async () => {
+    const { manager, toasts, client } = createManager()
+    const original = client.session.promptAsync.bind(client.session)
+    client.session.promptAsync = async (...args: Parameters<PrismClient["session"]["promptAsync"]>) => {
+      // children fail (both launch attempts, exhausting the retry budget);
+      // the parent wake must go through
+      if (args[0].path.id !== "parent") throw new Error("quota exhausted")
+      return original(...args)
+    }
+    await manager.launch({ description: "doomed", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    const errorToasts = toasts.filter((t) => t.message.includes("ERROR"))
+    expect(errorToasts).toHaveLength(1)
+    expect(errorToasts[0]!.message).toContain("doomed")
+    expect(errorToasts[0]!.message).toContain("quota exhausted")
+    expect(errorToasts[0]!.variant).toBe("error")
+  })
+
+  test("cancelTask with skipNotification silences both the toast and the parent injection", async () => {
+    const { manager, toasts, gate } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await manager.cancelTask(task.id, { skipNotification: true })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(task.status).toBe("cancelled")
+    expect(toasts.filter((t) => t.message.includes("CANCELLED"))).toHaveLength(0)
+    expect(gate.hasRecentDispatch("parent")).toBe(false)
   })
 
   test("cancel toast uses the warning variant", async () => {
@@ -899,7 +1078,7 @@ describe("BackgroundManager", () => {
         flipped = true
         task.status = "running"
         task.sessionId = "child_retry"
-        childSessions.set("child_retry", { parentID: "parent", prompts: [], aborted: false })
+        childSessions.set("child_retry", { parentID: "parent", title: "retry", prompts: [], aborted: false })
       }
       return originalStatus()
     }

@@ -82,6 +82,7 @@ src/
 - **Runtime**：纯 Bun 环境（`bun test` / `bun run typecheck` / `bun run build`）。
 - **TypeScript**：Strict 模式，开启 `noUncheckedIndexedAccess`，必须使用 `verbatimModuleSyntax`（类型导入统一用 `import type`）。
 - **提交规范**：Conventional Commits（`feat:`, `fix:`, `chore:`, `release:`），无语言强制（仓库现状为中文）。
+- **禁止自动提交**：代码实现、修复或审查收尾即止，**未经用户在当前指令中明确要求，Agent 不得执行 `git commit`**（push 同理）。完成标志是"代码 + 测试 + QA 证据 + 文档就绪、工作区留待用户检视"，提交时机、拆分方式与提交信息由用户决定；用户要求提交时才按上述提交规范执行。
 
 ### 常用命令速查
 ```bash

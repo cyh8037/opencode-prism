@@ -26,6 +26,13 @@ describe("createBgCommand", () => {
     const template = createBgCommand(false).template
     expect(template).not.toContain("vision_look")
   })
+
+  test("includes the native child-session navigation guidance", () => {
+    const template = createBgCommand(true).template
+    expect(template).toContain("TUI 中按 leader 键（默认 Ctrl+X）")
+    expect(template).toContain("[bg_ 任务 id] 开头")
+    expect(template).toContain("不要通过反复调用 bg_output 轮询过程")
+  })
 })
 
 describe("createSplitCommand", () => {
@@ -35,6 +42,13 @@ describe("createSplitCommand", () => {
     expect(template).toContain("保留分层结构与依赖标注")
     expect(template).toContain("不要添加 emoji")
     expect(template).toContain("不要自行合并行")
+  })
+
+  test("relays the intent verdict instead of retrying and includes the navigation guidance", () => {
+    const template = createSplitCommand(true).template
+    expect(template).toContain("意图识别：无需拆分")
+    expect(template).toContain("split.intentCheck=false")
+    expect(template).toContain("TUI 中按 leader 键（默认 Ctrl+X）")
   })
 })
 

@@ -180,6 +180,8 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
     gate,
     registry: splitRegistry,
     resolvePlannerModel: (sessionID) => resolveModel(sessionID),
+    // 插件加载时读取，切换需重启 opencode（与 background.autoTrigger 同模式）。
+    intentCheckEnabled: config.split.intentCheck,
   })
 
   return {
@@ -219,7 +221,9 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
         directory,
       }),
       // Read once at plugin load: toggling it requires restarting opencode.
-      ...(config.split.tool ? createSplitTool(splitService) : {}),
+      // autoTrigger 与 vision.enabled 同模式：true 时 split_task 的描述拼接
+      // "自主触发准则"，模型可主动拆分；关闭时回退旧描述。
+      ...(config.split.tool ? createSplitTool(splitService, { autoTrigger: config.split.autoTrigger }) : {}),
       // vision.enabled gates registration the same way split.tool does: a
       // disabled feature must not leave a tool the model can call and fail
       // with, and children (whose prompts prism builds) lose vision_look too.

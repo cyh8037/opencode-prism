@@ -16,13 +16,13 @@ function createHook(options: {
   sendResult?: SendResult | Error
   cancelled?: boolean
   registry?: SplitRunRegistry
-  onCancelTask?: (taskID: string) => Promise<boolean>
+  onCancelTask?: (taskID: string, options?: { skipNotification?: boolean }) => Promise<boolean>
 }): { hook: ReturnType<typeof createCommandExecuteBeforeHook>; toasts: string[] } {
   const manager = {
     getTasksByParentSession: () => options.tasks,
     getTask: (id: string) => options.tasks.find((task) => task.id === id),
-    cancelTask: async (taskID: string) => {
-      if (options.onCancelTask) return options.onCancelTask(taskID)
+    cancelTask: async (taskID: string, cancelOptions?: { skipNotification?: boolean }) => {
+      if (options.onCancelTask) return options.onCancelTask(taskID, cancelOptions)
       return options.cancelled ?? true
     },
     cancelAllByParentSession: async () => {},
@@ -174,18 +174,20 @@ describe("/bg command routing", () => {
       settled: false,
       createdAt: new Date(),
     })
-    const cancelledIds: string[] = []
-    const { hook } = createHook({
+    const cancelledCalls: Array<{ id: string; skipNotification?: boolean }> = []
+    const { hook, toasts } = createHook({
       tasks: [running, done],
       registry,
-      onCancelTask: async (taskID) => {
-        cancelledIds.push(taskID)
+      onCancelTask: async (taskID, cancelOptions) => {
+        cancelledCalls.push({ id: taskID, skipNotification: cancelOptions?.skipNotification })
         return true
       },
     })
     const text = await run(hook, "split", `cancel ${runID}`)
-    expect(cancelledIds).toEqual(["bg_r1"]) // completed 跳过
+    expect(cancelledCalls).toEqual([{ id: "bg_r1", skipNotification: true }]) // completed 跳过
     expect(text).toContain(`已取消拆分任务 \`${runID}\` 的 1 个子任务`)
+    // 整批取消只弹一条汇总 toast（防逐任务 CANCELLED 刷屏）
+    expect(toasts.some((t) => t.includes(`已取消拆分任务 \`${runID}\` 的 1 个子任务`))).toBe(true)
   })
 
   test("/bg status bg_xxx shows the single task as a table even when finished", async () => {

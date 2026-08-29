@@ -4,6 +4,7 @@ import { log } from "../../shared/log"
 import type { BackgroundManager } from "../background/manager"
 import type { PrismClient } from "../client-types"
 import type { PromptGate } from "../prompt-gate"
+import { checkSplitIntent, sanitizeIntentReason, type SplitIntent } from "./intent"
 import type { SubTaskPlan } from "./plan-schema"
 import { planSplit } from "./planner"
 import { layerPlans } from "./scheduler"
@@ -17,6 +18,8 @@ export interface SplitServiceDeps {
   gate: PromptGate
   registry: SplitRunRegistry
   resolvePlannerModel: (sessionID: string) => Promise<ResolvedModel | undefined>
+  /** config.split.intentCheck（插件加载时读取）：开启时拆分前先做意图判定。 */
+  intentCheckEnabled?: boolean
   logger?: typeof log
 }
 
@@ -29,7 +32,7 @@ export interface SplitRequest {
 }
 
 export interface SplitOutcome {
-  kind: "dry-run" | "launched" | "planner-failed" | "unresolvable-planner-model"
+  kind: "dry-run" | "launched" | "planner-failed" | "unresolvable-planner-model" | "skipped-intent"
   message: string
   run?: SplitRunResult
 }
@@ -57,6 +60,36 @@ export class SplitService {
       return {
         kind: "unresolvable-planner-model",
         message: "无法确定主会话的当前模型，规划器无法启动",
+      }
+    }
+
+    // 意图判定（config.split.intentCheck）：direct 一律返回 skipped-intent，
+    // dry-run 同入口（消息注明是预览判定，没有计划可展示）。checkSplitIntent
+    // 自身 fail-open（任何失败视为可拆分），这里的 try/catch 只是兜住意外的
+    // 同步 throw —— 两层都不得让意图识别成为 /split 的可用性单点。
+    if (this.deps.intentCheckEnabled) {
+      let intent: SplitIntent = { intent: "split" }
+      try {
+        intent = await checkSplitIntent({
+          client: this.deps.client,
+          directory: this.deps.directory,
+          parentSessionID: request.sessionID,
+          task: request.task,
+          model: plannerModel,
+        })
+      } catch (error) {
+        this.logger("[prism] split: intent check threw; failing open", { error })
+      }
+      if (intent.intent === "direct") {
+        const reason = sanitizeIntentReason(intent.reason)
+        const preview = request.dryRun ? "（预览判定，未执行）" : ""
+        return {
+          kind: "skipped-intent",
+          message:
+            `意图识别：该任务无需拆分${reason ? `（${reason}）` : ""}。${preview}`
+            + "建议直接执行；确认要拆分可补充任务细节后重试，"
+            + "或设置 split.intentCheck=false（需重启 opencode）。",
+        }
       }
     }
 
@@ -190,7 +223,7 @@ export class SplitService {
 
     return {
       kind: "launched",
-      message: `拆分计划已启动：${plans.length} 个子任务，按依赖分层并发执行。子任务进度通过 toast 展示，全部完成后会收到汇总通知。`,
+      message: `拆分计划已启动：${plans.length} 个子任务，按依赖分层并发执行。子任务进度可通过 TUI 子会话导航（leader 键+↓ 进入）与 /split status 查看；全部结束后汇总报告回注主会话。`,
       run,
     }
   }

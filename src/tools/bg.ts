@@ -1,5 +1,5 @@
 import { tool, type ToolDefinition } from "@opencode-ai/plugin"
-import { BG_WAIT_DEFAULT_MS, BG_WAIT_MAX_MS, MAX_IMAGES_PER_BATCH } from "../config/constants"
+import { BG_SESSION_NAV_HINT, BG_WAIT_DEFAULT_MS, BG_WAIT_MAX_MS, MAX_IMAGES_PER_BATCH } from "../config/constants"
 import type { BackgroundManager } from "../core/background/manager"
 import type { PrismClient } from "../core/client-types"
 import { extractImageParts, type ImageAttachment } from "../core/vision/detector"
@@ -102,7 +102,13 @@ export function createBgTools(
             agent: args.agent,
           })
           const model = task.model ? `模型 ${task.model.providerID}/${task.model.modelID}` : ""
-          return `后台任务已入队: \`${task.id}\` (${task.description}) ${model}\n用 bg_output("${task.id}") 查询结果，bg_cancel("${task.id}") 取消。`
+          return (
+            `后台任务已入队: \`${task.id}\` (${task.description}) ${model}\n`
+            + `用 bg_output("${task.id}") 查询结果，bg_cancel("${task.id}") 取消。\n`
+            // 键位为 TUI 默认值（用户可覆盖），措辞用"启动后"——返回时任务
+            // 实为 queued，尚未开始产生输出。
+            + `启动后可${BG_SESSION_NAV_HINT}。`
+          )
         } catch (error) {
           return `后台任务启动失败: ${error instanceof Error ? error.message : String(error)}`
         }

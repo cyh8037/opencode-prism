@@ -8,6 +8,7 @@
 // 序列在终端不占列宽,不清除会算进 padEndWidth 导致整行错位。
 import { getStringWidth, padEndWidth, truncateWidth } from "../shared/width"
 import { sanitizeSystemReminder } from "../../shared/sanitize"
+import { BG_SESSION_NAV_HINT, MAX_SESSION_TITLE_CHARS } from "../../config/constants"
 import type { BgTask } from "./types"
 
 /** 单字段渲染管线:sanitize(模板逃逸)→ ANSI 整序列剥离 → 换行压平 → 控制字符剥离。
@@ -192,6 +193,9 @@ export function renderBgDashboard(
     // 注释行不参与表格对齐,可完整显示超宽内容(不截断)。
     lines.push(`Pool: ${pool.map((p) => `${p.key} ${p.active}/${p.limit}`).join(", ")}`)
   }
+  // 注释行(不参与对齐):子会话实时查看指引。只在 /bg status 看板出现,
+  // 不进 renderCompactDashboard——完成通知不应被固定文案污染。
+  lines.push(BG_SESSION_NAV_HINT)
   return lines.join("\n")
 }
 
@@ -219,4 +223,25 @@ function sliceChars(text: string, max: number): string {
   const sliced = text.slice(0, max)
   const last = sliced.charCodeAt(sliced.length - 1)
   return last >= 0xd800 && last <= 0xdbff ? sliced.slice(0, -1) : sliced
+}
+
+/** 清洗并截断不可信文本（description/reason 等）：复用单元格管线（模板逃逸
+ *  → ANSI 整序列剥离 → 换行压平 → 控制字符剥离）后按 UTF-16 码元截断，
+ *  不会切出半个代理对。 */
+export function sanitizeTruncate(text: string, maxChars: number): string {
+  return sliceChars(sanitizeCell(text), maxChars)
+}
+
+/** 子会话标题：task id 前缀供 TUI 子会话导航（←/→ 切换）时对号；description
+ *  来自父会话模型输出（不可信文本），走清洗管线并截断。导航视图约按 50 列
+ *  显示标题，前缀必须放头部才不会被截断吃掉。retries > 0 时追加 retry 序号
+ *  ——同模型重试会以同一 task.id 重建子会话（旧会话仅 abort 不删除，长期
+ *  留在导航组），无序号则新旧标题完全相同、无法对号。
+ *  版本行为依赖：导航视图的标题截断宽度与 parentID 分组经 opencode
+ *  1.15.0 / 1.18.25 二进制验证一致。 */
+export function buildChildSessionTitle(taskId: string, description: string, retries = 0): string {
+  const cleaned = sanitizeTruncate(description, MAX_SESSION_TITLE_CHARS).trim()
+  if (!cleaned) return `[${taskId}]${retries > 0 ? ` (prism, retry ${retries})` : " (prism)"}`
+  const suffix = retries > 0 ? ` (prism, retry ${retries})` : " (prism)"
+  return `[${taskId}] ${cleaned}${suffix}`
 }

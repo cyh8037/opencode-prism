@@ -22,10 +22,10 @@ import { errorInfoFromResult } from "../../shared/api-result"
 import { log } from "../../shared/log"
 import { sanitizeSystemReminder } from "../../shared/sanitize"
 import { collectAssistantText } from "../assistant-text"
-import type { PrismClient } from "../client-types"
+import type { PrismClient, ToastVariant } from "../client-types"
 import type { PromptGate } from "../prompt-gate"
 import { ConcurrencyManager } from "./concurrency"
-import { renderCompactDashboard } from "./visualizer"
+import { buildChildSessionTitle, renderCompactDashboard, sanitizeTruncate } from "./visualizer"
 import type { BgTask, LaunchInput, QueueItem, SessionStatusMap } from "./types"
 
 // Resolve the model a child session should use. Implementations read the
@@ -49,6 +49,11 @@ interface ForwardedEvent {
 }
 
 const TERMINAL_STATUSES = new Set<BgTask["status"]>(["completed", "error", "cancelled"])
+
+// Mid-batch failure toasts inside this window per parent session are
+// suppressed (a cascade — provider outage, mass failure — must not flood the
+// TUI); the settle summary toast and the injected table still report them.
+const FAILURE_TOAST_COALESCE_MS = 8_000
 
 function resolveEventSessionID(properties: Record<string, unknown> | undefined): string | undefined {
   if (!properties) return undefined
@@ -107,6 +112,9 @@ export class BackgroundManager {
   private shutdownTriggered = false
   /** Running tasks already warned about exceeding the TTL (warn once). */
   private ttlWarned = new Set<string>()
+  /** Per parent session: timestamp of the last mid-batch failure toast
+   *  (failure toasts inside FAILURE_TOAST_COALESCE_MS are suppressed). */
+  private lastFailureToastAtByParent = new Map<string, number>()
   private logger: typeof log
 
   constructor(private deps: BackgroundManagerDeps) {
@@ -177,14 +185,21 @@ export class BackgroundManager {
 
   // Tool filters for child prompts. The nested bg_* tools and question are
   // always disabled (they would recurse or block on a non-interactive
-  // child); vision_look is removed too when the vision feature is disabled
-  // entirely, so bg_spawn's read-image guidance never points at a dead tool.
+  // child); split_task too — with split.autoTrigger its description carries
+  // proactive-trigger guidance, and a nested run would register under the
+  // child session (invisible to the parent's /split status), dispatch its
+  // report into a soon-aborted session and bypass this task's circuit
+  // breaker. Same face the vision sync child closes via
+  // VISION_CHILD_TOOL_FILTERS. vision_look is removed too when the vision
+  // feature is disabled entirely, so bg_spawn's read-image guidance never
+  // points at a dead tool.
   private childToolFilters(): Record<string, boolean> {
     return {
       bg_spawn: false,
       bg_cancel: false,
       bg_send: false,
       bg_wait: false,
+      split_task: false,
       question: false,
       ...(this.deps.config.vision.enabled ? {} : { vision_look: false }),
     }
@@ -313,7 +328,7 @@ export class BackgroundManager {
     const createResult = await this.deps.client.session.create({
       body: {
         parentID: input.parentSessionId,
-        title: `${input.description} (prism)`,
+        title: buildChildSessionTitle(task.id, input.description, task.retries),
         model: {
           id: model.modelID,
           providerID: model.providerID,
@@ -418,7 +433,7 @@ export class BackgroundManager {
   // TUI is unavailable (missing API or non-TUI mode). The optional call is
   // essential — a missing showToast would otherwise throw a sync TypeError
   // that .catch() cannot catch.
-  private showToast(title: string, message: string, variant: string, duration: number): void {
+  private showToast(title: string, message: string, variant: ToastVariant, duration: number): void {
     const toast = this.deps.client.tui.showToast?.({ body: { title, message, variant, duration } })
     if (toast) {
       void toast.catch((error) => {
@@ -667,10 +682,14 @@ export class BackgroundManager {
       // (role lives on the message), so the assistant text is read from the
       // message history right before the task completes. ALL completed
       // assistant texts are joined (capped) so multi-turn children keep
-      // their intermediate conclusions.
-      if (task && !task.resultText) {
-        const text = collectAssistantText(messages, MAX_NOTIFICATION_RESULT_CHARS)
-        if (text) task.resultText = text
+      // their intermediate conclusions. This capture ALWAYS overwrites the
+      // event-path value — including clearing it when the history holds no
+      // completed assistant text (e.g. a tool-only ending): the event path
+      // records any non-synthetic text part, which since TUI child-session
+      // navigation includes the user's own typed input in the child, and
+      // that must never be reported as the task's result.
+      if (task) {
+        task.resultText = collectAssistantText(messages, MAX_NOTIFICATION_RESULT_CHARS) ?? undefined
       }
 
       return messages.some((message) => {
@@ -1207,6 +1226,49 @@ export class BackgroundManager {
     return task
   }
 
+  // Terminal toasts, keyed off notifyParent's settle condition. The settle
+  // path (allComplete) summarizes the WHOLE parent task set — its message
+  // must not borrow the last-settling task's identity: in a mixed batch the
+  // old single-task toast read as a green "success" even when siblings had
+  // failed. The mid-batch failure path stays per-task (it is the urgent,
+  // actionable signal) but coalesces repeats inside a short window so a
+  // cascade cannot flood the TUI — the settle summary still reports counts.
+  private showTerminalToast(task: BgTask, siblingTasks: BgTask[], allComplete: boolean): void {
+    if (allComplete && siblingTasks.length > 1) {
+      const ok = siblingTasks.filter((t) => t.status === "completed").length
+      const bad = siblingTasks.filter((t) => t.status === "error").length
+      const cancelled = siblingTasks.length - ok - bad
+      const parts = [`${ok} 成功`, `${bad} 失败`]
+      if (cancelled > 0) parts.push(`${cancelled} 取消`)
+      this.showToast(
+        "Prism background task",
+        `全部后台任务已结束: ${parts.join(", ")}`,
+        bad > 0 ? "error" : cancelled > 0 ? "warning" : "success",
+        5000,
+      )
+      this.lastFailureToastAtByParent.delete(task.parentSessionId)
+      return
+    }
+    if (!allComplete) {
+      const now = Date.now()
+      const last = this.lastFailureToastAtByParent.get(task.parentSessionId)
+      if (last !== undefined && now - last < FAILURE_TOAST_COALESCE_MS) return
+      this.lastFailureToastAtByParent.set(task.parentSessionId, now)
+    }
+    // task.error carries the provider/API reason for both error and
+    // cancelled (finalizeTask writes the reason there) — surface a cleaned
+    // excerpt so the toast is actionable without waiting for the injection.
+    const reason = (task.error ?? "").trim()
+    const suffix = reason ? `: ${sanitizeTruncate(reason, 80)}` : ""
+    const variant = task.status === "completed" ? "success" : task.status === "cancelled" ? "warning" : "error"
+    this.showToast(
+      "Prism background task",
+      `${task.status.toUpperCase()}: ${task.description} (${task.id})${suffix}`,
+      variant,
+      5000,
+    )
+  }
+
   private notifyParent(task: BgTask): Promise<void> {
     return this.enqueueNotificationForParent(task.parentSessionId, async () => {
       const remaining = this.getTasksByParentSession(task.parentSessionId).filter(
@@ -1220,14 +1282,8 @@ export class BackgroundManager {
       // joins the same condition: one terminal toast per task would flood the
       // TUI on batches (/split, --parallel).
       if (allComplete || isFailure) {
-        const variant = task.status === "completed" ? "success" : task.status === "cancelled" ? "warning" : "error"
-        this.showToast(
-          "Prism background task",
-          `${task.status.toUpperCase()}: ${task.description} (${task.id})`,
-          variant,
-          5000,
-        )
         const siblingTasks = this.getTasksByParentSession(task.parentSessionId)
+        this.showTerminalToast(task, siblingTasks, allComplete)
 
         // Single completed task: inject the FULL result into the parent
         // conversation — a truncated preview leaves the model reporting
@@ -1457,6 +1513,11 @@ export class BackgroundManager {
         this.ttlWarned.delete(task.id)
         this.removeTask(task)
       }
+    }
+    // Failure-toast timestamps for parents with no tasks left (session
+    // deleted, everything pruned) have no batch left to coalesce for.
+    for (const parent of this.lastFailureToastAtByParent.keys()) {
+      if (!this.tasksByParentSession.get(parent)?.size) this.lastFailureToastAtByParent.delete(parent)
     }
   }
 
