@@ -44,6 +44,30 @@ describe("detector", () => {
     ])
     expect(images).toHaveLength(1)
   })
+
+  test("skips junk entries but keeps valid siblings", () => {
+    const images = extractImageAttachments({
+      attachments: ["junk", null, 42, { mime: "image/webp", url: "https://x/w.webp" }],
+    })
+    expect(images).toHaveLength(1)
+    expect(images[0]?.mime).toBe("image/webp")
+    expect(extractImageParts([null, "junk", { type: "file", mime: "image/gif", url: "https://x/g.gif" }])).toEqual([
+      { mime: "image/gif", url: "https://x/g.gif" },
+    ])
+  })
+
+  test("drops a non-string filename without rejecting the attachment", () => {
+    const images = extractImageAttachments({
+      attachments: [{ mime: "image/png", url: "https://x/s.png", filename: 42 }],
+    })
+    expect(images).toEqual([{ mime: "image/png", url: "https://x/s.png" }])
+  })
+
+  test("returns empty for non-array attachments/parts", () => {
+    expect(extractImageAttachments({ attachments: "junk" })).toEqual([])
+    expect(extractImageAttachments({})).toEqual([])
+    expect(extractImageParts("junk")).toEqual([])
+  })
 })
 
 // Minimal payload carrying a real PNG magic-byte signature. The size check

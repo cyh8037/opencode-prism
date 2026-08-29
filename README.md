@@ -3,8 +3,9 @@
 OpenCode 插件：视觉自动解读、后台并行 Agent、复杂任务拆分。
 
 - **视觉解读**：工具输出里的图片自动解读并追加到工具输出（落会话历史）；`vision_look` 工具手动解读任意图片（URL / 本地路径 / 会话贴图），支持 `goal` 关注点。未配置模型时继承主会话当前模型
-- **后台并行**：`/bg` 命令与 `bg_*` 工具在独立子会话并行执行（继承主会话模型）；支持图片附件自动跟随、中途投递补充指令（`bg_send`）、续跑已结束任务、阻塞等待（`bg_wait`）；完成通知与结果自动回注主会话
-- **任务拆分**：`/split` 命令（经主模型调用 `split_task` 工具执行，输入后立即流式反馈）与 `split_task` 工具把复杂任务拆成带依赖的子任务图，各任务在依赖满足后立即启动（ASAP，不等整波），全部完成后汇总回注
+- **后台并行**：`/bg` 命令（插件原生直接执行，输入即确定性回执）与 `bg_*` 工具在独立子会话并行执行（继承主会话模型）；支持图片附件自动跟随、中途投递补充指令（`bg_send`）、续跑已结束任务、阻塞等待（`bg_wait`）；完成通知与结果自动回注主会话
+- **任务拆分**：`/split` 命令（插件原生异步调度，意图判定与规划不占主会话回合，计划与结果自动注入）与 `split_task` 工具把复杂任务拆成带依赖的子任务图，各任务在依赖满足后立即启动（ASAP，不等整波），全部完成后汇总回注
+- **双端对齐看板**：`/bg status`、`/split status` 与完成通知中的状态看板输出为 markdown 管道表格——TUI 等宽终端按字符对齐，web 前端由 GFM 解析为 HTML 表格（不依赖字体比例，含中文也不错位）；纯分层文本（dry-run 计划、run 明细）仍包 ` ```text ` 围栏保形
 
 ## 安装
 
@@ -93,13 +94,13 @@ OpenCode 插件：视觉自动解读、后台并行 Agent、复杂任务拆分�
 
 ### 后台并行任务
 
-**启动与管理**：
+**启动与管理**：`/bg <任务描述>` 由插件**原生直接执行**（不再经过主模型回合）——启动即返回确定的任务回执，消除模型不调工具的不确定性；`--parallel N` 是唯一例外（语义拆分需要模型，见下）。
 
 ```text
-/bg 重构 auth 模块并补齐单测                 # 启动一个后台子会话（继承主会话模型）
-/bg 调研三个竞品的定价 --parallel 3          # 拆 3 个并行子任务
+/bg 重构 auth 模块并补齐单测                 # 原生启动一个后台子会话（继承主会话模型），回执即任务 id
+/bg 调研三个竞品的定价 --parallel 3          # 拆 3 个并行子任务（唯一由模型拆分并并行调用 bg_spawn 的分支）
 /bg 分析当前架构图 [附贴图/截图]              # 自动携带当前消息图片附件至子会话，子任务用 vision_look 读图
-/bg status                                  # 当前会话任务看板（严格字符对齐，进行中在上，已结束折叠为摘要）
+/bg status                                  # 当前会话任务看板（markdown 管道表格：TUI 字符对齐，web 端渲染为 HTML 表格）
 /bg status --all                           # 展开已结束历史任务
 /bg status bg_xxxx                         # 单个任务的独立看板明细
 /bg output bg_ab12cd34                      # 查看结果与错误信息
@@ -108,18 +109,18 @@ OpenCode 插件：视觉自动解读、后台并行 Agent、复杂任务拆分�
 /bg cancel                                  # 取消当前会话的全部任务
 ```
 
-**纯文本对齐看板**（`/bg status` 示例）：
+**看板**（`/bg status` 示例；markdown 管道表格——TUI 等宽终端字符对齐，web 前端 GFM 渲染为 HTML 表格）：
 
 ```text
-[prism background] 2 running, 1 queued
+PRISM BACKGROUND TASKS (Running: 2, Queued: 1)
+| ID          | Description      | Status     | Duration | Progress |
+| ----------- | ---------------- | ---------- | -------- | -------- |
+| bg_a1b2c3d4 | 重构 auth 模块   | RUNNING    | 42s      | 12 calls |
+| bg_e5f6g7h8 | 跑全量 E2E 测试  | RUNNING    | 18s      | 3 calls  |
+| bg_j9k0l1m2 | 压测网关性能     | QUEUED     | -        | queued   |
 
-  ID          TASK                 STATUS     TIME   TOOLS   MODEL
-  bg_a1b2c3d4 重构 auth 模块       RUNNING     42s   12      anthropic/claude-3-7-sonnet
-  bg_e5f6g7h8 跑全量 E2E 测试      RUNNING     18s    3      anthropic/claude-3-7-sonnet
-  bg_j9k0l1m2 压测网关性能         QUEUED       -     -      anthropic/claude-3-7-sonnet
-
-  + 3 已结束: 2 COMPLETED, 1 CANCELLED (使用 /bg status --all 查看全部)
-  Pool: anthropic/claude-3-7-sonnet: 2/5 running
++ 3 已结束: 2 COMPLETED, 1 CANCELLED (使用 /bg status --all 查看全部)
+Pool: anthropic/claude-3-7-sonnet: 2/5 running
 ```
 
 **中途投递与续跑（steering）**：
@@ -151,8 +152,10 @@ OpenCode 插件：视觉自动解读、后台并行 Agent、复杂任务拆分�
 
 ### 任务拆分
 
+`/split <任务描述>` 由插件**原生异步调度**：输入后立即回执，意图判定与规划在插件管理的一次性子会话中进行（不占用主会话回合），计划与执行结果自动注入会话；`split_task` 工具仍保留供模型自主触发。
+
 ```text
-/split 把首页迁移到新设计系统 --dry-run      # 只看计划：按依赖分波展示，不执行
+/split 把首页迁移到新设计系统 --dry-run      # 只看计划：按依赖分波展示，不执行（计划注入会话后等用户确认）
 /split 把首页迁移到新设计系统               # 规划 → 按依赖并发执行 → 完成后汇总回注
 /split 大重构 --sequential                  # 串行执行（按计划顺序逐个启动）
 /split 大重构 --max 6                       # 子任务数上限（2-12，越界自动钳制）

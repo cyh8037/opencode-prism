@@ -2,6 +2,7 @@ import { MAX_IMAGES_PER_BATCH, VISION_SYNC_TIMEOUT_MS } from "../../config/const
 import type { PrismConfig } from "../../config/schema"
 import type { ResolvedModel } from "../../models"
 import { log } from "../../shared/log"
+import { parseSessionMessages } from "../../shared/session-data"
 import type { BackgroundManager } from "../background/manager"
 import type { PrismClient } from "../client-types"
 import type { ImageAttachment } from "./detector"
@@ -225,15 +226,15 @@ export class VisionPipeline {
       this.logger("[prism] vision: failed to fetch session messages for 'last'", { sessionID, error })
       return { text: null, reason: "internal-error", notFound: false }
     }
-    if (Array.isArray(messages)) {
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const parts = (messages[i] as { parts?: unknown }).parts
-        const images = extractImageParts(parts)
-        if (images.length > 0) {
-          const { batch } = this.capBatch(images)
-          const result = await this.interpretWithFallback(sessionID, batch, goal)
-          return { ...result, notFound: false }
-        }
+    const parsed = parseSessionMessages(messages)
+    for (let i = parsed.length - 1; i >= 0; i--) {
+      const message = parsed[i]
+      if (!message) continue
+      const images = extractImageParts(message.parts)
+      if (images.length > 0) {
+        const { batch } = this.capBatch(images)
+        const result = await this.interpretWithFallback(sessionID, batch, goal)
+        return { ...result, notFound: false }
       }
     }
     return { text: null, reason: null, notFound: true }

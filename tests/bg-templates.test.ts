@@ -1,25 +1,35 @@
 import { describe, expect, test } from "bun:test"
 import { createBgCommand, createSplitCommand } from "../src/commands/templates"
-import { collectLatestUserImages } from "../src/tools/bg"
+import { collectLatestUserImages } from "../src/core/background/image-follow"
 
 describe("createBgCommand", () => {
-  test("tells the model to relay injected dashboards verbatim (no rewrite, no emoji)", () => {
+  test("tells the model to relay injected results completely (no omission, no rewrite, no tools)", () => {
     const template = createBgCommand(true).template
-    expect(template).toContain("原样转达")
-    expect(template).toContain("保留表格与分层格式")
+    expect(template).toContain("完整转达")
+    expect(template).toContain("不要省略、压缩或重排")
+    expect(template).toContain("不要调用任何工具")
     expect(template).toContain("不要改写为列表")
     expect(template).toContain("不要添加 emoji")
+    expect(template).toContain("不要重复执行任务")
   })
 
-  test("image guidance reflects automatic attachment forwarding", () => {
-    const template = createBgCommand(true).template
-    expect(template).toContain("插件会自动把当前消息中的图片附件传给后台子会话")
+  test("does NOT contain $ARGUMENTS — the model must never see the task description", () => {
+    // 防双发的关键：任务描述由插件原生消费，模型只看到回执。实测模板
+    // 回合曾出现模型拿到描述后不调工具自己开干。
+    expect(createBgCommand(true).template).not.toContain("$ARGUMENTS")
   })
 
-  test("old-image tasks are told to reference the image path explicitly", () => {
+  test("parallel branch hands the model an explicit spawn instruction", () => {
     const template = createBgCommand(true).template
-    expect(template).toContain("自动传图只跟随当前消息")
-    expect(template).toContain("写进 prompt")
+    expect(template).toContain("【并行启动")
+    expect(template).toContain("并行调用")
+    expect(template).toContain("绝不串行等待")
+  })
+
+  test("image guidance lives in the parallel branch and reflects automatic forwarding", () => {
+    const template = createBgCommand(true).template
+    expect(template).toContain("自动传给对应子会话")
+    expect(template).toContain("把文件路径写进该子任务的 prompt")
   })
 
   test("image guidance is dropped when vision is disabled", () => {
@@ -27,28 +37,48 @@ describe("createBgCommand", () => {
     expect(template).not.toContain("vision_look")
   })
 
-  test("includes the native child-session navigation guidance", () => {
-    const template = createBgCommand(true).template
+  test("includes the native child-session navigation guidance in TUI mode", () => {
+    const template = createBgCommand(true, true).template
     expect(template).toContain("TUI 中按 leader 键（默认 Ctrl+X）")
     expect(template).toContain("[bg_ 任务 id] 开头")
     expect(template).toContain("不要通过反复调用 bg_output 轮询过程")
   })
+
+  test("swaps the navigation guidance for tool-based equivalents outside TUI", () => {
+    const template = createBgCommand(true, false).template
+    expect(template).not.toContain("Ctrl+X")
+    expect(template).toContain("/bg status 或 bg_output 工具查看")
+  })
 })
 
 describe("createSplitCommand", () => {
-  test("tells the model to relay the DAG dashboard verbatim", () => {
+  test("tells the model to relay the dashboard completely and keep pipe-table structure", () => {
     const template = createSplitCommand(true).template
-    expect(template).toContain("原样转达")
+    expect(template).toContain("完整转达")
+    expect(template).toContain("不要省略、压缩或重排")
     expect(template).toContain("保留分层结构与依赖标注")
     expect(template).toContain("不要添加 emoji")
     expect(template).toContain("不要自行合并行")
+    expect(template).toContain("不要调用任何工具")
+    // 方案 a:markdown 管道表格,模型转达时必须保留 | 列分隔
+    expect(template).toContain("保留表格的 | 列分隔结构")
   })
 
   test("relays the intent verdict instead of retrying and includes the navigation guidance", () => {
-    const template = createSplitCommand(true).template
+    const template = createSplitCommand(true, true).template
     expect(template).toContain("意图识别：无需拆分")
     expect(template).toContain("split.intentCheck=false")
     expect(template).toContain("TUI 中按 leader 键（默认 Ctrl+X）")
+  })
+
+  test("does NOT contain $ARGUMENTS either", () => {
+    expect(createSplitCommand(true).template).not.toContain("$ARGUMENTS")
+  })
+
+  test("non-TUI mode swaps the navigation guidance", () => {
+    const template = createSplitCommand(true, false).template
+    expect(template).not.toContain("Ctrl+X")
+    expect(template).toContain("/split status 或 bg_output 查看")
   })
 })
 

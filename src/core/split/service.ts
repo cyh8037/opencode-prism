@@ -20,6 +20,8 @@ export interface SplitServiceDeps {
   resolvePlannerModel: (sessionID: string) => Promise<ResolvedModel | undefined>
   /** config.split.intentCheck（插件加载时读取）：开启时拆分前先做意图判定。 */
   intentCheckEnabled?: boolean
+  /** TUI 环境探测（插件加载时读取）：false 时子会话查看指引不含 TUI 键位。 */
+  tuiNavigation?: boolean
   logger?: typeof log
 }
 
@@ -194,27 +196,44 @@ export class SplitService {
             source: "split-aggregation",
             text,
           })
+
+        // 升级为 5 轮指数退避重试（覆盖最长 30+ 秒的主会话 busy 等待窗口）
+        const retryDelays = [1_000, 2_000, 4_000, 8_000, 16_000]
         let result = await dispatch()
-        if (result.status === "failed") {
-          // The aggregation is the only record of the whole run — callers do not
-          // re-enqueue, so give it one more chance after a pause.
-          this.logger("[prism] split: aggregation dispatch failed, retrying once", {
+        let attempt = 0
+        while (result.status === "failed" && attempt < retryDelays.length) {
+          const delay = retryDelays[attempt]!
+          this.logger("[prism] split: aggregation dispatch failed, retrying", {
             sessionID: request.sessionID,
+            attempt: attempt + 1,
+            delay,
             error: result.error,
           })
-          await new Promise((resolve) => setTimeout(resolve, 2_000))
+          await new Promise((resolve) => setTimeout(resolve, delay))
           result = await dispatch()
-          if (result.status === "failed") {
-            // The report is the only record of the SKIPPED plans (the per-task
-            // batch notices never mention unlaunched ones) — once it is lost to
-            // the parent conversation, the log file is the only place it can
-            // still be recovered from.
-            this.logger("[prism] split: aggregation dispatch failed permanently (report lost to chat, preserved below)", {
-              sessionID: request.sessionID,
-              error: result.error,
-              report: text,
-            })
-          }
+          attempt++
+        }
+
+        if (result.status === "failed") {
+          // The report is the only record of the SKIPPED plans (the per-task
+          // batch notices never mention unlaunched ones) — once it is lost to
+          // the parent conversation, the log file is the only place it can
+          // still be recovered from.
+          this.logger("[prism] split: aggregation dispatch failed permanently (report lost to chat, preserved below)", {
+            sessionID: request.sessionID,
+            error: result.error,
+            report: text,
+          })
+          // 兜底提示：通过 Toast 告知用户拆分已结束，引导通过 status 查看
+          const toast = this.deps.client.tui.showToast?.({
+            body: {
+              title: "Prism Split",
+              message: "拆分任务已全部完成（主会话忙未注入，可通过 /split status 查看明细）",
+              variant: "warning",
+              duration: 8000,
+            },
+          })
+          if (toast) void toast.catch(() => {})
         }
       })
       .catch((error) => {
@@ -223,7 +242,9 @@ export class SplitService {
 
     return {
       kind: "launched",
-      message: `拆分计划已启动：${plans.length} 个子任务，按依赖分层并发执行。子任务进度可通过 TUI 子会话导航（leader 键+↓ 进入）与 /split status 查看；全部结束后汇总报告回注主会话。`,
+      message: this.deps.tuiNavigation === false
+        ? `拆分计划已启动：${plans.length} 个子任务，按依赖分层并发执行。子任务进度可通过 /split status 与 bg_output 查看；全部结束后汇总报告回注主会话。`
+        : `拆分计划已启动：${plans.length} 个子任务，按依赖分层并发执行。子任务进度可通过 TUI 子会话导航（leader 键+↓ 进入）与 /split status 查看；全部结束后汇总报告回注主会话。`,
       run,
     }
   }

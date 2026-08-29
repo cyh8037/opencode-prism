@@ -1,3 +1,4 @@
+import { z } from "zod"
 import {
   ABORT_TIMEOUT_MS,
   DEFAULT_CONCURRENCY,
@@ -18,9 +19,10 @@ import {
 import type { PrismConfig } from "../../config/schema"
 import type { ResolvedModel } from "../../models"
 import { isAgentNotFoundError, shouldRetryError, type ErrorInfo } from "../../models"
-import { errorInfoFromResult } from "../../shared/api-result"
+import { errorInfoFromObject, errorInfoFromResult } from "../../shared/api-result"
 import { log } from "../../shared/log"
 import { sanitizeSystemReminder } from "../../shared/sanitize"
+import { eventSessionID, parseSessionMessages, sessionStatusMapSchema } from "../../shared/session-data"
 import { collectAssistantText } from "../assistant-text"
 import type { PrismClient, ToastVariant } from "../client-types"
 import type { PromptGate } from "../prompt-gate"
@@ -55,17 +57,16 @@ const TERMINAL_STATUSES = new Set<BgTask["status"]>(["completed", "error", "canc
 // TUI); the settle summary toast and the injected table still report them.
 const FAILURE_TOAST_COALESCE_MS = 8_000
 
-function resolveEventSessionID(properties: Record<string, unknown> | undefined): string | undefined {
-  if (!properties) return undefined
-  const direct = properties.sessionID
-  if (typeof direct === "string") return direct
-  const info = properties.info
-  if (typeof info === "object" && info !== null) {
-    const infoSessionID = (info as Record<string, unknown>).sessionID
-    if (typeof infoSessionID === "string") return infoSessionID
-  }
-  return undefined
-}
+// A child session "has output" when any assistant/tool message carries a tool
+// part or a non-empty text/reasoning part (per-part tolerance: malformed
+// parts just do not count as output).
+const outputSignalPartSchema = z.union([
+  z.object({ type: z.literal("tool") }),
+  z.object({
+    type: z.enum(["text", "reasoning"]),
+    text: z.string().refine((text) => text.trim().length > 0),
+  }),
+])
 
 // Byte-safe truncation for steering messages: slicing at a character count
 // can cut mid-UTF-8 (a lone continuation byte breaks the provider request),
@@ -444,12 +445,7 @@ export class BackgroundManager {
 
   private classifyError(error: unknown): { name?: string; message?: string; statusCode?: number } {
     if (typeof error === "object" && error !== null) {
-      const record = error as Record<string, unknown>
-      return {
-        name: typeof record.name === "string" ? record.name : undefined,
-        message: typeof record.message === "string" ? record.message : undefined,
-        statusCode: typeof record.statusCode === "number" ? record.statusCode : undefined,
-      }
+      return errorInfoFromObject(error)
     }
     return { message: String(error) }
   }
@@ -550,7 +546,7 @@ export class BackgroundManager {
 
   handleEvent(event: ForwardedEvent): void {
     const properties = event.properties
-    const sessionID = resolveEventSessionID(properties)
+    const sessionID = eventSessionID(properties)
 
     if (event.type === "message.part.updated" && sessionID) {
       const task = this.findBySession(sessionID)
@@ -675,8 +671,7 @@ export class BackgroundManager {
         path: { id: sessionID },
         query: { directory: this.deps.directory },
       })
-      const messages = response.data
-      if (!Array.isArray(messages)) return false
+      const messages = parseSessionMessages(response.data)
 
       // Authoritative result capture: part-level events carry no role/state
       // (role lives on the message), so the assistant text is read from the
@@ -693,15 +688,8 @@ export class BackgroundManager {
       }
 
       return messages.some((message) => {
-        const info = (message as { info?: { role?: string } }).info
-        if (info?.role !== "assistant" && info?.role !== "tool") return false
-        const parts = (message as { parts?: unknown[] }).parts ?? []
-        return parts.some((part) => {
-          const record = part as Record<string, unknown>
-          if (record.type === "text" && typeof record.text === "string" && record.text.trim().length > 0) return true
-          if (record.type === "reasoning" && typeof record.text === "string" && record.text.trim().length > 0) return true
-          return record.type === "tool"
-        })
+        if (message.info.role !== "assistant" && message.info.role !== "tool") return false
+        return (message.parts ?? []).some((part) => outputSignalPartSchema.safeParse(part).success)
       })
     } catch (error) {
       this.logger("[prism] failed to validate session output", { sessionID, error })
@@ -772,9 +760,9 @@ export class BackgroundManager {
     }
     try {
       const response = await this.deps.client.session.status()
-      const map = response.data
-      if (!map || typeof map !== "object") return false
-      const type = (map as SessionStatusMap)[sessionID]?.type
+      const parsedMap = sessionStatusMapSchema.safeParse(response.data)
+      if (!parsedMap.success) return false
+      const type = parsedMap.data[sessionID]?.type
       // Absent entries ARE the idle state (the map only lists non-idle
       // sessions); anything else is left to the next sweep.
       if (type === undefined || type === "idle") return true
@@ -1301,6 +1289,11 @@ export class BackgroundManager {
           "[PRISM BACKGROUND TASKS]",
           allComplete ? `全部后台任务已结束 (${siblingTasks.length} 个):` : "后台任务状态更新:",
           "",
+          // 看板是 markdown 管道表格(方案 a):web 端 GFM 解析器渲染为 HTML
+          // 表格,因此**不包代码围栏**(围栏会使 web 端表格降级为代码块、
+          // 含中文列错位)。模型转达时保留 | 列分隔即可,两端渲染都正确。
+          "请把下方的状态看板表格原样转达给用户（保留表格的 | 列分隔结构，不要改写为列表、不要添加 emoji 或任何符号）：",
+          "",
           buildTaskTable(siblingTasks, !fullResult),
         ]
         if (fullResult) {
@@ -1386,8 +1379,9 @@ export class BackgroundManager {
       let statusMapAvailable = false
       try {
         const statusResult = await this.deps.client.session.status()
-        if (statusResult.data && typeof statusResult.data === "object") {
-          allStatuses = statusResult.data as SessionStatusMap
+        const parsedStatuses = sessionStatusMapSchema.safeParse(statusResult.data)
+        if (parsedStatuses.success) {
+          allStatuses = parsedStatuses.data
           statusMapAvailable = true
         }
       } catch {

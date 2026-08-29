@@ -47,8 +47,8 @@ describe("renderBgDashboard", () => {
       undefined,
       { foldCompleted: false },
     )
-    // 表格行(box-drawing 开头)等宽;Pool/导航指引等注释行不参与对齐
-    const tableLines = text.split("\n").filter((line) => /^[│┌├└]/.test(line))
+    // 表格行(| 开头的管道表格)等宽;Pool/导航指引等注释行不参与对齐
+    const tableLines = text.split("\n").filter((line) => /^\|/.test(line))
     const widths = tableLines.map((line) => getStringWidth(line))
     expect(new Set(widths).size).toBe(1)
   })
@@ -88,7 +88,7 @@ describe("renderBgDashboard", () => {
     )
     const lines = text.split("\n")
     // 表格行等宽;注释行(Pool/导航指引)不参与对齐,完整显示超宽内容
-    const tableLines = lines.filter((line) => /^[│┌├└]/.test(line))
+    const tableLines = lines.filter((line) => /^\|/.test(line))
     const widths = tableLines.map((line) => getStringWidth(line))
     expect(new Set(widths).size).toBe(1)
     expect(text).toContain("Pool: anthropic/claude-sonnet-4-5 3/5, openai/gpt-5.6-sol 2/5")
@@ -140,6 +140,35 @@ describe("renderBgDashboard", () => {
       { foldCompleted: false },
     )
     expect(text).toContain("ERROR: rate limit exceeded")
+  })
+
+  test("pipes in untrusted fields are escaped so the markdown table keeps its columns", () => {
+    const text = renderBgDashboard(
+      [
+        makeTask({
+          id: "bg_eeee5555",
+          description: "a|b",
+          status: "error",
+          error: "EOF | retry",
+        }),
+      ],
+      undefined,
+      { foldCompleted: false },
+    )
+    // \| 转义后 GFM 解析器不会按新列拆开(description 与 error 均未信任文本)
+    expect(text).toContain("a\\|b")
+    expect(text).toContain("ERROR: EOF \\| retry")
+    expect(text).not.toContain("| a|b ")
+  })
+
+  test("the table header is followed by the markdown separator row", () => {
+    const text = renderBgDashboard([
+      makeTask({ id: "bg_aaaa1111", description: "运行中", status: "running" }),
+    ])
+    const lines = text.split("\n")
+    const headerIdx = lines.findIndex((line) => line.startsWith("| ID"))
+    expect(headerIdx).toBeGreaterThanOrEqual(0)
+    expect(lines[headerIdx + 1]).toMatch(/^\| -+ \| -+ \|/)
   })
 
   test("overlong descriptions are truncated to the column cap", () => {

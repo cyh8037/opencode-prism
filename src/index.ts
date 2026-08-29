@@ -21,15 +21,8 @@ import { createBgCommand, createSplitCommand, type PrismCommandDefinition } from
 import { log } from "./shared/log"
 import { guardHook } from "./shared/hook-guard"
 import { resolveServerUrl } from "./shared/server-url"
-
-function modelFromRecord(value: unknown): ResolvedModel | undefined {
-  if (typeof value !== "object" || value === null) return undefined
-  const record = value as Record<string, unknown>
-  const providerID = record.providerID
-  const modelID = record.id ?? record.modelID
-  if (typeof providerID !== "string" || typeof modelID !== "string") return undefined
-  return { providerID, modelID }
-}
+import { modelFromRecord } from "./shared/session-data"
+import { isTuiClient } from "./core/client-types"
 
 // Read the parent session's CURRENT model. Tier order: session object (the
 // authoritative "what is this session using right now" source), latest
@@ -115,6 +108,10 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
 
   const gate = new PromptGate(client)
 
+  // TUI 环境探测（插件加载时读取一次）：host 只在 TUI 会话挂载 tui RPC 面。
+  // 子会话导航指引等 TUI 专属文案据此门控（web/headless 下是错误指引）。
+  const tuiNavigation = isTuiClient(client)
+
   // Resolve once so the /bg output --full hint prints a consistent attach URL
   // (port-0 fallback, OPENCODE_PORT, config).
   const attachServerUrl = resolveServerUrl(serverUrl, process.env, log)
@@ -182,6 +179,7 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
     resolvePlannerModel: (sessionID) => resolveModel(sessionID),
     // 插件加载时读取，切换需重启 opencode（与 background.autoTrigger 同模式）。
     intentCheckEnabled: config.split.intentCheck,
+    tuiNavigation,
   })
 
   return {
@@ -203,11 +201,11 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
         ...(cfg.command ?? {}),
         // vision.enabled drops the read-image guidance from both templates:
         // it references vision_look, which is unregistered when disabled.
-        bg: createBgCommand(config.vision.enabled),
-        // split.tool gates BOTH split entries: the command's task mode runs
-        // through the split_task tool (template-instructed), so without the
-        // tool a registered command could not execute — do not register it.
-        ...(config.split.tool ? { split: createSplitCommand(config.vision.enabled) } : {}),
+        bg: createBgCommand(config.vision.enabled, tuiNavigation),
+        // split.tool gates the whole split feature: with it off, neither the
+        // split_task tool nor the /split command (native path calls the same
+        // service) is registered.
+        ...(config.split.tool ? { split: createSplitCommand(config.vision.enabled, tuiNavigation) } : {}),
       }
     },
     tool: {
@@ -219,6 +217,7 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
         autoTrigger: config.background.autoTrigger,
         client,
         directory,
+        tuiNavigation,
       }),
       // Read once at plugin load: toggling it requires restarting opencode.
       // autoTrigger 与 vision.enabled 同模式：true 时 split_task 的描述拼接
@@ -243,7 +242,16 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
     ),
     "command.execute.before": guardHook(
       "command.execute.before",
-      createCommandExecuteBeforeHook({ manager, serverUrl: attachServerUrl, client, registry: splitRegistry }),
+      createCommandExecuteBeforeHook({
+        manager,
+        serverUrl: attachServerUrl,
+        client,
+        registry: splitRegistry,
+        splitService,
+        gate,
+        visionEnabled: config.vision.enabled,
+        tuiNavigation,
+      }),
     ),
     event: guardHook("event", createEventHook(manager, modelTracker, gate)),
     dispose: async () => {

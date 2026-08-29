@@ -1,11 +1,20 @@
-// 后台任务纯文本看板渲染器。无 Emoji、无 ANSI 着色:状态一律大写 ASCII
-// 标签,box-drawing 边框在现代等宽终端按 1 列渲染(与 width.ts 的宽度规则
-// 一致),任何平台、任何终端字体下表格都严格对齐。
+// 后台任务看板渲染器 — markdown 管道表格(方案 a,2026-08-29)。
+//
+// 双端渲染决策:box-drawing 边框在 TUI 等宽终端精确对齐,但 web 端代码块
+// 字体 CJK≈1.67×ASCII(宽度引擎假设 2×),含中文的表格在 web 必然错位
+// (像素级实测:ASCII 16.4px / CJK 27.4px)——围栏也无法修复。因此改用
+// markdown 管道表格:`|` 列分隔由 web 端 GFM 解析器渲染为真 HTML 表格
+// (不依赖字体比例),TUI 端按原始文本等宽显示,列宽补齐(宽度引擎)仍然
+// 生效——双端对齐。
+//
+// 约束:单元格内管道符必须转义为 \|(否则 markdown 解析器按新列分隔);
+// 宽度按转义后文本计算,渲染用同一边界截断补齐,不会二次超宽。标题行
+// 放表格上方独立成段(markdown 表格无标题行)。
 //
 // 所有嵌入字段都是未信任文本(description 来自父会话对话,error/resultText
 // 来自 provider),渲染管线顺序固定:sanitize -> 换行替换 -> 控制字符剥离
-// -> 截断 -> 补齐。剥离 ANSI 是"列表 -> 对齐表格"引入的硬要求:escape
-// 序列在终端不占列宽,不清除会算进 padEndWidth 导致整行错位。
+// -> 管道转义 -> 截断 -> 补齐。剥离 ANSI 是"列表 -> 对齐表格"引入的硬
+// 要求:escape 序列在终端不占列宽,不清除会算进 padEndWidth 导致整行错位。
 import { getStringWidth, padEndWidth, truncateWidth } from "../shared/width"
 import { sanitizeSystemReminder } from "../../shared/sanitize"
 import { BG_SESSION_NAV_HINT, MAX_SESSION_TITLE_CHARS } from "../../config/constants"
@@ -22,6 +31,13 @@ export function sanitizeCell(text: string): string {
     .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, "")
     .replace(/\n/g, " ")
     .replace(/[\u0000-\u001f\u007f]/g, "")
+}
+
+/** markdown 管道表格的单元格转义:管道符是列分隔符,不转义会被 GFM 解析
+ *  器按新列拆开(description/error 均可能含 |)。宽度按转义后文本计算,
+ *  \| 占 2 列,渲染用同一边界截断补齐,不会二次超宽。 */
+function escapePipe(text: string): string {
+  return text.replace(/\|/g, "\\|")
 }
 
 /** 任务时长(从 manager.ts 移入,看板与通知共用)。 */
@@ -60,42 +76,40 @@ interface Column {
   cell: (task: BgTask) => string
 }
 
-// 列宽 = clamp(max(表头宽, 最长内容宽), min, max);宽度按"原始"文本计算,
-// 渲染时用同一边界截断,因此任何单元格都不会二次超宽。表头同样走宽度
-// 引擎(当前全 ASCII,但规则不应依赖这个巧合)。
+// 列宽 = clamp(max(表头宽, 最长内容宽), min, max);宽度按"转义后"文本
+// 计算(escapePipe 之后),渲染时用同一边界截断补齐,因此任何单元格都不会
+// 二次超宽。表头同样走宽度引擎(当前全 ASCII,但规则不应依赖这个巧合)。
 function computeWidths(tasks: BgTask[], columns: Column[]): number[] {
   return columns.map((col) => {
-    const contentWidth = tasks.reduce((max, task) => Math.max(max, getStringWidth(col.cell(task))), 0)
+    const contentWidth = tasks.reduce(
+      (max, task) => Math.max(max, getStringWidth(escapePipe(col.cell(task)))),
+      0,
+    )
     return clamp(Math.max(getStringWidth(col.header), contentWidth), col.minWidth, col.maxWidth)
   })
 }
 
+// markdown 管道表格:表头行 + `| --- |` 分隔行 + 数据行。标题(如有)独立
+// 在表格上方成段——markdown 表格没有标题行,放进表格会被解析成一行单元格。
+// 单元格经 escapePipe 转义后按列宽截断补齐:web 端 GFM 解析器忽略补齐
+// 空格(列宽由 HTML 表格决定),TUI 端等宽显示严格对齐(宽度引擎假设成立)。
 function renderTable(title: string | undefined, tasks: BgTask[], columns: Column[]): string {
   const widths = computeWidths(tasks, columns)
 
-  const borderTop = `┌${widths.map((w) => "─".repeat(w + 2)).join("┬")}┐`
-  const borderMid = `├${widths.map((w) => "─".repeat(w + 2)).join("┼")}┤`
-  const borderBot = `└${widths.map((w) => "─".repeat(w + 2)).join("┴")}┘`
-
+  // 分隔行只需 `---`,但按列宽补齐后 TUI 端同样对齐(web 端忽略)。
   const renderRow = (cells: string[]): string =>
-    `│${cells.map((cell, i) => ` ${padEndWidth(cell, widths[i]!)} `).join("│")}│`
+    `|${cells.map((cell, i) => ` ${padEndWidth(cell, widths[i]!)} `).join("|")}|`
 
   const lines: string[] = []
   if (title) {
-    // 行宽 = 2 + Σ(w+2) + (n-1)(首尾 │ + 每列 ` cell ` + 列间 │);
-    // header 行 = `│ ` + title + ` │`,innerWidth = 行宽 - 4。
-    const innerWidth = widths.reduce((sum, w) => sum + w + 2, 0) + widths.length - 3
-    // 标题(含并发池信息)可能超过 innerWidth:先截断再补齐,与单元格同
-    // 管线——否则超宽标题会破坏"每行等宽"的对齐承诺。
-    lines.push(`│ ${padEndWidth(truncateWidth(title, innerWidth), innerWidth)} │`)
-    lines.push(borderMid)
+    // 标题独立成段,不参与表格解析
+    lines.push(title)
   }
   lines.push(renderRow(columns.map((col) => col.header)))
-  lines.push(borderMid)
+  lines.push(renderRow(widths.map((w) => "-".repeat(w))))
   for (const task of tasks) {
-    lines.push(renderRow(columns.map((col, i) => truncateWidth(col.cell(task), widths[i]!))))
+    lines.push(renderRow(columns.map((col, i) => truncateWidth(escapePipe(col.cell(task)), widths[i]!))))
   }
-  lines.push(borderBot)
   return lines.join("\n")
 }
 
@@ -150,13 +164,16 @@ const TERMINAL_STATUSES = new Set(["completed", "error", "cancelled"])
 /** `/bg status` 看板:标题只含计数(必不超宽),并发池信息放在表格下方独立
  *  行完整显示(池信息进标题会被截断,截断点落在模型名中间观感像文本损坏)。
  *  默认(foldCompleted)表格只含进行中任务,已结束任务折叠为一行摘要——
- *  取消后主视图立即干净,`--all`(foldCompleted=false)展开全部。 */
+ *  取消后主视图立即干净,`--all`(foldCompleted=false)展开全部。
+ *  表格为 markdown 管道表格(标题/摘要/池信息各占独立段落,与表格之间用
+ *  空行分隔——GFM 解析器按块解析,空行保证表格不被前后段落吞并)。 */
 export function renderBgDashboard(
   tasks: BgTask[],
   pool?: Array<{ key: string; active: number; limit: number }>,
-  opts: { foldCompleted?: boolean } = {},
+  opts: { foldCompleted?: boolean; tuiNavigation?: boolean } = {},
 ): string {
   const foldCompleted = opts.foldCompleted ?? true
+  const tuiNavigation = opts.tuiNavigation ?? true
   const active = tasks.filter((t) => !TERMINAL_STATUSES.has(t.status))
   const terminal = tasks.filter((t) => TERMINAL_STATUSES.has(t.status))
 
@@ -177,6 +194,7 @@ export function renderBgDashboard(
         foldCompleted ? active : tasks,
         [ID_COLUMN, DESCRIPTION_COLUMN, STATUS_COLUMN, DURATION_COLUMN, PROGRESS_COLUMN],
       ),
+      "",
     )
   }
   if (foldCompleted && terminal.length > 0) {
@@ -194,18 +212,25 @@ export function renderBgDashboard(
     lines.push(`Pool: ${pool.map((p) => `${p.key} ${p.active}/${p.limit}`).join(", ")}`)
   }
   // 注释行(不参与对齐):子会话实时查看指引。只在 /bg status 看板出现,
-  // 不进 renderCompactDashboard——完成通知不应被固定文案污染。
-  lines.push(BG_SESSION_NAV_HINT)
+  // 不进 renderCompactDashboard——完成通知不应被固定文案污染。非 TUI
+  // 环境(web/headless)没有子会话导航键位,替换为工具侧等价查看方式。
+  lines.push(
+    tuiNavigation
+      ? BG_SESSION_NAV_HINT
+      : "子任务进度可通过 /bg status 与 bg_output 工具查看。",
+  )
   return lines.join("\n")
 }
 
-/** 完成通知用的紧凑看板(列少,结果预览在表格下方)。 */
+/** 完成通知用的紧凑看板(列少,结果预览在表格下方)。表格与结果预览之间
+ *  用空行分隔:GFM 表格在空行处结束,结果行(无 | 列分隔)不会被吞进表格。 */
 export function renderCompactDashboard(tasks: BgTask[], opts: { includeResults?: boolean } = {}): string {
   if (tasks.length === 0) return "当前会话没有后台任务。"
   const lines = [
     renderTable(undefined, tasks, [ID_COLUMN, DESCRIPTION_COLUMN, STATUS_COLUMN, DURATION_COLUMN, RETRIES_COLUMN]),
   ]
   if (opts.includeResults) {
+    lines.push("")
     for (const task of tasks) {
       if (task.resultText) {
         // 按字符上限截断但避免切出半个代理对(resultText 来自子会话 LLM,

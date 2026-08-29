@@ -40,7 +40,7 @@ src/
 ### 核心 Hook 职责速查
 | Hook | 触发时机 | 核心职责 | 特殊契约 / 注意事项 |
 |---|---|---|---|
-| `command-execute-before` | 用户触发命令 | `/bg`、`/split` 命令拦截入口 | 拦截并转交对应引擎调度 |
+| `command-execute-before` | 用户触发命令 | `/bg`、`/split` 拦截入口：确定性子命令与**任务描述形式**均原生执行（启动/查询/取消/拆分调度），注入回执与看板；仅 `/bg --parallel N` 交由模型拆分 | 模板只剩"转达注入结果"职责，**禁止在 hook 内 await LLM 轮询**（秒级 I/O 可 await）；模型回合必发生（1.18 实测），防双发靠"模板无 $ARGUMENTS + 强禁令" (1.18.25 验证) |
 | `tool-execute-after` | 工具执行返回 | 自动解读 (Trigger A)：拦截带图片附件的工具输出 | 受视觉三重门控硬拦截 |
 | `chat-message` | 消息发送前 | 贴图提示：为无图模型注入调用 `vision_look` 提醒（零阻塞） | **必须满足 Part 字段完整性契约** |
 | `chat-params` | 生成对话参数 | 只读：喂 `CurrentModelTracker`（追踪当前模型与多模态能力） | 只读消费，不改参数 |
@@ -62,6 +62,7 @@ src/
   - 后台子会话恒禁用 `bg_*` 与 `question`（`manager.ts` 的 `childToolFilters`）；`vision_look` 在视觉启用时保留（支持 async 视觉任务解读自身图片），视觉禁用时移除。
   - 同步解读子会话使用 `VISION_CHILD_TOOL_FILTERS` 禁用全部 Prism 工具 + `question`。
 - **运行时守卫承重**：递归防护的核心承重墙是运行时守卫 `isInterpretationSession`（在 `vision-look`、`pipeline.onToolOutput`、`chat-message` 三处生效）。**删除守卫必然复发 0.4.0-beta.1 递归风暴事故**。
+- **新增「模型可自主触发」入口的检查清单**（autoTrigger 类功能的公共防线，2026-08-29 对抗性审查沉淀）：新入口上线前逐项核对——① 子会话工具过滤是否覆盖（`childToolFilters` / `JSON_CHILD_TOOL_FILTERS`，含一次性 JSON 子会话）；② 递归守卫是否覆盖该入口的子会话形态；③ 熔断预算（`MAX_TOOL_CALLS`）是否对新增子会话生效；④ resultText 权威来源（`validateSessionHasOutput` 始终以 messages API 覆盖事件路径值）。
 
 ### 3.3 消息构造与客户端调用契约
 - **Chat-Message Part 契约**：在 `chat-message` 中动态 `push` 的 part **必须**携带 `id`（带 `prt_` 前缀）、`sessionID`、`messageID`（取自 `output.message.id`）。缺少字段会导致持久化失败（"invalid user part before save" 导致会话冻结事故，2026-08-25）。
@@ -72,7 +73,28 @@ src/
 ### 3.4 模型继承与配置回退
 - **模型继承三级回退链**：`Session 对象` → `最新消息 info.model` → `Config 默认模型`。主会话 `/models` 切换后新任务自动跟随。
 - **配置按字段回退**：无效字段单独回退默认值，同节其他有效设置保留（例如 `vision.mode: "background"` 仅将 mode 回退为默认值，启动时弹出 warning toast）。
-- **版本行为依赖标注**：凡依赖 OpenCode 具体版本行为的代码（如 `session.status` 的 busy/retry 字段，1.18 验证），必须在注释中显式注明验证版本。
+- **版本行为依赖标注**：凡依赖 OpenCode 具体版本行为的代码（如 `session.status` 的 busy/retry 字段，1.18 验证），必须在注释中显式注明验证版本。依赖矩阵（SDK `@opencode-ai/plugin` 类型面逐版本验证，2026-08-29）：
+
+| 依赖 | 引入 | 宿主行为实测 |
+|---|---|---|
+| `chat.message` / `chat.params` / `tool.execute.*` / `event` / `config` | 1.0.0 | 1.18.25 |
+| `command.execute.before`（parts 合入命令消息；命令必触发 LLM 回合） | **1.2.0** | 1.18.25 |
+| `experimental.chat.messages.transform` / `experimental.chat.system.transform` | 1.2.0 | 1.18.25（system.transform 已实测注入生效） |
+| `client.session.status`（busy/retry 字段） | ≥1.4 | 1.18 |
+| TUI 子会话导航（parentID 分组） | 1.15.0 | 1.15.0 / 1.18.25 二进制 strings 验证 |
+| `client.tui.*`（**非版本化运行时面**，SDK 类型无此字段） | — | 探测用 `isTuiClient`，web 端待人工验证 |
+
+声明支持 **1.18.x**（SDK pinned 1.18.18，全量 QA 在 1.18.25）；1.15–1.17 类型面一致但宿主未实测，不承诺；≤1.1 缺核心钩子，不支持。
+
+### 3.5 数据边界解析规范 (Tolerant zod Parsing)
+- 外部数据边界（SDK 返回值、event properties、消息历史、LLM JSON 输出）的解析**必须走宽容语义的 zod schema**，禁止新增手写 `typeof`/`isRecord`/`as` 强转链——解析抛错就是红线 #2 的抛错。共享 shape 收敛在 `src/shared/session-data.ts`（消息信封 / `eventSessionID` / `modelFromRecord` / `sessionStatusMapSchema`）与 `src/shared/api-result.ts`（错误 shape）。
+- 宽容语义三条：**逐条 `safeParse` 跳过坏条目（绝不整体拒绝）**；字段级 `.optional().catch(undefined)` 降级（坏字段不拖垮整条记录）；consumer 特定的 part 形状（text part / file part / tool part）由各自 schema 校验。
+- 失败语义分两级：**解析失败 = 静默跳过**（数据面）；**状态不可信 = fail-closed**（如 `sessionStatusMapSchema` 校验失败时 sweep 跳过/完成确认推迟——"无法确认时绝不完成任务"，防止误中止仍在运行的子会话）。
+
+### 3.6 注入文本契约 (Injected-Text Contract)
+- **看板/表格一律用 markdown 管道表格（GFM），绝不包 ` ```text ` 围栏**（2026-08-29 方案 a，像素级实测）：web 端代码块字体 CJK≈1.67×ASCII（宽度引擎假设 2×，ASCII 按 ~0.6em 进宽），box-drawing 表格含中文必然错位、围栏也修不了；管道表格由 web 端 GFM 解析为 HTML 表格（不依赖字体比例），TUI 端等宽显示照旧对齐。约束：单元格 `|` 转义为 `\|`（`escapePipe`）；标题行放表格上方独立成段；表格与前后段落空行分隔；转达指令要求模型**保留 `|` 列分隔结构**（模型有改写成 emoji 列表的实测倾向，不能靠自觉）。
+- **纯分层缩进文本（dry-run 计划、`/split status sp_xxx` 明细）仍包 ` ```text ` 围栏**：web 端未围栏的缩进会被 markdown 折叠；分层文本无列对齐、不受 CJK 比例影响。混合内容（`/split status` 的 run 区块 + INDEPENDENT TASKS 表格）不整体围栏，run 区块缩进在 web 端折叠为可接受损失。
+- 命令模板**禁止包含 `$ARGUMENTS`**（任务描述形式已被 hook 原生消费）：模型看到任务描述就有绕过插件自行执行的实测先例（2026-08-29）。需要模型消费任务文本的唯一例外是 `/bg --parallel`（经 hook 注入的【并行启动】part 显式传递）。
 
 ---
 
@@ -97,6 +119,7 @@ bun run build             # 构建打包 → dist/
 2. **测试严格划界**：
    - **单元测试 (`tests/*.test.ts`)**：**只测纯逻辑**（Schema 解析、状态机调度、拓扑排序、配置回退规则）。严禁对 LLM 文本输出、消息时序做脆弱断言。
    - **真实环境 QA (`scripts/qa/sandbox-run.sh`)**：凡涉及 Hook 触发、子会话生命周期、消息回注的改动，**必须在沙箱中跑真实验证**。
+   - **沙箱技法**（2026-08-29 沉淀）：headless `opencode run` 进程退出会连带杀掉后台子会话——bg/split 生命周期验证必须用 **`opencode serve` 常驻 + HTTP API 驱动**（`POST /session`、`POST /session/:id/command`）；manager 成功路径静默（完成不打日志），证据取**回注消息/会话状态/opencode.db**，不能等日志；provider 工具（如 glob）在沙箱偶发挂起属环境噪声，改用 cancel 路径收尾验证。
 3. **证据写盘交付**：
    - 真实验证结论必须写入 `docs/qa/YYYY-MM-DD-<主题>.md`（包含改动范围、验证步骤、实际输出）。**无 QA 证据文件不提交代码**。
 4. **文档同步**：用户可感知改动（配置、命令、工具、行为）必须同步更新 `README.md` 与 `CHANGELOG.md` [Unreleased]。

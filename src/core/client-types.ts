@@ -43,3 +43,10 @@ export interface PrismClient {
   session: PrismSession
   tui: PrismTui
 }
+
+// 运行时探测 TUI 环境：host 只在 TUI 会话里挂载 tui RPC 面（web/headless
+// 下为空或缺失）。子会话导航指引等 TUI 专属文案据此门控。注意这是运行时
+// 鸭子探测（非版本化 API），web 端行为需在真实 web 会话中人工验证。
+export function isTuiClient(client: PrismClient | undefined | null): boolean {
+  return typeof (client as { tui?: { showToast?: unknown } } | undefined)?.tui?.showToast === "function"
+}

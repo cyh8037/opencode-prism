@@ -1,4 +1,26 @@
+import { z } from "zod"
 import type { ErrorInfo } from "../models/types"
+
+// Tolerant error-like shape: every field degrades to undefined instead of
+// failing the whole parse, and the SDK body's `data.message` wins over the
+// envelope's own `message`.
+const errorLikeSchema = z.object({
+  name: z.string().optional().catch(undefined),
+  message: z.string().optional().catch(undefined),
+  statusCode: z.number().optional().catch(undefined),
+  data: z.object({ message: z.string().optional().catch(undefined) })
+    .optional()
+    .catch(undefined),
+})
+
+// Extract an ErrorInfo from an error-shaped object (SDK 4xx/5xx payloads,
+// thrown non-Error objects). Never throws; unreadable fields stay undefined.
+export function errorInfoFromObject(error: object): ErrorInfo {
+  const parsed = errorLikeSchema.safeParse(error)
+  if (!parsed.success) return {}
+  const { name, message, statusCode, data } = parsed.data
+  return { name, message: data?.message ?? message, statusCode }
+}
 
 // The generated SDK client resolves 4xx/5xx with `{ error, response }`
 // instead of rejecting (throwOnError defaults to false); only network
@@ -15,15 +37,7 @@ export function errorInfoFromResult(result: unknown): ErrorInfo | undefined {
     return { name: error.name, message: error.message, statusCode }
   }
   if (typeof error === "object") {
-    const err = error as Record<string, unknown>
-    const data = err.data as Record<string, unknown> | undefined
-    const message =
-      typeof data?.message === "string" ? data.message : typeof err.message === "string" ? err.message : undefined
-    return {
-      name: typeof err.name === "string" ? err.name : undefined,
-      message,
-      statusCode,
-    }
+    return { ...errorInfoFromObject(error), statusCode }
   }
   return { message: typeof error === "string" ? error : String(error), statusCode }
 }

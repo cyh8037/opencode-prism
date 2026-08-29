@@ -1,15 +1,36 @@
-import type { BackgroundManager } from "../core/background/manager"
+import { BG_SESSION_NAV_HINT, MAX_IMAGES_PER_BATCH } from "../config/constants"
+import { log } from "../shared/log"
 import type { BgTask } from "../core/background/types"
-import type { PrismClient } from "../core/client-types"
-import { renderBgDashboard } from "../core/background/visualizer"
+import type { BackgroundManager } from "../core/background/manager"
+import type { PromptGate } from "../core/prompt-gate"
+import { renderBgDashboard, sanitizeTruncate } from "../core/background/visualizer"
 import { renderRunDetails, renderSplitRuns } from "../core/split/visualizer"
 import type { SplitRunRegistry } from "../core/split/registry"
+import type { SplitService } from "../core/split/service"
+import type { PrismClient } from "../core/client-types"
+import { errorInfoFromObject } from "../shared/api-result"
+import { extractImageParts } from "../core/vision/detector"
 
 type CommandInput = { command: string; sessionID: string; arguments: string }
 type CommandOutput = { parts: Array<{ type: string; text?: string; [key: string]: unknown }> }
 
 function pushText(output: CommandOutput, text: string): void {
   output.parts.push({ type: "text", text, synthetic: true })
+}
+
+// 看板已是 markdown 管道表格(方案 a):web 端 GFM 解析器渲染为 HTML 表格,
+// TUI 端按等宽文本显示——**不能再包围栏**(围栏会把表格降级成代码块,
+// web 端代码块字体 CJK≈1.67×ASCII,含中文表格错位,2026-08-29 像素级实测)。
+// fence 仅保留给纯分层缩进文本(dry-run 计划/run 明细):web 端未围栏的
+// 缩进会被 markdown 折叠,围栏保形;分层文本无列对齐,不受 CJK 比例影响。
+function fence(text: string): string {
+  return "```text\n" + text + "\n```"
+}
+
+// 与 tools/bg.ts 的 bg_spawn 回执同一文案（命令原生启动与工具启动的用户
+// 视感一致）。tuiNavigation=false 时换用工具侧等价查看方式。
+function navHint(tuiNavigation: boolean): string {
+  return tuiNavigation ? `启动后，${BG_SESSION_NAV_HINT}。` : "启动后可通过 /bg status 或 bg_output 查看进度。"
 }
 
 function formatTaskOutput(manager: BackgroundManager, taskID: string, fullSession: boolean, serverUrl: string): string {
@@ -58,15 +79,20 @@ function showToast(client: PrismClient, message: string): void {
 }
 
 // Deterministic subcommands run natively in the hook (status/output/cancel);
-// everything else — /bg and /split task descriptions — falls through to the
-// command template, where the main model calls bg_spawn / split_task with
-// full streaming feedback. No LLM work ever runs inside this hook: it would
-// block the TUI for the whole round.
+// 任务描述形式同样原生执行（0.5.0）:启动逻辑收进插件代码，模型回合只剩
+// "转达注入结果"——不再由模型决定是否/如何调用 bg_spawn / split_task。
+// 唯一例外是 /bg --parallel N：任务语义拆分需要 LLM，hook 注入【并行启动】
+// 指令 part，交由模板回合中的模型并行调用 bg_spawn。这里绝不 await 任何
+// LLM 轮询（秒级 I/O 与既有 cancel/send 先例同级）。
 export function createCommandExecuteBeforeHook(args: {
   manager: BackgroundManager
   serverUrl: string
   client: PrismClient
   registry: SplitRunRegistry
+  splitService: SplitService
+  gate: PromptGate
+  visionEnabled: boolean
+  tuiNavigation: boolean
 }) {
   return async (input: CommandInput, output: CommandOutput): Promise<void> => {
     const argumentsText = input.arguments.trim()
@@ -74,7 +100,7 @@ export function createCommandExecuteBeforeHook(args: {
     if (input.command === "bg") {
       // /bg status bg_xxx:单个任务的表格视图(与 /split status sp_xxx 对称)。
       // 无论任务是否已结束都以表格展示当前状态(foldCompleted: false),
-      // 不依赖状态更新事件。
+      // 不依赖状态更新事件。看板是 markdown 管道表格,不包围栏(见 fence 注释)。
       const taskStatusMatch = argumentsText.match(/^(?:status|list)\s+(bg_\S+)$/)
       if (taskStatusMatch) {
         const taskID = taskStatusMatch[1]!
@@ -85,7 +111,10 @@ export function createCommandExecuteBeforeHook(args: {
         }
         pushText(
           output,
-          renderBgDashboard([owned.task], args.manager.getConcurrencySnapshot(), { foldCompleted: false }),
+          renderBgDashboard([owned.task], args.manager.getConcurrencySnapshot(), {
+            foldCompleted: false,
+            tuiNavigation: args.tuiNavigation,
+          }),
         )
         return
       }
@@ -94,11 +123,10 @@ export function createCommandExecuteBeforeHook(args: {
         const showAll = argumentsText.includes("--all")
         pushText(
           output,
-          renderBgDashboard(
-            args.manager.getTasksByParentSession(input.sessionID),
-            args.manager.getConcurrencySnapshot(),
-            { foldCompleted: !showAll },
-          ),
+          renderBgDashboard(args.manager.getTasksByParentSession(input.sessionID), args.manager.getConcurrencySnapshot(), {
+            foldCompleted: !showAll,
+            tuiNavigation: args.tuiNavigation,
+          }),
         )
         return
       }
@@ -120,7 +148,9 @@ export function createCommandExecuteBeforeHook(args: {
         pushText(output, formatTaskOutput(args.manager, taskID, outputMatch[2] !== undefined, args.serverUrl))
         return
       }
-      const cancelMatch = argumentsText.match(/^(?:cancel)\s+(\S+)$/)
+      // (?!--) 排除旗标形态: "cancel --all" 会被 --all 当作 task id 命中,
+      // 必须落到下方的前缀拦截给用法提示,而不是报"任务不存在: --all"。
+      const cancelMatch = argumentsText.match(/^(?:cancel)\s+(?!--)(\S+)$/)
       if (cancelMatch) {
         const taskID = cancelMatch[1]!
         const owned = checkTaskOwnership(args.manager, input.sessionID, taskID)
@@ -170,6 +200,64 @@ export function createCommandExecuteBeforeHook(args: {
         }
         return
       }
+      if (argumentsText === "") {
+        pushText(output, "用法: /bg <任务描述> [--parallel <n≥2>] | status [--all] | status <task_id> | output <task_id> | cancel [task_id] | resume|send <task_id> <指令>")
+        return
+      }
+      // --parallel N:任务语义拆分需要 LLM——不原生启动，注入【并行启动】
+      // 指令，由模板回合中的模型并行调用 bg_spawn（模板不放 $ARGUMENTS，
+      // 描述只经这个 part 进入模型上下文）。
+      const parallelMatch = argumentsText.match(/--parallel\s+(\d+)\b/)
+      if (parallelMatch) {
+        const count = Number(parallelMatch[1])
+        const parallelTask = argumentsText.replace(/--parallel\s+\d+\b/, "").trim()
+        if (!parallelTask || !Number.isInteger(count) || count < 2) {
+          pushText(output, "用法: /bg <任务描述> --parallel <n≥2>（n 为相互独立的子任务个数）")
+          return
+        }
+        pushText(
+          output,
+          `已交给模型拆分（N=${count}）：${parallelTask}\n\n`
+            + `【并行启动 N=${count}】请把上述任务拆成 ${count} 个相互独立的子任务，在同一个回合内并行调用 ${count} 次 bg_spawn 工具（绝不串行等待），启动后告知用户每个子任务的 id 与用途。`,
+        )
+        return
+      }
+      // 任务描述形式：原生直接启动。await 的是秒级入队 I/O（与下方
+      // cancel/send 的 await 先例同级），不含任何 LLM 轮询。
+      showToast(args.client, "正在启动后台任务…")
+      try {
+        // 图片跟随：命令消息自带的图片附件直接从 parts 提取（按
+        // vision.enabled 门控——视觉关闭时子会话没有 vision_look，附加
+        // 图片只会制造读不了的死附件）。上一条消息的图片是旧上下文，
+        // 不跟随（与 collectLatestUserImages 的"无图即止"边界一致）。
+        const followImages = args.visionEnabled
+          ? extractImageParts(output.parts).slice(0, MAX_IMAGES_PER_BATCH)
+          : []
+        let parts: Array<Record<string, unknown>> | undefined
+        if (followImages.length > 0) {
+          parts = followImages.map((image) => ({ type: "file", mime: image.mime, url: image.url }))
+        }
+        const task = await args.manager.launch({
+          description: sanitizeTruncate(argumentsText, 80),
+          prompt: argumentsText,
+          parts,
+          parentSessionId: input.sessionID,
+        })
+        const model = task.model ? ` 模型 ${task.model.providerID}/${task.model.modelID}` : ""
+        pushText(
+          output,
+          `后台任务已入队: \`${task.id}\` (${task.description})${model}\n`
+            + `用 /bg output ${task.id} 查询结果、/bg cancel ${task.id} 取消（也可让模型调用 bg_output / bg_cancel）。\n`
+            + navHint(args.tuiNavigation),
+        )
+      } catch (error) {
+        // launch 抛出的都是已重试后的最终失败（内部完成分类），这里只需
+        // 提取信息并给出可行动引导，不重复判定可重试性。
+        const info = error instanceof Error ? errorInfoFromObject(error) : {}
+        const detail = info.message ?? String(error)
+        const hint = /shutting down/i.test(detail) ? "（插件正在关闭，无法启动新任务）" : "，可稍后重试或检查模型配置"
+        pushText(output, `后台任务启动失败: ${detail}${hint}`)
+      }
       return
     }
 
@@ -189,13 +277,16 @@ export function createCommandExecuteBeforeHook(args: {
           pushText(output, `无权查看其他会话的拆分任务: ${runID}`)
           return
         }
-        pushText(output, renderRunDetails(run))
+        pushText(output, fence(renderRunDetails(run)))
         return
       }
       if (argumentsText === "status" || argumentsText === "list" || argumentsText === "status --all" || argumentsText === "list --all") {
         // 拆分看板 + 独立任务合并视图(R2):run 的任务在 DAG 区块内展示,
         // 不属于任何 run 的后台任务以 INDEPENDENT TASKS 区块保留可见性。
         // 默认折叠全部终态的 run(--all 展开)。
+        // 混合内容不整体围栏:INDEPENDENT TASKS 区块是 markdown 管道表格,
+        // 围栏会使其在 web 端降级为代码块(错位);run 区块的缩进在 web 端
+        // 折叠属可接受的视觉损失,行前缀([s1]/Wave N:)保留结构语义。
         const showAll = argumentsText.includes("--all")
         const runs = args.registry.getRunsByParentSession(input.sessionID)
         const tasks = args.manager.getTasksByParentSession(input.sessionID)
@@ -255,7 +346,8 @@ export function createCommandExecuteBeforeHook(args: {
         )
         return
       }
-      const cancelMatch = argumentsText.match(/^(?:cancel)\s+(\S+)$/)
+      // (?!--) 同 /bg 侧: 旗标形态落到前缀拦截,不报"任务不存在"。
+      const cancelMatch = argumentsText.match(/^(?:cancel)\s+(?!--)(\S+)$/)
       if (cancelMatch) {
         const taskID = cancelMatch[1]!
         const owned = checkTaskOwnership(args.manager, input.sessionID, taskID)
@@ -269,11 +361,70 @@ export function createCommandExecuteBeforeHook(args: {
         return
       }
       if (argumentsText === "cancel") {
+        // 与 /bg 裸 cancel 对称：取消当前会话的全部后台任务（含拆分与独立任务）。
         showToast(args.client, "正在取消当前会话的全部后台任务…")
         await args.manager.cancelAllByParentSession(input.sessionID, "/split cancel")
         pushText(output, "已取消当前会话的全部后台任务")
         return
       }
+      // cancel 前缀命中但变体未识别（如 "cancel --all"、"cancel x y"）：拦下给
+      // 用法提示，防止穿透到任务描述语义把 "cancel" 当成任务 spawn 出去。
+      if (/^(?:cancel)(?:\s|$)/.test(argumentsText)) {
+        pushText(output, "用法: /split cancel <sp_run_id|task_id>（不带参数取消当前会话全部任务）")
+        return
+      }
+      if (argumentsText === "") {
+        pushText(output, "用法: /split <任务描述> [--dry-run] [--sequential] [--max <n>] | status [--all] | status <run_id> | output <task_id> | cancel [<sp_run_id|task_id>]")
+        return
+      }
+      // 任务描述形式：原生异步执行。意图判定与规划器都是一次性子会话，
+      // 严禁在 hook 内 await LLM 轮询（阻塞 TUI 整轮）——立即回执"已启动"，
+      // 产物（启动确认/dry-run 计划/意图判定结论/失败原因）经 PromptGate
+      // 回注主会话（注入的唯一入口，串行/去重由 gate 保证）。
+      const dryRun = /--dry-run\b/.test(argumentsText)
+      const sequential = /--sequential\b/.test(argumentsText)
+      const maxMatch = argumentsText.match(/--max\s+(\d+)\b/)
+      const rawMax = maxMatch ? Number(maxMatch[1]) : undefined
+      const maxSubtasks = rawMax !== undefined && Number.isInteger(rawMax) ? rawMax : undefined
+      const task = argumentsText.replace(/\s*--(?:dry-run|sequential|max\s+\d+)\b/g, "").trim()
+      if (!task) {
+        pushText(output, "用法: /split <任务描述> [--dry-run] [--sequential] [--max <n>]")
+        return
+      }
+      pushText(
+        output,
+        dryRun
+          ? "拆分任务已启动（预览模式）：正在做意图判定与规划（通常需十几秒），拆分计划生成后会自动注入本会话（未执行）；无需拆分或失败也会自动提示。"
+          : "拆分任务已启动：正在做意图判定与规划（通常需十几秒），计划确认后会自动启动子任务并注入本会话；失败会自动提示，进度可经 /split status 查看。",
+      )
+      void args.splitService
+        .split({ sessionID: input.sessionID, task, dryRun, sequential, maxSubtasks })
+        .then(async (outcome) => {
+          // dry-run 计划是分层缩进文本，围栏保形；其余产物为叙述文本。
+          const body = outcome.kind === "dry-run" ? fence(outcome.message) : outcome.message
+          const result = await args.gate.dispatch({
+            sessionID: input.sessionID,
+            source: "split-native-outcome",
+            text: [
+              "<system-reminder>",
+              "[PRISM SPLIT]",
+              "",
+              "请把以下拆分执行结果原样转达给用户（不要改写为列表、不要添加 emoji 或任何符号）：",
+              "",
+              body,
+              "</system-reminder>",
+            ].join("\n"),
+          })
+          if (result.status === "failed") {
+            log("[prism] split: outcome injection failed", { sessionID: input.sessionID, error: result.error })
+          }
+        })
+        .catch((error) => {
+          // fire-and-forget 链在 hook 之外：异常必须就地吞掉（不变量 #2），
+          // 否则以 unhandled rejection 泄漏进宿主进程 stderr。
+          log("[prism] split: native execution failed", { error })
+        })
+      return
     }
   }
 }

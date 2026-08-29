@@ -184,7 +184,13 @@ export function buildSplitReport(
   plans: SubTaskPlan[],
   skippedPlanIDs: Map<string, string> = new Map(),
 ): string {
-  const lines = ["<system-reminder>", "[PRISM SPLIT REPORT]", ""]
+  const lines = [
+    "<system-reminder>",
+    "[PRISM SPLIT REPORT]",
+    "",
+    "拆分子任务已全部执行结束。请把以下拆分任务汇总报告完整清晰地转达给用户，并进行最终整合总结与收尾说明：",
+    "",
+  ]
   // plan.title comes from the planner LLM and task.error from the provider —
   // untrusted text embedded in the template, escaped like the results.
   const esc = sanitizeSystemReminder
@@ -210,6 +216,10 @@ export function buildSplitReport(
     const result = task.resultText ? `\n  结果: ${esc(task.resultText.slice(0, 200))}` : ""
     lines.push(`- ${plan.id} ${title}: ${task.status.toUpperCase()}${error}${result}`)
   }
-  lines.push("", "整合子任务结果，完成整体任务的验证与收尾。", "</system-reminder>")
+  lines.push(
+    "",
+    "请根据上述各子任务的执行状态与结果，向用户汇报拆分执行情况并完成整体任务的验证与总结收尾。",
+    "</system-reminder>",
+  )
   return lines.join("\n")
 }

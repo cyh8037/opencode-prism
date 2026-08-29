@@ -51,8 +51,7 @@ describe("bg_spawn", () => {
     const result = await definition.execute({ description: "demo", prompt: "work" }, { sessionID: "session" } as never)
     expect(result).toContain("bg_hint1234")
     // 措辞是"启动后"（返回时任务实为 queued）,键位写"默认"不写死
-    expect(result).toContain("启动后可")
-    expect(result).toContain("TUI 中按 leader 键（默认 Ctrl+X）")
+    expect(result).toContain("启动后，TUI 中按 leader 键（默认 Ctrl+X）")
     expect(result).toContain("↑ 返回主会话")
   })
 })

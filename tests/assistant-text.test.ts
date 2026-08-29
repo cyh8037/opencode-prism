@@ -44,4 +44,22 @@ describe("collectAssistantText", () => {
     ]
     expect(lastAssistantText(messages)).toBe("newer")
   })
+
+  test("tolerates malformed entries and parts between valid ones", () => {
+    const messages = [
+      "junk",
+      { info: { role: "assistant" }, parts: ["junk", null, { type: "text", text: "before", state: "junk" }] },
+      { info: { role: "assistant" }, parts: [{ type: "text", text: "after", state: { status: "completed" } }] },
+    ]
+    expect(lastAssistantText(messages)).toBe("after")
+    expect(collectAssistantText(messages, 1000)).toBe("after")
+  })
+
+  test("skips whitespace-only text parts", () => {
+    const messages = [
+      { info: { role: "assistant" }, parts: [{ type: "text", text: "   ", state: { status: "completed" } }] },
+      { info: { role: "assistant" }, parts: [{ type: "text", text: "real", state: { status: "completed" } }] },
+    ]
+    expect(lastAssistantText(messages)).toBe("real")
+  })
 })

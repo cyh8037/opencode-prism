@@ -1,35 +1,20 @@
 import { tool, type ToolDefinition } from "@opencode-ai/plugin"
-import { BG_SESSION_NAV_HINT, BG_WAIT_DEFAULT_MS, BG_WAIT_MAX_MS, MAX_IMAGES_PER_BATCH } from "../config/constants"
+import { BG_SESSION_NAV_HINT, BG_WAIT_DEFAULT_MS, BG_WAIT_MAX_MS } from "../config/constants"
 import type { BackgroundManager } from "../core/background/manager"
+import { collectImageFollowParts } from "../core/background/image-follow"
 import type { PrismClient } from "../core/client-types"
-import { extractImageParts, type ImageAttachment } from "../core/vision/detector"
-import { errorInfoFromResult } from "../shared/api-result"
-import { log } from "../shared/log"
 
-// 从会话消息历史提取"最后一条用户消息"的图片附件(纯函数,可单测)。
-// 场景:/bg 分析这张图片——用户消息带 file 图片 part(斜杠命令的附件
-// 就是普通消息 part),bg_spawn 的子会话 prompt 需要带上这些图片才能让
-// 子任务 vision_look 读图。
-//
-// 严格只看最后一条用户消息、无图即止:更早消息的图片是旧上下文,跟随
-// 它们会把无关附件注入不相干的子任务(autoTrigger 下模型可随时自主
-// bg_spawn,误注入面更大)。基于早前消息的图片开新后台任务,由 bg 命令
-// 模板引导模型把图片路径显式写进 prompt。
-export function collectLatestUserImages(messages: unknown, max: number): ImageAttachment[] {
-  if (!Array.isArray(messages)) return []
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i] as { info?: { role?: string }; parts?: unknown } | undefined
-    if (message?.info?.role !== "user") continue
-    return extractImageParts(message.parts).slice(0, max)
-  }
-  return []
+// TUI 环境的子会话导航指引；web/headless 下 host 不提供 tui RPC 面，
+// 这段指引是错误操作指导，替换为工具侧的等价查看方式。
+function navigationHint(opts: { tuiNavigation: boolean }): string {
+  return opts.tuiNavigation ? `启动后，${BG_SESSION_NAV_HINT}。` : "启动后可通过 /bg status 或 bg_output 查看进度。"
 }
 
 // LLM-facing tools for the background engine. Commands (/bg, /split) are the
 // primary UX; these tools let the model drive the same engine mid-task.
 export function createBgTools(
   manager: BackgroundManager,
-  opts: { visionEnabled?: boolean; autoTrigger?: boolean; client?: PrismClient; directory?: string } = {},
+  opts: { visionEnabled?: boolean; autoTrigger?: boolean; client?: PrismClient; directory?: string; tuiNavigation?: boolean } = {},
 ): Record<string, ToolDefinition> {
   // With the vision feature disabled the child sessions also lose vision_look
   // from their tool lists — the read-image guidance must not point at a tool
@@ -68,31 +53,12 @@ export function createBgTools(
             parts = [{ type: "text", text: args.prompt, synthetic: true }]
           }
           if (opts.client && visionEnabled) {
-            try {
-              // 不变量 #7:4xx/5xx 解析为 { error } 而不是 reject,必须用
-              // errorInfoFromResult 判错;降级(跳过传图)必须留日志。
-              const response = await opts.client.session.messages({
-                path: { id: ctx.sessionID },
-                query: opts.directory ? { directory: opts.directory } : undefined,
-              })
-              const failure = errorInfoFromResult(response)
-              if (failure) {
-                log("[prism] bg_spawn: image follow skipped (messages query failed)", {
-                  sessionID: ctx.sessionID,
-                  error: failure.message,
-                })
-              } else {
-                const images = collectLatestUserImages(response.data, MAX_IMAGES_PER_BATCH)
-                if (images.length > 0) {
-                  parts = [
-                    ...(parts ?? []),
-                    ...images.map((image) => ({ type: "file", mime: image.mime, url: image.url })),
-                  ]
-                }
-              }
-            } catch (error) {
-              log("[prism] bg_spawn: image follow failed (skipped)", { sessionID: ctx.sessionID, error })
-            }
+            const followImages = await collectImageFollowParts({
+              client: opts.client,
+              directory: opts.directory,
+              sessionID: ctx.sessionID,
+            })
+            if (followImages) parts = [...(parts ?? []), ...followImages]
           }
           const task = await manager.launch({
             description: args.description,
@@ -105,9 +71,7 @@ export function createBgTools(
           return (
             `后台任务已入队: \`${task.id}\` (${task.description}) ${model}\n`
             + `用 bg_output("${task.id}") 查询结果，bg_cancel("${task.id}") 取消。\n`
-            // 键位为 TUI 默认值（用户可覆盖），措辞用"启动后"——返回时任务
-            // 实为 queued，尚未开始产生输出。
-            + `启动后可${BG_SESSION_NAV_HINT}。`
+            + navigationHint({ tuiNavigation: opts.tuiNavigation ?? true })
           )
         } catch (error) {
           return `后台任务启动失败: ${error instanceof Error ? error.message : String(error)}`
