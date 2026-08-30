@@ -2,6 +2,7 @@ import { VISION_INTERPRET_POLL_MS, VISION_SYNC_TIMEOUT_MS } from "../../config/c
 import type { ResolvedModel } from "../../models"
 import { errorInfoFromResult } from "../../shared/api-result"
 import { log } from "../../shared/log"
+import { sleep } from "../../shared/sleep"
 import { lastAssistantText } from "../assistant-text"
 import type { PrismClient } from "../client-types"
 import type { ImageAttachment } from "./detector"
@@ -87,10 +88,6 @@ export function visionFailureMessage(reason: VisionFailureReason, invalidRefs: s
     case "internal-error":
       return "视觉解读失败: 插件内部错误（详见插件日志）"
   }
-}
-
-async function sleep(ms: number): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 export interface InterpretationOutcome {
@@ -219,7 +216,10 @@ export async function runVisionInterpretation(args: {
   } finally {
     // Fire-and-forget cleanup: callers may be blocking a hook while this
     // runs, so the abort must not add its own latency. The server tears the
-    // session down regardless of whether this promise settles first.
-    client.session.abort({ path: { id: sessionID } }).catch(() => {})
+    // session down regardless of whether this promise settles first. The
+    // session was created under `directory` — scope the abort the same way.
+    client.session
+      .abort({ path: { id: sessionID }, query: { directory } })
+      .catch(() => {})
   }
 }

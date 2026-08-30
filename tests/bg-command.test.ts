@@ -26,6 +26,7 @@ function createHook(options: {
   splitOutcome?: { kind: string; message: string }
   visionEnabled?: boolean
   tuiNavigation?: boolean
+  isChildSession?: boolean
 }): {
   hook: ReturnType<typeof createCommandExecuteBeforeHook>
   toasts: string[]
@@ -39,6 +40,7 @@ function createHook(options: {
   const manager = {
     getTasksByParentSession: () => options.tasks,
     getTask: (id: string) => options.tasks.find((task) => task.id === id),
+    isChildSession: () => options.isChildSession ?? false,
     cancelTask: async (taskID: string, cancelOptions?: { skipNotification?: boolean }) => {
       if (options.onCancelTask) return options.onCancelTask(taskID, cancelOptions)
       return options.cancelled ?? true
@@ -274,6 +276,15 @@ describe("/bg native task launch", () => {
     expect(launches).toHaveLength(0)
   })
 
+  test("--parallel over the MAX_SUBTASKS cap gets a usage hint, not an unbounded spawn instruction", async () => {
+    const { hook, launches } = createHook({ tasks: [] })
+    const text = await run(hook, "bg", "--parallel 50 做事")
+    expect(text).toContain("用法:")
+    expect(text).toContain("2-12")
+    expect(text).not.toContain("【并行启动 N=50】")
+    expect(launches).toHaveLength(0)
+  })
+
   test("empty arguments get a usage hint instead of a model round with nothing to relay", async () => {
     const { hook, launches } = createHook({ tasks: [] })
     expect(await run(hook, "bg", "")).toContain("用法:")
@@ -285,7 +296,23 @@ describe("/bg native task launch", () => {
     const { hook, launches } = createHook({ tasks: [], launchResult: { id: "bg_img", description: "看图" } })
     await hook({ command: "bg", sessionID: "session", arguments: "分析这张图" }, output)
     expect(launches).toHaveLength(1)
-    expect(launches[0]!.parts).toEqual([{ type: "file", mime: "image/png", url: "data:image/png;base64,AAA" }])
+    // 回归（P0）：parts 必须自带任务文本 part——startTask 的语义是 parts
+    // 完全取代 input.prompt，只传图片会把任务指令整个丢掉。
+    expect(launches[0]!.parts).toEqual([
+      { type: "text", text: "分析这张图", synthetic: true },
+      { type: "file", mime: "image/png", url: "data:image/png;base64,AAA" },
+    ])
+  })
+
+  test("/bg and /split are refused inside prism child sessions", async () => {
+    for (const command of ["bg", "split"] as const) {
+      const { hook, launches, splitCalls } = createHook({ tasks: [], isChildSession: true })
+      const text = await run(hook, command, "做点事")
+      expect(text).toContain("后台子会话内不能执行")
+      expect(text).toContain("回到主会话")
+      expect(launches).toHaveLength(0)
+      expect(splitCalls).toHaveLength(0)
+    }
   })
 
   test("no image follow when vision is disabled (child has no vision_look)", async () => {

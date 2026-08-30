@@ -15,7 +15,7 @@ export interface PrismSession {
     body: Record<string, unknown>
     query?: { directory?: string }
   }): Promise<{ data?: { id: string }; error?: unknown }>
-  abort(params: { path: { id: string } }): Promise<unknown>
+  abort(params: { path: { id: string }; query?: { directory?: string } }): Promise<unknown>
   prompt(params: {
     path: { id: string }
     body: Record<string, unknown>

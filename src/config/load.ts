@@ -9,12 +9,20 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
+// Unsafe prototype-chain keys: a config file is untrusted-ish input (a
+// cloned repo's .prism/prism.jsonc loads into this process), and assigning
+// obj["__proto__"] = {...} rewrites the object's prototype rather than
+// creating an own property — skip the keys outright instead of relying on
+// downstream schema stripping (the assignment happens before validation).
+const UNSAFE_MERGE_KEYS = new Set(["__proto__", "constructor", "prototype"])
+
 function deepMerge<T>(base: T, override: unknown): T {
   if (!isRecord(base) || !isRecord(override)) {
     return (override as T) ?? base
   }
   const result: Record<string, unknown> = { ...base }
   for (const [key, value] of Object.entries(override)) {
+    if (UNSAFE_MERGE_KEYS.has(key)) continue
     result[key] = isRecord(base[key]) && isRecord(value) ? deepMerge(base[key], value) : value
   }
   return result as T
@@ -111,7 +119,16 @@ export function parseConfig(partial: Record<string, unknown>, warnings: string[]
       }
     }
     for (const [field, indices] of invalidIndices) {
-      cleaned[field] = (cleaned[field] as unknown[]).filter((_, i) => !indices.has(i))
+      // A field-level issue in the same section pass may have deleted this
+      // field already (one schema can emit both an element-indexed issue and
+      // a field-level one for the same array). Filtering the deleted field
+      // would throw and break parseConfig's documented never-throws contract
+      // — unreachable with the current schema (no array-level constraints),
+      // but one .min()/.superRefine() away from crashing plugin load.
+      const entries = cleaned[field]
+      if (Array.isArray(entries)) {
+        cleaned[field] = entries.filter((_, i) => !indices.has(i))
+      }
     }
     const retried = prismConfigSchema.shape[key].safeParse(deepMerge(defaults[key], cleaned))
     if (retried.success) {
@@ -128,8 +145,11 @@ export interface ConfigLoadResult {
 }
 
 export function loadConfig(startDir: string, env: Record<string, string | undefined> = process.env): ConfigLoadResult {
-  const userPath = env.PRISM_CONFIG ?? join(homedir(), ".prism", "prism.jsonc")
-  const projectPath = findProjectConfig(startDir)
+  // PRISM_CONFIG 是一次性实验覆盖：设置时独占生效（跳过用户级默认文件与
+  // 项目级文件），否则带自有项目配置的仓库会把实验值覆盖回去，实验就失真。
+  const overridePath = env.PRISM_CONFIG?.trim()
+  const userPath = overridePath && overridePath.length > 0 ? overridePath : join(homedir(), ".prism", "prism.jsonc")
+  const projectPath = overridePath && overridePath.length > 0 ? null : findProjectConfig(startDir)
 
   const warnings: string[] = []
   let merged: Record<string, unknown> = {}

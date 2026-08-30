@@ -3,11 +3,13 @@ import type { ErrorInfo } from "./types"
 const RETRYABLE_PATTERNS = [
   /rate\s*limit/i,
   /too many requests/i,
-  /429/,
-  /503/,
-  /502/,
-  /500/,
-  /504/,
+  // 状态码词匹配必须带 \b 锚定：裸 /500/ 会命中 "1500 tokens" 这类正文，
+  // 把非限流错误误判为可重试。
+  /\b429\b/,
+  /\b500\b/,
+  /\b502\b/,
+  /\b503\b/,
+  /\b504\b/,
   /overloaded/i,
   /service unavailable/i,
   /timeout/i,

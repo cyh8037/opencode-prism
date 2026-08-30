@@ -18,6 +18,7 @@
 import { getStringWidth, padEndWidth, truncateWidth } from "../shared/width"
 import { sanitizeSystemReminder } from "../../shared/sanitize"
 import { BG_SESSION_NAV_HINT, MAX_SESSION_TITLE_CHARS } from "../../config/constants"
+import { TERMINAL_TASK_STATUSES } from "./types"
 import type { BgTask } from "./types"
 
 /** 单字段渲染管线:sanitize(模板逃逸)→ ANSI 整序列剥离 → 换行压平 → 控制字符剥离。
@@ -118,7 +119,10 @@ function renderTable(title: string | undefined, tasks: BgTask[], columns: Column
 const ID_COLUMN: Column = {
   header: "ID",
   minWidth: 4,
-  maxWidth: 12,
+  // 任务 id 定长:bg_ + 12 位 hex = 15(manager.launch 生成处)。上限必须
+  // ≥ 实际长度,ID 列禁止截断——看板上的 id 被截短后用户照抄去 /bg status
+  // 查询必报"任务不存在"(2026-08-30 真实会话事故),复制回查必须闭环。
+  maxWidth: 15,
   cell: (task) => task.id,
 }
 
@@ -159,7 +163,7 @@ const RETRIES_COLUMN: Column = {
   cell: (task) => (task.retries > 0 ? `${task.retries + 1} attempts` : "-"),
 }
 
-const TERMINAL_STATUSES = new Set(["completed", "error", "cancelled"])
+const TERMINAL_STATUSES = TERMINAL_TASK_STATUSES
 
 /** `/bg status` 看板:标题只含计数(必不超宽),并发池信息放在表格下方独立
  *  行完整显示(池信息进标题会被截断,截断点落在模型名中间观感像文本损坏)。

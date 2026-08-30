@@ -96,7 +96,7 @@ describe("SplitRunRegistry", () => {
   test("register assigns a sp_ id when none is provided", () => {
     const registry = new SplitRunRegistry(60 * 60_000)
     const { id } = registry.register(makeEntry({ id: undefined }))
-    expect(id).toMatch(/^sp_[0-9a-f]{8}$/)
+    expect(id).toMatch(/^sp_[0-9a-f]{12}$/)
   })
 
   test("getRun finds a run by its id across sessions", () => {

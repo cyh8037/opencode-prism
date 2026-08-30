@@ -85,6 +85,7 @@ function createManager(
     concurrency?: number
     pollingIntervalMs?: number
     resumeAcquireTimeoutMs?: number
+    standaloneFlushDelayMs?: number
     model?: ResolvedModel
     statusData?: Record<string, { type?: string }>
     noToast?: boolean
@@ -103,8 +104,25 @@ function createManager(
     resolveModel: async () => overrides.model ?? SESSION_MODEL,
     pollingIntervalMs: overrides.pollingIntervalMs ?? 60_000,
     resumeAcquireTimeoutMs: overrides.resumeAcquireTimeoutMs,
+    // 独立任务完成通知的合并窗口:测试里给短窗(生产默认 8s),让"窗口内
+    // 合并"与"窗口到达即刷出"两条路径都能在亚秒断言内覆盖。
+    standaloneFlushDelayMs: overrides.standaloneFlushDelayMs ?? 50,
   })
   return { manager, gate, client, childSessions, statusData, toasts }
+}
+
+// Capture gate dispatches (notification texts) while keeping the real gate
+// behavior — notifyParent's batch semantics are asserted against these.
+function spyOnDispatches(gate: PromptGate): string[] {
+  const dispatched: string[] = []
+  const original = gate.dispatchWithRetry.bind(gate)
+  ;(gate as unknown as { dispatchWithRetry: unknown }).dispatchWithRetry = async (
+    input: { sessionID: string; source: string; text: string },
+  ) => {
+    dispatched.push(input.text)
+    return original(input)
+  }
+  return dispatched
 }
 
 // Drive the polling loop directly (it normally runs on an interval).
@@ -337,8 +355,8 @@ describe("BackgroundManager", () => {
     expect(session.title.endsWith(" (prism)")).toBe(true)
     expect(session.title).not.toContain("\n")
     expect(session.title).not.toContain("\u001b")
-    // 前缀 [bg_xxxxxxxx](11) + 空格(1) + 100 码元 + " (prism)"(8)
-    expect(session.title.length).toBeLessThanOrEqual(122)
+    // 前缀 "[bg_" + 12 位 id + "]"(17) + 空格(1) + 100 码元 + " (prism)"(8)
+    expect(session.title.length).toBeLessThanOrEqual(126)
   })
 
   test("child prompts disable split_task alongside the other prism tools", async () => {
@@ -445,6 +463,53 @@ describe("BackgroundManager", () => {
 
     expect(task.status).toBe("error")
     expect(task.retries).toBe(1)
+  })
+
+  // Two failure signals for one task can overlap (a prompt rejection racing
+  // the same run's session.error event). The first tryRetry flips the task to
+  // "pending" synchronously before its abort await; the latch must make the
+  // loser stand down WITHOUT reporting "not retried" — a false would send its
+  // caller into finalizeTask(error) and kill the task the winner is about to
+  // relaunch.
+  test("a second failure signal while a retry is in flight stands down without finalizing", async () => {
+    const { manager, childSessions } = createManager()
+    const task = await manager.launch({ description: "race retry", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(task.status).toBe("running")
+
+    // White-box: reflect the state the winning tryRetry leaves behind (status
+    // flipped to pending synchronously, its abort still in flight).
+    task.status = "pending"
+    const tryRetry = (
+      manager as unknown as {
+        tryRetry(task: BgTask, errorInfo: { message?: string }): Promise<boolean>
+      }
+    ).tryRetry.bind(manager)
+    const loserOutcome = await tryRetry(task, { message: "503 Service Unavailable" })
+
+    expect(loserOutcome).toBe(true)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    // Without the latch the loser would pass the retries check and re-queue a
+    // second launch for the same task (two children, the first orphaned).
+    expect(childSessions.size).toBe(1)
+    expect(task.retries).toBe(0)
+    expect(task.error).toBeUndefined()
+  })
+
+  test("a second concurrent resume on the same terminal task is rejected", async () => {
+    const { manager } = createManager()
+    const task = await manager.launch({ description: "double resume", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await poll(manager) // idle status map → settled as completed
+    expect(task.status).toBe("completed")
+
+    // resume() establishes resumingTaskIds synchronously (before its acquire
+    // await), so the second call must be rejected instead of double-prompting
+    // the same child session.
+    const first = manager.resume(task.id, "first")
+    await expect(manager.resume(task.id, "second")).rejects.toThrow(/恢复等待/)
+    await first
+    expect(task.status).toBe("running")
   })
 
   test("launch throws when the session model is unresolvable", async () => {
@@ -1567,5 +1632,170 @@ describe("BackgroundManager", () => {
     // survive, or the recursion guard would no longer recognize the child.
     expect(task.taskType).toBe("vision")
     await manager.shutdown()
+  })
+
+  // Regression (0.5.0 review): the session.status "retry" state is the HOST's
+  // transient provider-backoff (verified 1.18) — the old handler aborted and
+  // re-queued the task on it, or finalized it as "error" when the backoff
+  // message matched no retryable pattern, while the polling path correctly
+  // treats the same status as busy. Now it only refreshes the watchdog anchor.
+  test("a session.status retry event refreshes the anchor without failing the task", async () => {
+    const { manager, childSessions } = createManager()
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const child = childSessions.get(task.sessionId!)!
+    const before = task.progress!.lastUpdate.getTime()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    manager.handleEvent({
+      type: "session.status",
+      properties: { sessionID: task.sessionId, status: { type: "retry", message: "429 too many requests" } },
+    })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    expect(task.status).toBe("running")
+    expect(task.retries).toBe(0)
+    expect(child.aborted).toBe(false)
+    expect(task.progress!.lastUpdate.getTime()).toBeGreaterThan(before)
+    await manager.shutdown()
+  })
+
+  // Regression (0.5.0 review): a non-retryable prompt rejection finalized the
+  // task but left the created child session alive — an empty orphan in the
+  // TUI child navigation forever.
+  test("a non-retryable prompt rejection aborts the created child session", async () => {
+    const { manager, client, childSessions } = createManager()
+    const original = client.session.promptAsync.bind(client.session)
+    client.session.promptAsync = async (...args: Parameters<PrismClient["session"]["promptAsync"]>) => ({
+      error: { message: "model not found" },
+      response: { status: 400 },
+    }) as unknown as Awaited<ReturnType<PrismClient["session"]["promptAsync"]>>
+    void original
+
+    const task = await manager.launch({ description: "doomed", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    expect(task.status).toBe("error")
+    expect(task.sessionId).toBeDefined()
+    expect(childSessions.get(task.sessionId!)?.aborted).toBe(true)
+    await manager.shutdown()
+  })
+})
+
+// 完成通知的批次语义（notificationGroup + 独立任务合并窗口）。2026-08-30
+// 事故回归:拆分进行中插入的 /bg 任务完成后,"父会话全量门控"把它的完成
+// 通知静默压到整个拆分结束——独立任务必须在自己的终态上进入通知流程。
+describe("background completion notification batching", () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  test("standalone task completing mid-split reports on its own, not gated on the run", async () => {
+    const { manager, gate } = createManager({ standaloneFlushDelayMs: 20 })
+    const dispatched = spyOnDispatches(gate)
+
+    // 拆分子任务（带 notificationGroup，模拟 run）：始终保持 running。
+    const subtask = await manager.launch({
+      description: "s1: 拆分子任务",
+      prompt: "work",
+      parentSessionId: "parent",
+      notificationGroup: "sp_run1",
+    })
+    const standalone = await manager.launch({
+      description: "查看下 [Image 1]",
+      prompt: "work",
+      parentSessionId: "parent",
+    })
+    await sleep(50)
+    expect(subtask.status).toBe("running")
+
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: standalone.sessionId } })
+    await sleep(250)
+
+    expect(standalone.status).toBe("completed")
+    expect(subtask.status).toBe("running")
+    expect(dispatched).toHaveLength(1)
+    expect(dispatched[0]).toContain("查看下 [Image 1]")
+    // 父会话仍有进行中任务：标题不得声称"全部后台任务已结束"。
+    expect(dispatched[0]).toContain("后台任务已完成 (1 个):")
+    expect(dispatched[0]).not.toContain("全部后台任务已结束")
+  })
+
+  test("grouped tasks (split run) report once when the whole group settles", async () => {
+    const { manager, gate } = createManager()
+    const dispatched = spyOnDispatches(gate)
+
+    const s1 = await manager.launch({
+      description: "s1: a",
+      prompt: "work",
+      parentSessionId: "parent",
+      notificationGroup: "sp_run1",
+    })
+    const s2 = await manager.launch({
+      description: "s2: b",
+      prompt: "work",
+      parentSessionId: "parent",
+      notificationGroup: "sp_run1",
+    })
+    await sleep(50)
+
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: s1.sessionId } })
+    await sleep(250)
+    expect(s1.status).toBe("completed")
+    // 组未收尾：静默，不唤醒父会话。
+    expect(dispatched).toHaveLength(0)
+
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: s2.sessionId } })
+    await sleep(250)
+    expect(dispatched).toHaveLength(1)
+    expect(dispatched[0]).toContain("全部后台任务已结束 (2 个):")
+    expect(dispatched[0]).toContain("s1: a")
+    expect(dispatched[0]).toContain("s2: b")
+  })
+
+  test("standalone completions inside the flush window merge into one notification", async () => {
+    const { manager, gate } = createManager({ standaloneFlushDelayMs: 120 })
+    const dispatched = spyOnDispatches(gate)
+
+    const a = await manager.launch({ description: "任务甲", prompt: "work", parentSessionId: "parent" })
+    const b = await manager.launch({ description: "任务乙", prompt: "work", parentSessionId: "parent" })
+    await sleep(50)
+
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: a.sessionId } })
+    await sleep(40)
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: b.sessionId } })
+    await sleep(350)
+
+    expect(a.status).toBe("completed")
+    expect(b.status).toBe("completed")
+    expect(dispatched).toHaveLength(1)
+    expect(dispatched[0]).toContain("全部后台任务已结束 (2 个):")
+    expect(dispatched[0]).toContain("任务甲")
+    expect(dispatched[0]).toContain("任务乙")
+  })
+
+  test("a failed standalone task reports immediately, even while a grouped batch runs", async () => {
+    // 失败是可行动信号：不进合并窗口（窗口拉到 60s 也必须在断言时间内注入）。
+    const { manager, gate } = createManager({ standaloneFlushDelayMs: 60_000 })
+    const dispatched = spyOnDispatches(gate)
+
+    const grouped = await manager.launch({
+      description: "s1: 拆分子任务",
+      prompt: "work",
+      parentSessionId: "parent",
+      notificationGroup: "sp_run1",
+    })
+    const bad = await manager.launch({ description: "会失败的任务", prompt: "work", parentSessionId: "parent" })
+    await sleep(50)
+
+    manager.handleEvent({
+      type: "session.error",
+      properties: { sessionID: bad.sessionId, error: { name: "ProviderError", message: "boom" } },
+    })
+    await sleep(250)
+
+    expect(bad.status).toBe("error")
+    expect(grouped.status).toBe("running")
+    expect(dispatched).toHaveLength(1)
+    expect(dispatched[0]).toContain("后台任务状态更新:")
+    expect(dispatched[0]).toContain("boom")
   })
 })

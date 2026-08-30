@@ -73,9 +73,17 @@ export const BG_WAIT_MAX_MS = 600_000
 // cancelled out of the wait. Bounded here, the bg_send call returns an error
 // instead of hanging the tool round.
 export const RESUME_ACQUIRE_TIMEOUT_MS = 15_000
+// 独立任务（无 notificationGroup）完成通知的合并窗口：窗口内终态的独立任务
+// 合并为一条通知（/bg --parallel N 几乎同时结束时不再逐条唤醒父会话）。
+// 窗口只是合并手段，绝不是门控——窗口到达时先刷出已终态的任务，绝不因
+// 同会话仍有其他批次在跑而推迟（2026-08-30 事故的教训）。
+export const STANDALONE_FLUSH_DELAY_MS = 8_000
 
 // split
 export const MAX_SUBTASKS = 12
+// 同一会话同时处于"未结算"状态的拆分 run 上限：模型 autoTrigger 连续
+// split_task（或用户连按 /split）时防失控叠 run。best-effort 上限。
+export const MAX_ACTIVE_SPLIT_RUNS = 2
 export const PLANNER_SYNC_TIMEOUT_MS = 120_000
 // 意图识别（一次性分类子会话）的超时。比规划器短：分类任务轻，超时即
 // fail-open 视为可拆分，不重试（重试只是把 /split 的等待加倍）。
@@ -93,7 +101,7 @@ export const MAX_SESSION_TITLE_CHARS = 100
 // session_child_cycle(right,left)/session_parent(up) 及 parentID 子会话
 // 分组行为，经 opencode 1.15.0 与 1.18.25 二进制（strings）验证一致。
 export const BG_SESSION_NAV_HINT =
-  "TUI 中按 leader 键（默认 Ctrl+X）后按 ↓ 实时查看子会话输出，←/→ 切换，↑ 返回主会话"
+  "In TUI, press leader key (default Ctrl+X) then ↓ to view child session output live, ←/→ to cycle, ↑ to return to parent session"
 
 // attach hint (/bg output --full) server port
 export const DEFAULT_SERVER_PORT = 4096
@@ -110,3 +118,7 @@ export const GATE_RESERVATION_WAIT_MS = 15_000
 export const GATE_RESERVATION_POLL_MS = 100
 export const GATE_DISPATCH_ATTEMPTS = 3
 export const GATE_DISPATCH_RETRY_DELAY_MS = 1_000
+// dispatchWithRetry 的外层退避阶梯（gate 内层 3×1s 之外）：注入文本往往承载
+// 唯一一份完成报告/汇总（调用方不会重新入队），主会话一段长回合的 busy
+// 窗口可达 30+ 秒，外层阶梯覆盖它。后台完成通知与 split 聚合共用。
+export const GATE_DISPATCH_RETRY_DELAYS_MS: readonly number[] = [1_000, 2_000, 4_000, 8_000, 16_000]

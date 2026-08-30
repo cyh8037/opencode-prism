@@ -1,4 +1,4 @@
-import { MAX_SUBTASKS } from "../../config/constants"
+import { MAX_ACTIVE_SPLIT_RUNS, MAX_SUBTASKS } from "../../config/constants"
 import type { ResolvedModel } from "../../models"
 import { log } from "../../shared/log"
 import type { BackgroundManager } from "../background/manager"
@@ -34,7 +34,7 @@ export interface SplitRequest {
 }
 
 export interface SplitOutcome {
-  kind: "dry-run" | "launched" | "planner-failed" | "unresolvable-planner-model" | "skipped-intent"
+  kind: "dry-run" | "launched" | "planner-failed" | "unresolvable-planner-model" | "skipped-intent" | "run-limit"
   message: string
   run?: SplitRunResult
 }
@@ -48,6 +48,19 @@ export class SplitService {
   }
 
   async split(request: SplitRequest): Promise<SplitOutcome> {
+    // 并发 run 上限：模型 autoTrigger 下连续 split_task（或用户连按 /split）
+    // 会叠出多组子任务互相抢并发槽、看板难以阅读。best-effort（两次并发
+    // split 的检查窗口内仍可能同时通过），语义是防失控而非硬隔离。
+    const activeRuns = this.deps.registry
+      .getRunsByParentSession(request.sessionID)
+      .filter((entry) => !entry.settled).length
+    if (activeRuns >= MAX_ACTIVE_SPLIT_RUNS) {
+      return {
+        kind: "run-limit",
+        message: `已有 ${activeRuns} 个拆分任务在执行（上限 ${MAX_ACTIVE_SPLIT_RUNS}）。请等待其完成，或用 /split cancel <sp_run_id> 取消后再试；/split status 可查看进行中的 run。`,
+      }
+    }
+
     // Single source of the subtask bounds for BOTH entry points (/split
     // command and split_task tool): out-of-range or non-integer values fall
     // back to the default instead of producing a contradictory planner
@@ -145,17 +158,23 @@ export class SplitService {
       return { kind: "dry-run", message }
     }
 
+    // run id 先于启动生成：runSplit 要拿它当子任务的 notificationGroup
+    // （父会话在每个 run 收尾只被唤醒一次，同会话独立任务的通知不受其
+    // 门控），register 时原样传入保持 id 一致。
+    const runId = this.deps.registry.generateRunId()
     const run = runSplit(this.deps.manager, {
       plans,
       parentSessionId: request.sessionID,
       basePromptPrefix: `你在执行一个更大任务的子任务。整体任务: ${request.task}`,
       sequential: request.sequential,
+      notificationGroupId: runId,
     })
 
     // 登记到 SplitRunRegistry:/split status 看板的数据源。tasksByPlanID /
     // skippedPlanIDs 是实时引用,状态在查询时推导;run 结束时标记 settled,
     // TTL 锚点随之切换(运行中条目永不清理,见 registry.ts 文件头注释)。
     const registryEntry = this.deps.registry.register({
+      id: runId,
       sessionID: request.sessionID,
       plans,
       tasksByPlanID: run.tasksByPlanID,
@@ -190,29 +209,14 @@ export class SplitService {
     void run.done
       .then(async () => {
         const text = buildSplitReport(run.tasksByPlanID, plans, run.skippedPlanIDs)
-        const dispatch = () =>
-          this.deps.gate.dispatch({
-            sessionID: request.sessionID,
-            source: "split-aggregation",
-            text,
-          })
-
-        // 升级为 5 轮指数退避重试（覆盖最长 30+ 秒的主会话 busy 等待窗口）
-        const retryDelays = [1_000, 2_000, 4_000, 8_000, 16_000]
-        let result = await dispatch()
-        let attempt = 0
-        while (result.status === "failed" && attempt < retryDelays.length) {
-          const delay = retryDelays[attempt]!
-          this.logger("[prism] split: aggregation dispatch failed, retrying", {
-            sessionID: request.sessionID,
-            attempt: attempt + 1,
-            delay,
-            error: result.error,
-          })
-          await new Promise((resolve) => setTimeout(resolve, delay))
-          result = await dispatch()
-          attempt++
-        }
+        // 升级为退避阶梯重试（覆盖最长 30+ 秒的主会话 busy 窗口）：汇总
+        // 报告是 SKIPPED 计划的唯一记录，永久丢失前必须穷尽重试。重试语义
+        // 收敛在 gate.dispatchWithRetry（与后台完成通知共用同一阶梯）。
+        const result = await this.deps.gate.dispatchWithRetry({
+          sessionID: request.sessionID,
+          source: "split-aggregation",
+          text,
+        })
 
         if (result.status === "failed") {
           // The report is the only record of the SKIPPED plans (the per-task

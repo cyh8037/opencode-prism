@@ -197,6 +197,12 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
       // `(config) => Promise<void>`), so in-place mutation is the only way
       // commands reach the config that the TUI slash menu reads.
       const cfg = configInput as { command?: Record<string, PrismCommandDefinition> }
+      // Prism 注册的 bg/split 会覆盖用户在 opencode 配置里的同名命令——
+      // 检测到冲突时留日志（用户命令被静默吞掉是排查黑洞）。
+      const conflicts = ["bg", "split"].filter((name) => cfg.command?.[name] !== undefined)
+      if (conflicts.length > 0) {
+        log(`[prism] user-defined command templates are overridden by prism commands: ${conflicts.join(", ")}`)
+      }
       cfg.command = {
         ...(cfg.command ?? {}),
         // vision.enabled drops the read-image guidance from both templates:

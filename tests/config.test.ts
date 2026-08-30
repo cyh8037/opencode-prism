@@ -114,12 +114,10 @@ describe("loadConfig", () => {
   test("a malformed config file is ignored instead of throwing", () => {
     const dir = mkdtempSync(join(tmpdir(), "prism-cfg-"))
     try {
-      const configDir = join(dir, ".prism")
-      mkdirSync(configDir)
-      writeFileSync(join(configDir, "prism.jsonc"), '{ "vision": { "model": "unterminated')
-      // PRISM_CONFIG points at a nonexistent file so the home config cannot
-      // leak into this assertion; only the broken project config is read.
-      const { config } = loadConfig(dir, { PRISM_CONFIG: join(dir, "unused.jsonc") })
+      // PRISM_CONFIG 独占生效（跳过项目级与用户级默认路径），指向损坏文件：
+      // 既隔离了真实 home 配置的泄漏，也验证坏文件不抛错、回退默认值。
+      writeFileSync(join(dir, "broken.jsonc"), '{ "vision": { "model": "unterminated')
+      const { config } = loadConfig(dir, { PRISM_CONFIG: join(dir, "broken.jsonc") })
       expect(config.vision.model).toBe("")
       expect(config.background.concurrency).toBe(5)
     } finally {
@@ -130,10 +128,8 @@ describe("loadConfig", () => {
   test("a non-object config file is ignored instead of throwing", () => {
     const dir = mkdtempSync(join(tmpdir(), "prism-cfg-"))
     try {
-      const configDir = join(dir, ".prism")
-      mkdirSync(configDir)
-      writeFileSync(join(configDir, "prism.jsonc"), '["not", "an", "object"]')
-      const { config } = loadConfig(dir, { PRISM_CONFIG: join(dir, "unused.jsonc") })
+      writeFileSync(join(dir, "not-object.jsonc"), '["not", "an", "object"]')
+      const { config } = loadConfig(dir, { PRISM_CONFIG: join(dir, "not-object.jsonc") })
       expect(config.vision.model).toBe("")
     } finally {
       rmSync(dir, { recursive: true, force: true })
@@ -143,10 +139,8 @@ describe("loadConfig", () => {
   test("file-level problems are reported as warnings", () => {
     const dir = mkdtempSync(join(tmpdir(), "prism-cfg-"))
     try {
-      const configDir = join(dir, ".prism")
-      mkdirSync(configDir)
-      writeFileSync(join(configDir, "prism.jsonc"), '{ "vision": { "model": "unterminated')
-      const { config, warnings } = loadConfig(dir, { PRISM_CONFIG: join(dir, "unused.jsonc") })
+      writeFileSync(join(dir, "broken.jsonc"), '{ "vision": { "model": "unterminated')
+      const { config, warnings } = loadConfig(dir, { PRISM_CONFIG: join(dir, "broken.jsonc") })
       expect(warnings).toHaveLength(1)
       expect(warnings[0]).toContain("failed to parse")
       expect(config.vision.model).toBe("")
@@ -158,17 +152,48 @@ describe("loadConfig", () => {
   test("invalid sections are reported as warnings while valid ones are kept", () => {
     const dir = mkdtempSync(join(tmpdir(), "prism-cfg-"))
     try {
-      const configDir = join(dir, ".prism")
-      mkdirSync(configDir)
       writeFileSync(
-        join(configDir, "prism.jsonc"),
+        join(dir, "sections.jsonc"),
         JSON.stringify({ vision: { model: "no-slash" }, background: { concurrency: 3 } }),
       )
-      const { config, warnings } = loadConfig(dir, { PRISM_CONFIG: join(dir, "unused.jsonc") })
+      const { config, warnings } = loadConfig(dir, { PRISM_CONFIG: join(dir, "sections.jsonc") })
       expect(warnings).toHaveLength(1)
       expect(warnings[0]).toContain("invalid fields fell back")
       expect(config.background.concurrency).toBe(3)
       expect(config.vision.model).toBe("")
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("PRISM_CONFIG is exclusive: the project config is ignored while it is set", () => {
+    const dir = mkdtempSync(join(tmpdir(), "prism-cfg-"))
+    try {
+      const configDir = join(dir, ".prism")
+      mkdirSync(configDir)
+      writeFileSync(join(configDir, "prism.jsonc"), JSON.stringify({ background: { concurrency: 3 } }))
+      // 指向不存在的文件：实验语义下项目级配置被跳过，而不是再被它覆盖。
+      const { config, warnings } = loadConfig(dir, { PRISM_CONFIG: join(dir, "unused.jsonc") })
+      expect(warnings).toHaveLength(0)
+      expect(config.background.concurrency).toBe(5)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("deepMerge skips prototype-chain keys from config files", () => {
+    const dir = mkdtempSync(join(tmpdir(), "prism-cfg-"))
+    try {
+      // JSON.parse 产生 __proto__ 自有键（JS 对象字面量做不到）：恶意仓库的
+      // .prism/prism.jsonc 不得借此改写原型链或注入配置。
+      writeFileSync(
+        join(dir, "proto.jsonc"),
+        '{"__proto__": {"vision": {"model": "evil/model"}}, "injected": true}',
+      )
+      const { config } = loadConfig(dir, { PRISM_CONFIG: join(dir, "proto.jsonc") })
+      expect(config.vision.model).toBe("")
+      expect(({} as Record<string, unknown>).injected).toBeUndefined()
+      expect(({} as Record<string, unknown>).vision).toBeUndefined()
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

@@ -1,6 +1,7 @@
 import { MAX_SUBTASKS } from "../../config/constants"
-import { sanitizeSystemReminder } from "../../shared/sanitize"
+import { sanitizeCell } from "../background/visualizer"
 import type { BgTask, LaunchInput } from "../background/types"
+import { TERMINAL_TASK_STATUSES } from "../background/types"
 import type { BackgroundManager } from "../background/manager"
 import type { SubTaskPlan } from "./plan-schema"
 
@@ -9,6 +10,9 @@ export interface SplitRunOptions {
   parentSessionId: string
   basePromptPrefix?: string
   sequential?: boolean
+  /** run id，作为子任务的 notificationGroup 传入 manager：父会话在每个
+   *  run 收尾时只被唤醒一次，不被同会话其他独立任务的完成通知吞并。 */
+  notificationGroupId: string
 }
 
 export interface SplitRunResult {
@@ -20,7 +24,7 @@ export interface SplitRunResult {
   done: Promise<void>
 }
 
-const TERMINAL = new Set(["completed", "error", "cancelled"])
+const TERMINAL = TERMINAL_TASK_STATUSES
 // Sentinel value in skippedPlanIDs: the plan itself never launched (manager
 // rejected it — unresolvable model, shutdown). Distinct from a plan id so
 // the report can say "启动失败" instead of the misleading "上游 <自己> 失败".
@@ -139,6 +143,7 @@ export function runSplit(manager: BackgroundManager, options: SplitRunOptions): 
         description: `${plan.id}: ${plan.title}`,
         prompt: [options.basePromptPrefix, plan.description].filter(Boolean).join("\n\n"),
         parentSessionId: options.parentSessionId,
+        notificationGroup: options.notificationGroupId,
       }
       void manager
         .launch(input)
@@ -192,8 +197,12 @@ export function buildSplitReport(
     "",
   ]
   // plan.title comes from the planner LLM and task.error from the provider —
-  // untrusted text embedded in the template, escaped like the results.
-  const esc = sanitizeSystemReminder
+  // untrusted text embedded in the template. Both go through the dashboard
+  // cell pipeline (tag escape + ANSI strip + newline flatten + control-char
+  // strip): a multi-line result would otherwise break the "- id title" list
+  // structure and let a hostile child forge extra report entries, not just
+  // escape the reminder tag.
+  const esc = sanitizeCell
   for (const plan of plans) {
     const title = esc(plan.title)
     const skippedDep = skippedPlanIDs.get(plan.id)
@@ -212,7 +221,8 @@ export function buildSplitReport(
     }
     const error = task.error ? `: ${esc(task.error.slice(0, 120))}` : ""
     // Untrusted subtask output embedded in the <system-reminder> block —
-    // escape the close tag so it cannot break out of the template.
+    // escaped AND newline-flattened so it cannot break out of the template
+    // or forge report lines.
     const result = task.resultText ? `\n  结果: ${esc(task.resultText.slice(0, 200))}` : ""
     lines.push(`- ${plan.id} ${title}: ${task.status.toUpperCase()}${error}${result}`)
   }

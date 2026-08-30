@@ -12,6 +12,7 @@ import {
   STEERING_ACCEPT_TIMEOUT_MS,
   STEERING_MAX_DELIVERY_ATTEMPTS,
   STEERING_SETTLE_GRACE_MS,
+  STANDALONE_FLUSH_DELAY_MS,
   TASK_INACTIVITY_TIMEOUT_MS,
   TASK_TTL_MS,
   TERMINAL_TASK_RETENTION_MS,
@@ -29,6 +30,7 @@ import type { PromptGate } from "../prompt-gate"
 import { ConcurrencyManager } from "./concurrency"
 import { buildChildSessionTitle, renderCompactDashboard, sanitizeTruncate } from "./visualizer"
 import type { BgTask, LaunchInput, QueueItem, SessionStatusMap } from "./types"
+import { TERMINAL_TASK_STATUSES } from "./types"
 
 // Resolve the model a child session should use. Implementations read the
 // parent session's current model; returns undefined when unavailable.
@@ -43,6 +45,7 @@ export interface BackgroundManagerDeps {
   logger?: typeof log
   pollingIntervalMs?: number
   resumeAcquireTimeoutMs?: number
+  standaloneFlushDelayMs?: number
 }
 
 interface ForwardedEvent {
@@ -50,7 +53,9 @@ interface ForwardedEvent {
   properties?: Record<string, unknown>
 }
 
-const TERMINAL_STATUSES = new Set<BgTask["status"]>(["completed", "error", "cancelled"])
+// 终态集合收敛到 types.ts 的 TERMINAL_TASK_STATUSES（manager/visualizer/
+// scheduler 共用单一定义）。
+const TERMINAL_STATUSES = TERMINAL_TASK_STATUSES
 
 // Mid-batch failure toasts inside this window per parent session are
 // suppressed (a cascade — provider outage, mass failure — must not flood the
@@ -227,7 +232,9 @@ export class BackgroundManager {
     }
 
     const task: BgTask = {
-      id: `bg_${crypto.randomUUID().slice(0, 8)}`,
+      // 48-bit 随机段（12 hex）：8 位只有 32 位熵，长期驻留的 server 进程
+      // 累计任务量下存在生日碰撞窗口，碰撞会静默覆盖 tasks 表里的旧任务。
+      id: `bg_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`,
       parentSessionId: input.parentSessionId,
       description: input.description,
       prompt: input.prompt,
@@ -240,6 +247,7 @@ export class BackgroundManager {
       status: "pending",
       queuedAt: new Date(),
       concurrencyGroup: this.concurrencyKeyFor(model),
+      notificationGroup: input.notificationGroup,
     }
 
     this.addTask(task)
@@ -305,7 +313,7 @@ export class BackgroundManager {
             this.concurrency.release(key)
           }
           if (item.task.sessionId) {
-            await this.abortSession(item.task.sessionId, "startTask error cleanup")
+            await this.abortSession(item.task.sessionId, "startTask error cleanup", item.task.directory)
           }
           this.notifyParent(item.task).catch((notifyError) => {
             this.logger("[prism] failed to notify on startTask error", { taskId: item.task.id, error: notifyError })
@@ -349,7 +357,7 @@ export class BackgroundManager {
     // orphaned child running with no manager oversight.
     if (this.shutdownTriggered || TERMINAL_STATUSES.has(task.status)) {
       this.concurrency.release(this.concurrencyKeyFor(model))
-      await this.abortSession(sessionID, "cancelled pre-start cleanup")
+      await this.abortSession(sessionID, "cancelled pre-start cleanup", task.directory)
       if (this.shutdownTriggered) {
         this.finalizeTask(task, "cancelled", "background manager shut down during session creation")
       }
@@ -422,12 +430,25 @@ export class BackgroundManager {
         "error",
         `agent "${task.agent}" not found. Register it in your opencode config or omit the agent parameter.`,
       )
+      await this.abortOrphanSession(task)
       this.notifyParent(task).catch(() => {})
       return
     }
     if (await this.tryRetry(task, errorInfo)) return
     this.finalizeTask(task, "error", errorInfo.message ?? JSON.stringify(errorInfo))
+    // The prompt was rejected (or the launch gave up): the created child
+    // session would otherwise linger as an empty orphan in the TUI child
+    // navigation forever. The retry path aborts its own previous session;
+    // only the terminal-error path needs this cleanup.
+    await this.abortOrphanSession(task)
     this.notifyParent(task).catch(() => {})
+  }
+
+  // Abort the task's child session after a terminal failure, if it still
+  // exists. Best-effort: abortSession never throws.
+  private async abortOrphanSession(task: BgTask): Promise<void> {
+    if (!task.sessionId) return
+    await this.abortSession(task.sessionId, "terminal prompt failure cleanup", task.directory)
   }
 
   // Best-effort toast: never block the flow on it and never throw when the
@@ -454,6 +475,16 @@ export class BackgroundManager {
     // Shutdown clears the queues; re-queueing here would strand the task as a
     // forever-pending object nothing will ever start.
     if (this.shutdownTriggered) return false
+    // Reentrancy latch: two failure signals for the same task can overlap (a
+    // prompt rejection racing the same run's session.error event, or two
+    // prompts after a racing double-resume). The first caller flips the task
+    // to "pending" below — synchronously, before its abort await — so a
+    // concurrent second caller observes a non-running status here. It must
+    // NOT report "not retried": a false would send its caller into
+    // finalizeTask(error) and kill a task the winner is about to relaunch.
+    // true = "the task's fate is owned elsewhere (a retry in flight, or
+    // already terminal) — do not finalize".
+    if (task.status !== "running") return true
     const retryable = shouldRetryError(errorInfo)
     if (!retryable) return false
     if (task.retries >= MAX_RETRIES) {
@@ -481,7 +512,7 @@ export class BackgroundManager {
       // task the manager itself is retiring.
       task.sessionId = undefined
       task.status = "pending"
-      await this.abortSession(previousSessionID, "same-model retry")
+      await this.abortSession(previousSessionID, "same-model retry", task.directory)
     }
 
     // The task may have been cancelled while the abort was in flight; let the
@@ -530,17 +561,22 @@ export class BackgroundManager {
     return true
   }
 
-  private async abortSession(sessionID: string, reason: string): Promise<void> {
+  private async abortSession(sessionID: string, reason: string, directory?: string): Promise<void> {
     // The race only bounds the WAIT. Converting the abort's own rejection
     // into a log here means a failure landing after the timeout is still
     // recorded (and never surfaces as an unhandled rejection) — Promise.race
-    // would otherwise swallow it without a trace.
-    const abort = this.deps.client.session.abort({ path: { id: sessionID } }).then(
-      () => undefined,
-      (error) => {
-        this.logger(`[prism] session abort failed during ${reason}`, { sessionID, error })
-      },
-    )
+    // would otherwise swallow it without a trace. directory scopes the
+    // request to the session's own project (task.directory) — the same
+    // parameter every other session route in this manager passes; without it
+    // an abort for a cross-directory child may not resolve.
+    const abort = this.deps.client.session
+      .abort({ path: { id: sessionID }, ...(directory ? { query: { directory } } : {}) })
+      .then(
+        () => undefined,
+        (error) => {
+          this.logger(`[prism] session abort failed during ${reason}`, { sessionID, error })
+        },
+      )
     await Promise.race([abort, new Promise((resolve) => setTimeout(resolve, ABORT_TIMEOUT_MS))])
   }
 
@@ -635,19 +671,16 @@ export class BackgroundManager {
     }
 
     if (event.type === "session.status" && sessionID) {
-      const status = properties?.status as { type?: string; message?: string } | undefined
+      // session.status 的 "retry" 是宿主 provider 退避的**瞬态**（两次尝试
+      // 之间的等待，1.18 实测；见 prompt-gate.isBusyStatus 与轮询路径对
+      // busy/retry 的同款处理）——绝不能当失败终止任务：退避中的子会话
+      // 随后可能成功，这里 abort+重建会丢上下文、与宿主重试叠加并烧掉
+      // MAX_RETRIES 预算。终态失败以 session.error 事件为准。此处仅把
+      // 状态翻转当作活跃信号刷新看门狗锚点（退避期间没有 part.updated
+      // 事件，长退避 otherwise 会被 inactivity watchdog 误杀）。
       const task = this.findBySession(sessionID)
-      if (task && task.status === "running" && status?.type === "retry") {
-        void this.tryRetry(task, { message: status.message })
-          .then((retried) => {
-            if (!retried) {
-              this.finalizeTask(task, "error", status.message ?? "session retry failed")
-              this.notifyParent(task).catch(() => {})
-            }
-          })
-          .catch((error) => {
-            this.logger("[prism] session.status handling failed", { taskId: task.id, error })
-          })
+      if (task && task.status === "running" && task.progress) {
+        task.progress.lastUpdate = new Date()
       }
       return
     }
@@ -669,7 +702,13 @@ export class BackgroundManager {
     try {
       const response = await this.deps.client.session.messages({
         path: { id: sessionID },
-        query: { directory: this.deps.directory },
+        // The child may live in the PARENT's project directory (startTask
+        // creates it under parentDirectory), which can differ from the
+        // plugin's own directory — query with the task's directory like
+        // deliverSteering/resume do, or the read fails and the task can
+        // never be verified (fail-closed would then park it until the
+        // watchdog kills it 30 minutes later).
+        query: { directory: task?.directory ?? this.deps.directory },
       })
       const messages = parseSessionMessages(response.data)
 
@@ -960,12 +999,15 @@ export class BackgroundManager {
     // task done and abort its just-relaunched child mid-run. Only complete
     // when the task still owns the session this settle confirmed idle.
     if (task.sessionId !== expectedSessionID) return
-    // Reserve the parent gate BEFORE flipping status: between the flip and the
-    // wake landing, the batch would already look fully settled to any
-    // concurrent check. The reservation only covers the flip-to-notification
-    // queue window; the actual gate dispatch happens after release. Release is
-    // scoped to this reservation's source: when two completions overlap, an
-    // earlier holder's release must not clear the later holder's reservation.
+    // Reserve the parent gate BEFORE flipping status: the reservation makes
+    // any OTHER source's injection queued during this window (e.g. a split
+    // aggregation report) wait inside the gate, so the completion notice is
+    // dispatched before whatever a sibling settle enqueues — this serializes
+    // injection ORDER, not settle visibility (status checks never consult
+    // the reservation). The actual gate dispatch happens after release.
+    // Release is scoped to this reservation's source: when two completions
+    // overlap, an earlier holder's release must not clear the later holder's
+    // reservation.
     const reservationSource = `background-completion:${task.id}`
     this.deps.gate.reserve(task.parentSessionId, reservationSource)
 
@@ -973,7 +1015,7 @@ export class BackgroundManager {
       this.finalizeTask(task, "completed")
 
       if (task.sessionId) {
-        await this.abortSession(task.sessionId, `task completion (${source})`)
+        await this.abortSession(task.sessionId, `task completion (${source})`, task.directory)
       }
     } finally {
       this.deps.gate.release(task.parentSessionId, reservationSource)
@@ -1016,7 +1058,7 @@ export class BackgroundManager {
       // Clear the link before aborting so a session.deleted event cannot
       // re-enter cancellation for the same task.
       task.sessionId = undefined
-      await this.abortSession(sessionID, `task cancellation (${source})`)
+      await this.abortSession(sessionID, `task cancellation (${source})`, task.directory)
     }
 
     this.finalizeTask(task, "cancelled", options?.reason)
@@ -1031,13 +1073,15 @@ export class BackgroundManager {
 
   // Retire every task owned by a parent session (e.g. the parent was deleted):
   // children are aborted and no wake is dispatched — the parent no longer
-  // exists to receive one. Already-terminal tasks are no-ops.
+  // exists to receive one. Already-terminal tasks are no-ops. Aborts run in
+  // parallel: each is bounded by ABORT_TIMEOUT_MS, and a serial loop would
+  // multiply that by the task count on the /bg cancel command path.
   async cancelAllByParentSession(parentSessionID: string, source: string): Promise<void> {
     const taskIDs = this.tasksByParentSession.get(parentSessionID)
     if (!taskIDs) return
-    for (const taskID of Array.from(taskIDs)) {
-      await this.cancelTask(taskID, { source, skipNotification: true })
-    }
+    await Promise.all(
+      Array.from(taskIDs).map((taskID) => this.cancelTask(taskID, { source, skipNotification: true })),
+    )
   }
 
   /** Send a follow-up to a task. Running/pending: the message is queued and
@@ -1131,6 +1175,15 @@ export class BackgroundManager {
     }
     if (task.status === "running") {
       throw new Error(`task ${taskId} is currently running and cannot accept a continuation prompt`)
+    }
+    // Reentrancy guard: two concurrent bg_send calls on the same terminal
+    // task would both pass the checks above, both acquire a slot and both
+    // prompt the SAME child session — the second rejected busy (a spurious
+    // task error mid-continuation) or the continuation doubled. The set
+    // membership below is established synchronously before the first await,
+    // so a concurrent second call reliably observes it.
+    if (this.resumingTaskIds.has(taskId)) {
+      throw new Error(`任务 ${taskId} 已有一个进行中的恢复等待，请等待其完成后再发送新指令`)
     }
 
     const key = task.concurrencyGroup
@@ -1257,71 +1310,167 @@ export class BackgroundManager {
     )
   }
 
+  // 完成通知的批次语义：同 notificationGroup（拆分 run 传入 run id）的
+  // 任务共享一次通知，组内全部终态才唤醒父会话（N 个子任务绝不逐个唤醒）；
+  // 不带组号的独立任务（/bg 单发、bg_spawn、--parallel）在自己的终态上
+  // 立即进入通知流程——绝不因同会话仍有其他批次在跑而被吞掉（2026-08-30
+  // 事故：拆分进行中插入的 /bg 任务完成后，"父会话全量门控"把它的完成
+  // 通知静默压到整个拆分结束）。独立任务按父会话做短窗合并（--parallel N
+  // 几乎同时结束时合并为一条）；失败/取消仍立即上报（可行动信号，不进
+  // 合并窗口）。toast 的收尾汇总语义与旧实现保持一致（父会话全部终态时
+  // 汇总，失败即时逐条），只有注入走新批次语义。
   private notifyParent(task: BgTask): Promise<void> {
     return this.enqueueNotificationForParent(task.parentSessionId, async () => {
-      const remaining = this.getTasksByParentSession(task.parentSessionId).filter(
-        (t) => t.status === "running" || t.status === "pending",
-      ).length
-      const allComplete = remaining === 0
       const isFailure = task.status === "error" || task.status === "cancelled"
-
-      // Wake the parent only when the whole batch settled or a task failed;
-      // otherwise a batch of N tasks would wake the parent N times. The toast
-      // joins the same condition: one terminal toast per task would flood the
-      // TUI on batches (/split, --parallel).
-      if (allComplete || isFailure) {
-        const siblingTasks = this.getTasksByParentSession(task.parentSessionId)
-        this.showTerminalToast(task, siblingTasks, allComplete)
-
-        // Single completed task: inject the FULL result into the parent
-        // conversation — a truncated preview leaves the model reporting
-        // "完整结果没有注入到本次对话中". Batches keep the per-task
-        // previews plus the bg_output pointer instead.
-        const singleCompleted = allComplete && siblingTasks.length === 1 && task.status === "completed"
-        const resultText = (task.resultText ?? "").trim()
-        const fullResult = singleCompleted && resultText.length > 0
-        // >= : resultText was itself captured with the same cap, so hitting
-        // the cap exactly still means the full output is longer.
-        const truncated = resultText.length >= MAX_NOTIFICATION_RESULT_CHARS
-
-        const lines = [
-          "<system-reminder>",
-          "[PRISM BACKGROUND TASKS]",
-          allComplete ? `全部后台任务已结束 (${siblingTasks.length} 个):` : "后台任务状态更新:",
-          "",
-          // 看板是 markdown 管道表格(方案 a):web 端 GFM 解析器渲染为 HTML
-          // 表格,因此**不包代码围栏**(围栏会使 web 端表格降级为代码块、
-          // 含中文列错位)。模型转达时保留 | 列分隔即可,两端渲染都正确。
-          "请把下方的状态看板表格原样转达给用户（保留表格的 | 列分隔结构，不要改写为列表、不要添加 emoji 或任何符号）：",
-          "",
-          buildTaskTable(siblingTasks, !fullResult),
-        ]
-        if (fullResult) {
-          // The result is untrusted child output embedded inside the
-          // <system-reminder> block — escape the close tag so a hostile or
-          // accidental "</system-reminder>" cannot break out of it.
-          lines.push(
-            "",
-            "完整结果:",
-            sanitizeSystemReminder(truncated ? resultText.slice(0, MAX_NOTIFICATION_RESULT_CHARS) : resultText),
-          )
-          if (truncated) {
-            lines.push("", `（结果过长已截断，用 bg_output("${task.id}") 查看完整结果）`)
-          }
-        } else if (allComplete) {
-          lines.push("", "如果需要，可用 bg_output(task_id) 查看完整结果。")
-        } else {
-          lines.push("", `仍有 ${remaining} 个任务运行中。`, "如果需要，可用 bg_output(task_id) 查看完整结果。")
-        }
-        lines.push("</system-reminder>")
-
-        await this.deps.gate.dispatch({
-          sessionID: task.parentSessionId,
-          source: "background-notification",
-          text: lines.join("\n"),
-        })
+      if (isFailure) {
+        const remaining = this.getTasksByParentSession(task.parentSessionId).filter(
+          (t) => t.status === "running" || t.status === "pending",
+        ).length
+        this.showTerminalToast(task, [task], false)
+        await this.dispatchBatchNotification(task, [task], { allComplete: false, remaining })
+        return
       }
+      if (task.notificationGroup) {
+        const group = this.getTasksByParentSession(task.parentSessionId).filter(
+          (t) => t.notificationGroup === task.notificationGroup,
+        )
+        const remaining = group.filter((t) => t.status === "running" || t.status === "pending").length
+        // 组未收尾保持静默——唤醒由组内最后一个终态任务触发。
+        if (remaining > 0) return
+        this.showTerminalToast(task, group, true)
+        await this.dispatchBatchNotification(task, group, { allComplete: true, remaining: 0 })
+        return
+      }
+      this.scheduleStandaloneFlush(task)
     })
+  }
+
+  // 独立任务完成通知的合并窗口状态（按父会话）。timer 只在首个任务入窗时
+  // 安排；窗口到达先刷出已终态的任务，不等仍在跑的——窗口是合并手段，
+  // 绝不是门控。
+  private standaloneFlushStates = new Map<
+    string,
+    { timer?: ReturnType<typeof setTimeout>; pendingTaskIds: Set<string> }
+  >()
+
+  private scheduleStandaloneFlush(task: BgTask): void {
+    const parentSessionID = task.parentSessionId
+    const state = this.standaloneFlushStates.get(parentSessionID) ?? { pendingTaskIds: new Set<string>() }
+    state.pendingTaskIds.add(task.id)
+    if (!state.timer) {
+      const delay = this.shutdownTriggered ? 0 : (this.deps.standaloneFlushDelayMs ?? STANDALONE_FLUSH_DELAY_MS)
+      state.timer = setTimeout(() => {
+        void this.flushStandaloneNotifications(parentSessionID).catch((error) => {
+          this.logger("[prism] standalone notification flush failed", { parentSessionID, error })
+        })
+      }, delay)
+    }
+    this.standaloneFlushStates.set(parentSessionID, state)
+  }
+
+  private async flushStandaloneNotifications(parentSessionID: string): Promise<void> {
+    const state = this.standaloneFlushStates.get(parentSessionID)
+    if (!state) return
+    this.standaloneFlushStates.delete(parentSessionID)
+    if (state.timer) clearTimeout(state.timer)
+    const tasks = Array.from(state.pendingTaskIds)
+      .map((id) => this.tasks.get(id))
+      .filter((t): t is BgTask => t !== undefined)
+    if (tasks.length === 0) return
+    await this.enqueueNotificationForParent(parentSessionID, async () => {
+      // 窗口内任务按构造已全部终态（失败走即时路径不进窗）；取注册表里的
+      // 最新对象，已清剪的用捕获快照兜底。
+      const cohort = tasks.map((t) => this.tasks.get(t.id) ?? t)
+      const parentTasks = this.getTasksByParentSession(parentSessionID)
+      const parentActive = parentTasks.some((t) => t.status === "running" || t.status === "pending")
+      // toast 的收尾汇总沿用旧语义：本窗是父会话最后一批时汇总全部任务，
+      // 否则只汇总本窗（transient toast，窗口内合并）。
+      this.showTerminalToast(cohort[cohort.length - 1]!, parentActive ? cohort : parentTasks, true)
+      await this.dispatchBatchNotification(cohort[cohort.length - 1]!, cohort, { allComplete: true, remaining: 0 })
+    })
+  }
+
+  // 组装并注入一条完成通知。cohort 是本次通知覆盖的任务集合：组 = 全组，
+  // 独立任务合并窗 = 窗口内终态的任务，失败 = 出错的任务本身。toast 由
+  // 调用方按批次语义决定（收尾汇总 vs 逐条），这里只负责注入。
+  private async dispatchBatchNotification(
+    task: BgTask,
+    cohort: BgTask[],
+    opts: { allComplete: boolean; remaining: number },
+  ): Promise<void> {
+    const { allComplete, remaining } = opts
+
+    // Single completed task: inject the FULL result into the parent
+    // conversation — a truncated preview leaves the model reporting
+    // "完整结果没有注入到本次对话中". Batches keep the per-task
+    // previews plus the bg_output pointer instead.
+    const singleCompleted = allComplete && cohort.length === 1 && task.status === "completed"
+    const resultText = (task.resultText ?? "").trim()
+    const fullResult = singleCompleted && resultText.length > 0
+    // >= : resultText was itself captured with the same cap, so hitting
+    // the cap exactly still means the full output is longer.
+    const truncated = resultText.length >= MAX_NOTIFICATION_RESULT_CHARS
+
+    // 标题诚实性：父会话还有进行中任务（其他独立任务/拆分 run）时不得
+    // 声称"全部后台任务已结束"——本次批次结束 ≠ 全部结束。
+    const parentActive = this.getTasksByParentSession(task.parentSessionId).some(
+      (t) => t.status === "running" || t.status === "pending",
+    )
+    const header = allComplete
+      ? parentActive
+        ? `后台任务已完成 (${cohort.length} 个):`
+        : `全部后台任务已结束 (${cohort.length} 个):`
+      : "后台任务状态更新:"
+
+    const lines = [
+      "<system-reminder>",
+      "[PRISM BACKGROUND TASKS]",
+      header,
+      "",
+      // 看板是 markdown 管道表格(方案 a):web 端 GFM 解析器渲染为 HTML
+      // 表格,因此**不包代码围栏**(围栏会使 web 端表格降级为代码块、
+      // 含中文列错位)。模型转达时保留 | 列分隔即可,两端渲染都正确。
+      "请把下方的状态看板表格原样转达给用户（保留表格的 | 列分隔结构，不要改写为列表、不要添加 emoji 或任何符号）：",
+      "",
+      buildTaskTable(cohort, !fullResult),
+    ]
+    if (fullResult) {
+      // The result is untrusted child output embedded inside the
+      // <system-reminder> block — escape the close tag so a hostile or
+      // accidental "</system-reminder>" cannot break out of it.
+      lines.push(
+        "",
+        "完整结果:",
+        sanitizeSystemReminder(truncated ? resultText.slice(0, MAX_NOTIFICATION_RESULT_CHARS) : resultText),
+      )
+      if (truncated) {
+        lines.push("", `（结果过长已截断，用 bg_output("${task.id}") 查看完整结果）`)
+      }
+    } else if (allComplete) {
+      lines.push("", "如果需要，可用 bg_output(task_id) 查看完整结果。")
+    } else {
+      lines.push("", `仍有 ${remaining} 个任务运行中。`, "如果需要，可用 bg_output(task_id) 查看完整结果。")
+    }
+    lines.push("</system-reminder>")
+
+    // The dispatch carries the ONLY copy of the batch report into the
+    // parent conversation — a dropped one is lost forever (no caller
+    // re-enqueues). The gate's inner retries cover immediate rejections;
+    // the outer backoff ladder covers a parent that stays busy longer
+    // than the settle window (a long human turn), matching the split
+    // aggregation's retry semantics.
+    const dispatch = await this.deps.gate.dispatchWithRetry({
+      sessionID: task.parentSessionId,
+      source: "background-notification",
+      text: lines.join("\n"),
+    })
+    if (dispatch.status === "failed") {
+      this.logger("[prism] background completion notification lost (retries exhausted)", {
+        taskId: task.id,
+        parentSessionID: task.parentSessionId,
+        error: dispatch.error,
+      })
+    }
   }
 
   private enqueueNotificationForParent(parentSessionID: string, operation: () => Promise<void>): Promise<void> {
@@ -1522,7 +1671,7 @@ export class BackgroundManager {
 
     const aborts = Array.from(this.tasks.values())
       .filter((task) => task.status === "running" && task.sessionId)
-      .map((task) => this.abortSession(task.sessionId!, "shutdown"))
+      .map((task) => this.abortSession(task.sessionId!, "shutdown", task.directory))
     await Promise.allSettled(aborts)
 
     this.concurrency.clear()

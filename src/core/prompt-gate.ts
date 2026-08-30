@@ -1,6 +1,7 @@
 import {
   GATE_DISPATCH_ATTEMPTS,
   GATE_DISPATCH_RETRY_DELAY_MS,
+  GATE_DISPATCH_RETRY_DELAYS_MS,
   GATE_RESERVATION_POLL_MS,
   GATE_RESERVATION_WAIT_MS,
   PARENT_WAKE_DEDUPE_MS,
@@ -8,6 +9,7 @@ import {
 } from "../config/constants"
 import { errorInfoFromResult } from "../shared/api-result"
 import { log } from "../shared/log"
+import { sleep } from "../shared/sleep"
 import type { PrismClient } from "./client-types"
 
 export interface PromptGateOptions {
@@ -55,10 +57,6 @@ function isBusyStatus(status: string | undefined): boolean {
   if (!status) return false
   const normalized = status.toLowerCase()
   return normalized === "busy" || normalized === "retry"
-}
-
-async function sleep(ms: number): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 // Internal message injection gate: per-session reservation, semantic dedupe
@@ -169,11 +167,10 @@ export class PromptGate {
     source: string
     state: SessionState
     text: string
-    queueBehavior: "defer" | "enqueue"
     dedupeKey: string
     dedupeMs: number
   }): Promise<GateDispatchResult> {
-    const { sessionID, source, state, text, queueBehavior, dedupeKey, dedupeMs } = args
+    const { sessionID, source, state, text, dedupeKey, dedupeMs } = args
 
     const body = { parts: [{ type: "text", text, synthetic: true }] }
 
@@ -211,11 +208,13 @@ export class PromptGate {
       }
 
       try {
-        if (queueBehavior === "defer") {
-          const idle = await this.waitForIdle(state, sessionID)
-          if (!idle && !state.abortController.signal.aborted) {
-            log(`[prism] gate: session still busy after settle, dispatching anyway`, { sessionID, source })
-          }
+        // Wait for the session to settle between turns so the injected
+        // message does not collide with an in-flight prompt. A settle
+        // timeout still dispatches (logged) — a dropped notification is
+        // worse than a mid-turn landing.
+        const idle = await this.waitForIdle(state, sessionID)
+        if (!idle && !state.abortController.signal.aborted) {
+          log(`[prism] gate: session still busy after settle, dispatching anyway`, { sessionID, source })
         }
 
         // The session was cleared while we waited for idle — dispatching now
@@ -263,10 +262,8 @@ export class PromptGate {
     sessionID: string
     source: string
     text: string
-    /** defer: wait for session idle before dispatching; enqueue: dispatch immediately */
-    queueBehavior?: "defer" | "enqueue"
   }): Promise<GateDispatchResult> {
-    const { sessionID, source, text, queueBehavior = "defer" } = args
+    const { sessionID, source, text } = args
     const state = this.getState(sessionID)
     const dedupeKey = hashText(text)
     const dedupeMs = this.options.semanticDedupeMs ?? PARENT_WAKE_DEDUPE_MS
@@ -281,9 +278,38 @@ export class PromptGate {
     // previously be dropped, silently losing a wake.
     const run = state.dispatchChain
       .catch(() => undefined) // a failed dispatch must not block the queue
-      .then(() => this.dispatchNow({ sessionID, source, state, text, queueBehavior, dedupeKey, dedupeMs }))
+      .then(() => this.dispatchNow({ sessionID, source, state, text, dedupeKey, dedupeMs }))
     state.dispatchChain = run.catch(() => undefined)
     return run
+  }
+
+  // dispatch + an outer backoff ladder for server-confirmed rejections. The
+  // inner GATE_DISPATCH_ATTEMPTS loop covers immediate retries; this ladder
+  // covers a parent session that stays busy well past the settle window —
+  // injected texts here carry the ONLY copy of a completion report or split
+  // aggregation (callers never re-enqueue), so a long human turn must not
+  // silently drop them. "failed" after the ladder is final; "duplicate" and
+  // "dispatched" short-circuit immediately. Re-dispatch is safe: the dedupe
+  // window is only armed on SUCCESS, so failed attempts are never mistaken
+  // for delivered ones.
+  async dispatchWithRetry(
+    args: { sessionID: string; source: string; text: string },
+    retryDelays: readonly number[] = GATE_DISPATCH_RETRY_DELAYS_MS,
+  ): Promise<GateDispatchResult> {
+    let result = await this.dispatch(args)
+    for (let attempt = 0; result.status === "failed" && attempt < retryDelays.length; attempt++) {
+      const delay = retryDelays[attempt]!
+      log(`[prism] gate: dispatch failed, retrying with backoff`, {
+        sessionID: args.sessionID,
+        source: args.source,
+        attempt: attempt + 1,
+        delay,
+        error: result.error,
+      })
+      await sleep(delay)
+      result = await this.dispatch(args)
+    }
+    return result
   }
 
   clear(sessionID: string): void {

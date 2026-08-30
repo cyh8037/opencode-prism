@@ -839,6 +839,20 @@ describe("chat.message hook (pasted-image hint)", () => {
     expect(harness.childSessions.size).toBe(before)
   })
 
+  test("fail-closed: no reminder part is pushed when the host has not assigned a message id", async () => {
+    // 1.18.23 契约缺 messageID 会冻结消息保存（2026-08-25 事故）——宿主未
+    // 赋 id 时必须跳过提醒（fail-closed），而不是推出 messageID undefined。
+    const harness = createVisionHarness("sync")
+    const { hook } = hintHookFor(harness)
+    const parts: Array<Record<string, unknown>> = [
+      { type: "file", mime: "image/png", url: FAKE_PNG_URL },
+    ]
+    await hook({ sessionID: "parent" }, { parts } as never)
+    expect(parts).toHaveLength(1)
+    await hook({ sessionID: "parent" }, { parts, message: {} } as never)
+    expect(parts).toHaveLength(1)
+  })
+
   test('"auto" (reserved) currently behaves as "hint"', async () => {
     const harness = createVisionHarness("sync")
     const { hook } = hintHookFor(harness, "auto")

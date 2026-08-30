@@ -1,15 +1,17 @@
-import { BG_SESSION_NAV_HINT, MAX_IMAGES_PER_BATCH } from "../config/constants"
+import { BG_SESSION_NAV_HINT, MAX_IMAGES_PER_BATCH, MAX_SUBTASKS } from "../config/constants"
 import { log } from "../shared/log"
 import type { BgTask } from "../core/background/types"
 import type { BackgroundManager } from "../core/background/manager"
 import type { PromptGate } from "../core/prompt-gate"
-import { renderBgDashboard, sanitizeTruncate } from "../core/background/visualizer"
+import { renderBgDashboard, sanitizeCell, sanitizeTruncate } from "../core/background/visualizer"
 import { renderRunDetails, renderSplitRuns } from "../core/split/visualizer"
 import type { SplitRunRegistry } from "../core/split/registry"
 import type { SplitService } from "../core/split/service"
 import type { PrismClient } from "../core/client-types"
 import { errorInfoFromObject } from "../shared/api-result"
+import { sanitizeSystemReminder } from "../shared/sanitize"
 import { extractImageParts } from "../core/vision/detector"
+import { navigationHint } from "../commands/templates"
 
 type CommandInput = { command: string; sessionID: string; arguments: string }
 type CommandOutput = { parts: Array<{ type: string; text?: string; [key: string]: unknown }> }
@@ -23,15 +25,21 @@ function pushText(output: CommandOutput, text: string): void {
 // web 端代码块字体 CJK≈1.67×ASCII,含中文表格错位,2026-08-29 像素级实测)。
 // fence 仅保留给纯分层缩进文本(dry-run 计划/run 明细):web 端未围栏的
 // 缩进会被 markdown 折叠,围栏保形;分层文本无列对齐,不受 CJK 比例影响。
+// 围栏体是 LLM 输出(plan title/description):①过 sanitizeSystemReminder
+// 封闭 </system-reminder> 逃逸(外层注入模板的既有防线,渲染器逐 cell 清洗
+// 覆盖不到 fence 的调用点);②围栏标记按内容里最长的反引号串加长——
+// CommonMark 规则,title 含 ``` 时 3 反引号围栏会被击穿。
 function fence(text: string): string {
-  return "```text\n" + text + "\n```"
+  const escaped = sanitizeSystemReminder(text)
+  const longestRun = text.match(/`+/g)?.reduce((max, run) => Math.max(max, run.length), 0) ?? 0
+  const marker = "`".repeat(Math.max(3, longestRun + 1))
+  return marker + "text\n" + escaped + "\n" + marker
 }
 
 // 与 tools/bg.ts 的 bg_spawn 回执同一文案（命令原生启动与工具启动的用户
-// 视感一致）。tuiNavigation=false 时换用工具侧等价查看方式。
-function navHint(tuiNavigation: boolean): string {
-  return tuiNavigation ? `启动后，${BG_SESSION_NAV_HINT}。` : "启动后可通过 /bg status 或 bg_output 查看进度。"
-}
+// 视感一致）。tuiNavigation=false 时换用工具侧等价查看方式。实现收敛在
+// commands/templates.ts，两处共用同一份。
+const navHint = (tuiNavigation: boolean): string => navigationHint(tuiNavigation)
 
 function formatTaskOutput(manager: BackgroundManager, taskID: string, fullSession: boolean, serverUrl: string): string {
   const task = manager.getTask(taskID)
@@ -40,9 +48,11 @@ function formatTaskOutput(manager: BackgroundManager, taskID: string, fullSessio
     `任务 \`${taskID}\`: ${task.description}`,
     `状态: ${task.status}`,
   ]
-  if (task.error) lines.push(`错误: ${task.error}`)
+  // error/resultText 来自 provider 与子会话 LLM（不可信文本），进 TUI 前走
+  // 与看板相同的清洗管线（模板逃逸/ANSI/换行压平/控制字符剥离 + 截断）。
+  if (task.error) lines.push(`错误: ${sanitizeCell(task.error)}`)
   if (task.model) lines.push(`模型: ${task.model.providerID}/${task.model.modelID}${task.retries > 0 ? ` (重试 ${task.retries} 次)` : ""}`)
-  if (task.resultText) lines.push(`\n结果:\n${task.resultText.slice(0, 2000)}`)
+  if (task.resultText) lines.push(`\n结果:\n${sanitizeTruncate(task.resultText, 2000)}`)
   if (fullSession && task.sessionId) {
     lines.push(`\n完整会话: opencode attach ${serverUrl} --session ${task.sessionId}`)
     if (process.env.OPENCODE_SERVER_PASSWORD) {
@@ -96,6 +106,18 @@ export function createCommandExecuteBeforeHook(args: {
 }) {
   return async (input: CommandInput, output: CommandOutput): Promise<void> => {
     const argumentsText = input.arguments.trim()
+
+    // Prism 子会话（bg 任务/视觉任务）里拒绝 /bg、/split：任务以子会话为
+    // parent 启动后，子会话完成时会被 abort，孙任务随之失去管理者（
+    // cancelAllByParentSession 只在 session.deleted 触发）。工具面已在
+    // childToolFilters 封死，这里是命令面的同款防线。
+    if ((input.command === "bg" || input.command === "split") && args.manager.isChildSession(input.sessionID)) {
+      pushText(
+        output,
+        `Prism 后台子会话内不能执行 /${input.command}：这里是后台子会话，可能随任务结束被回收。请回到主会话使用 /${input.command}。`,
+      )
+      return
+    }
 
     if (input.command === "bg") {
       // /bg status bg_xxx:单个任务的表格视图(与 /split status sp_xxx 对称)。
@@ -201,18 +223,19 @@ export function createCommandExecuteBeforeHook(args: {
         return
       }
       if (argumentsText === "") {
-        pushText(output, "用法: /bg <任务描述> [--parallel <n≥2>] | status [--all] | status <task_id> | output <task_id> | cancel [task_id] | resume|send <task_id> <指令>")
+        pushText(output, `用法: /bg <任务描述> [--parallel <2-${MAX_SUBTASKS}>] | status [--all] | status <task_id> | output <task_id> | cancel [task_id] | resume|send <task_id> <指令>`)
         return
       }
       // --parallel N:任务语义拆分需要 LLM——不原生启动，注入【并行启动】
       // 指令，由模板回合中的模型并行调用 bg_spawn（模板不放 $ARGUMENTS，
-      // 描述只经这个 part 进入模型上下文）。
+      // 描述只经这个 part 进入模型上下文）。N 封顶 MAX_SUBTASKS：模型一次
+      // 回合内无约束地连发 bg_spawn 没有兜底。
       const parallelMatch = argumentsText.match(/--parallel\s+(\d+)\b/)
       if (parallelMatch) {
         const count = Number(parallelMatch[1])
         const parallelTask = argumentsText.replace(/--parallel\s+\d+\b/, "").trim()
-        if (!parallelTask || !Number.isInteger(count) || count < 2) {
-          pushText(output, "用法: /bg <任务描述> --parallel <n≥2>（n 为相互独立的子任务个数）")
+        if (!parallelTask || !Number.isInteger(count) || count < 2 || count > MAX_SUBTASKS) {
+          pushText(output, `用法: /bg <任务描述> --parallel <2-${MAX_SUBTASKS}>（n 为相互独立的子任务个数）`)
           return
         }
         pushText(
@@ -230,12 +253,18 @@ export function createCommandExecuteBeforeHook(args: {
         // vision.enabled 门控——视觉关闭时子会话没有 vision_look，附加
         // 图片只会制造读不了的死附件）。上一条消息的图片是旧上下文，
         // 不跟随（与 collectLatestUserImages 的"无图即止"边界一致）。
+        // ⚠️ parts 必须自带任务文本 part：startTask 的语义是"parts 存在
+        // 则完全取代 input.prompt"——只传图片会把用户输入的任务指令整个
+        // 丢掉，子会话只收到一张无指令的图（bg_spawn 工具路径同一组合）。
         const followImages = args.visionEnabled
           ? extractImageParts(output.parts).slice(0, MAX_IMAGES_PER_BATCH)
           : []
         let parts: Array<Record<string, unknown>> | undefined
         if (followImages.length > 0) {
-          parts = followImages.map((image) => ({ type: "file", mime: image.mime, url: image.url }))
+          parts = [
+            { type: "text", text: argumentsText, synthetic: true },
+            ...followImages.map((image) => ({ type: "file", mime: image.mime, url: image.url })),
+          ]
         }
         const task = await args.manager.launch({
           description: sanitizeTruncate(argumentsText, 80),
@@ -325,16 +354,17 @@ export function createCommandExecuteBeforeHook(args: {
           return
         }
         showToast(args.client, `正在取消拆分任务 \`${runID}\` 的全部子任务…`)
-        let cancelled = 0
-        for (const task of run.tasksByPlanID.values()) {
-          // 终态任务跳过:manager.cancelTask 对它们返回 false,没必要发起调用
-          if (task.status === "completed" || task.status === "error" || task.status === "cancelled") continue
-          // skipNotification:逐任务 cancel 的 CANCELLED toast 会在整批取消时
-          // 刷屏;汇总反馈由下方单条 toast + 命令回执 + split 聚合报告承担
-          // (与 cancelAllByParentSession 的既有语义一致)。
-          const ok = await args.manager.cancelTask(task.id, { source: "/split cancel run", skipNotification: true })
-          if (ok) cancelled++
-        }
+        // abort 是秒级网络 I/O 且各任务相互独立：并行发起（串行最坏
+        // N×ABORT_TIMEOUT_MS 会把命令回合拖到几十秒）。skipNotification:
+        // 逐任务 cancel 的 CANCELLED toast 会在整批取消时刷屏；汇总反馈由
+        // 下方单条 toast + 命令回执 + split 聚合报告承担。
+        const cancellable = Array.from(run.tasksByPlanID.values()).filter(
+          (task) => task.status !== "completed" && task.status !== "error" && task.status !== "cancelled",
+        )
+        const results = await Promise.all(
+          cancellable.map((task) => args.manager.cancelTask(task.id, { source: "/split cancel run", skipNotification: true })),
+        )
+        const cancelled = results.filter((ok) => ok).length
         if (cancelled > 0) {
           showToast(args.client, `已取消拆分任务 \`${runID}\` 的 ${cancelled} 个子任务`)
         }

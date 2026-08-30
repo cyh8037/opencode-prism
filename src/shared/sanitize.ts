@@ -12,5 +12,10 @@
 // unmatchable. Case-insensitive: a model emitting "</SYSTEM-REMINDER>" must
 // be neutralized too.
 export function sanitizeSystemReminder(text: string): string {
-  return text.replace(/<\/system-reminder>/gi, "<\\/system-reminder>")
+  // Whitespace-tolerant: the close-tag consumer is the parent MODEL, not a
+  // parser — "</system-reminder >" or "</ system-reminder>" can read as the
+  // block's end just as well as the canonical form. Every fuzzed variant is
+  // rewritten to the one canonical escaped form (what column measurement
+  // sees too: sanitize always runs before width computation).
+  return text.replace(/<\/\s*system-reminder\s*>/gi, "<\\/system-reminder>")
 }

@@ -1,6 +1,7 @@
 import type { ResolvedModel } from "../../models"
 import { errorInfoFromResult } from "../../shared/api-result"
 import { log } from "../../shared/log"
+import { sleep } from "../../shared/sleep"
 import { lastAssistantText } from "../assistant-text"
 import type { PrismClient } from "../client-types"
 
@@ -21,10 +22,6 @@ const JSON_CHILD_TOOL_FILTERS: Record<string, boolean> = {
   split_task: false,
   vision_look: false,
   question: false,
-}
-
-async function sleep(ms: number): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 // 在一次性子会话里运行一条期望 JSON 回复的提示，返回最后一条可用的
@@ -97,6 +94,7 @@ export async function runJsonPromptSession(args: {
     log("[prism] split: json-prompt timed out", { title, sessionID })
     return null
   } finally {
-    await client.session.abort({ path: { id: sessionID } }).catch(() => {})
+    // 会话创建于 directory 项目下，abort 同参数作用域（与 create/prompt 一致）。
+    await client.session.abort({ path: { id: sessionID }, query: { directory } }).catch(() => {})
   }
 }

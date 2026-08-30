@@ -2,6 +2,10 @@ import type { ResolvedModel } from "../../models"
 
 export type BgTaskStatus = "pending" | "running" | "completed" | "error" | "cancelled"
 
+// 任务终态的唯一定义：manager（状态机）、visualizer（看板折叠）、
+// split/scheduler（run 结算）共用，防止三处字符串集合漂移。
+export const TERMINAL_TASK_STATUSES: ReadonlySet<BgTaskStatus> = new Set(["completed", "error", "cancelled"])
+
 export interface TaskProgress {
   toolCalls: number
   /** Distinct tool part ids already counted (part.updated fires repeatedly). */
@@ -52,6 +56,11 @@ export interface BgTask {
   concurrencyKey?: string
   /** Stable key for re-acquiring a concurrency slot on resume. */
   concurrencyGroup: string
+  /** Completion-notification batch key (within the same parent session):
+   *  tasks sharing a value report once, when the whole group is terminal
+   *  (split runs pass the run id). Undefined = standalone task, which
+   *  reports on its own settle — never gated on unrelated batches. */
+  notificationGroup?: string
 }
 
 export interface LaunchInput {
@@ -67,6 +76,9 @@ export interface LaunchInput {
   taskType?: "default" | "vision"
   /** Pin the child session's model (e.g. the gate-checked vision model). Default: resolve the parent session's current model. */
   model?: ResolvedModel
+  /** See BgTask.notificationGroup. Split runs pass the run id so the parent
+   *  is woken once per run, not once per subtask. */
+  notificationGroup?: string
 }
 
 export interface QueueItem {

@@ -194,4 +194,43 @@ describe("PromptGate", () => {
     expect(statusCalls).toBe(callsAtClear) // no polling after the clear
     expect(promptCalls).toBe(promptAtClear) // no prompt ever dispatched
   })
+
+  test("dispatchWithRetry exhausts the outer backoff ladder for a persistently busy parent", async () => {
+    const { client, state } = createMockClient()
+    let calls = 0
+    client.session.promptAsync = async () => {
+      calls++
+      return { error: { message: "session busy" }, response: { status: 503 } }
+    }
+    const gate = new PromptGate(client, { idlePollMs: 10, dispatchRetryDelayMs: 10 })
+    const result = await gate.dispatchWithRetry(
+      { sessionID: "parent", source: "test", text: "wake" },
+      [10, 10, 10],
+    )
+    // inner GATE_DISPATCH_ATTEMPTS (3) x (1 + outer ladder length 3) = 12 tries
+    expect(calls).toBe(12)
+    expect(result.status).toBe("failed")
+    expect(state.dispatched).toHaveLength(0)
+  })
+
+  test("dispatchWithRetry succeeds through the outer ladder after inner retries exhaust", async () => {
+    const { client, state } = createMockClient()
+    let rounds = 0
+    const original = client.session.promptAsync.bind(client.session)
+    client.session.promptAsync = async (...args: Parameters<PrismClient["session"]["promptAsync"]>) => {
+      rounds++
+      // whole inner retry loop fails twice, then the third round lands
+      if (rounds <= 6) {
+        return { error: { message: "session busy" }, response: { status: 503 } }
+      }
+      return original(...args)
+    }
+    const gate = new PromptGate(client, { idlePollMs: 10, dispatchRetryDelayMs: 10 })
+    const result = await gate.dispatchWithRetry(
+      { sessionID: "parent", source: "test", text: "wake" },
+      [10, 10],
+    )
+    expect(result.status).toBe("dispatched")
+    expect(state.dispatched).toHaveLength(1)
+  })
 })

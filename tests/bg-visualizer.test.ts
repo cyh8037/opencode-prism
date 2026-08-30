@@ -98,7 +98,7 @@ describe("renderBgDashboard", () => {
     const dashboard = renderBgDashboard([
       makeTask({ id: "bg_aaaa1111", description: "运行中", status: "running" }),
     ])
-    expect(dashboard).toContain("TUI 中按 leader 键（默认 Ctrl+X）")
+    expect(dashboard).toContain("In TUI, press leader key (default Ctrl+X)")
     const compact = renderCompactDashboard([
       makeTask({ id: "bg_aaaa1111", description: "运行中", status: "running" }),
     ])
@@ -175,6 +175,24 @@ describe("renderBgDashboard", () => {
     const text = renderBgDashboard([makeTask({ description: "字".repeat(200) })])
     // 描述列宽上限 28(宽字符),超出必截断 —— 渲染结果不含完整 200 字
     expect(text).not.toContain("字".repeat(50))
+  })
+
+  test("full-length task ids are never truncated in any dashboard (copy round-trip)", () => {
+    // 真实 id 定长 15(bg_ + 12 位 hex)。ID 列上限曾是 12,看板把 id 截短
+    // 3 位,用户照抄去 /bg status 查询报"任务不存在"(2026-08-30 真实会话
+    // 事故,id 取自该事故的 s1/s5 子任务)。两个看板渲染器共用 ID_COLUMN,
+    // 都必须完整显示,保证"看板所见 id 可直接回查"。
+    const text = renderBgDashboard(
+      [makeTask({ id: "bg_3804443fbf5d", description: "s1: 项目定位与整体概览", status: "running" })],
+      undefined,
+      { foldCompleted: false },
+    )
+    expect(text).toContain("bg_3804443fbf5d")
+    expect(text).not.toContain("| bg_3804443fb |")
+    const compact = renderCompactDashboard([
+      makeTask({ id: "bg_444ce08357a8", status: "completed", completedAt: new Date() }),
+    ])
+    expect(compact).toContain("bg_444ce08357a8")
   })
 
   test("progress shows tool calls and queued steering", () => {

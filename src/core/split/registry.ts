@@ -35,13 +35,20 @@ export class SplitRunRegistry {
 
   constructor(private retentionMs: number = TERMINAL_TASK_RETENTION_MS) {}
 
-  /** 登记一个 run,自动分配 sp_ id,返回条目引用(service 在 run.done 后置
-   *  settled/settledAt)。 */
+  /** run id 单一来源：service 在 runSplit 启动前生成（调度器要拿它当子
+   *  任务的 notificationGroup），register 时原样传入。48-bit 随机段
+   *  （12 hex），与 bg_ 任务 id 同理由（见 manager.launch）。 */
+  generateRunId(): string {
+    return `sp_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`
+  }
+
+  /** 登记一个 run，自动分配 sp_ id（调用方已生成时原样使用），返回条目
+   *  引用（service 在 run.done 后置 settled/settledAt）。 */
   register(entry: Omit<SplitRunEntry, "id"> & { id?: string }): SplitRunEntry {
     this.prune()
-    // id 放在 spread 之后:调用方显式传 undefined 时不会被 ...entry 覆盖回
-    // undefined(此前 `{ id: gen, ...entry }` 的顺序会把生成值盖掉)。
-    const full: SplitRunEntry = { ...entry, id: entry.id ?? `sp_${crypto.randomUUID().slice(0, 8)}` }
+    // id 放在 spread 之后：调用方显式传 undefined 时不会被 ...entry 覆盖回
+    // undefined（此前 `{ id: gen, ...entry }` 的顺序会把生成值盖掉）。
+    const full: SplitRunEntry = { ...entry, id: entry.id ?? this.generateRunId() }
     this.entries.push(full)
     return full
   }

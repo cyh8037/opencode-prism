@@ -4,6 +4,7 @@ import type { VisionPipeline } from "../core/vision/pipeline"
 import { extractImageParts } from "../core/vision/detector"
 import { makePartID } from "../core/vision/part-id"
 import type { CurrentModelTracker } from "../core/vision/model-tracker"
+import { BG_COMMAND_TEMPLATE_MARKER, SPLIT_COMMAND_TEMPLATE_MARKER } from "../commands/templates"
 
 // Hint path for pasted images: a text-only main model sees pasted images
 // replaced by a "Cannot read ... (this model does not support image input)"
@@ -48,23 +49,28 @@ export function createChatMessageHook(args: {
     // 提醒会把模型带偏——实测(2026-08-28 会话 ses_fb868779)无视觉模型
     // 收到图片报错后,在"消息尾部提醒"的引导下直接 vision_look 同步解读,
     // 放弃用户显式要求的 bg_spawn 后台化。命令回合必须注入命令专用提醒。
+    // 标记串与模板首行共用同一常量(commands/templates.ts),防两处漂移。
     const parts = output.parts
     const isBgCommandTurn = parts.some(
-      (part) => typeof part.text === "string" && part.text.includes("你在处理 Prism 的 /bg 命令"),
+      (part) => typeof part.text === "string" && part.text.includes(BG_COMMAND_TEMPLATE_MARKER),
     )
     const isSplitCommandTurn = parts.some(
-      (part) => typeof part.text === "string" && part.text.includes("你在处理 Prism 的 /split 命令"),
+      (part) => typeof part.text === "string" && part.text.includes(SPLIT_COMMAND_TEMPLATE_MARKER),
     )
 
     // 1.18.23 contract: parts pushed here MUST carry id (prt_ prefix) /
     // sessionID / messageID or the message save dies ("invalid user part
     // before save" + prompt_async InvalidDurableEvent — the 2026-08-25
     // session freeze). messageID comes from output.message.id — the TUI does
-    // not send one, and opencode assigns it before this hook fires.
+    // not send one, and opencode assigns it before this hook fires. FAIL
+    // CLOSED: a host that has not assigned the id yet must cause the hint to
+    // be SKIPPED, not pushed with messageID undefined — an invalid part is
+    // what froze sessions in the first place, a lost hint is harmless.
+    if (!output.message?.id) return
     output.parts.push({
       id: makePartID(),
       sessionID: input.sessionID,
-      messageID: output.message?.id,
+      messageID: output.message.id,
       type: "text",
       // Conditional wording: on the FIRST message of a session the tracker
       // snapshot is still empty (chat.params has not fired yet), so we

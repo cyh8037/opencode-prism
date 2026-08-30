@@ -77,13 +77,30 @@ function clusterWidth(cluster: string): number {
   return Math.max(width, 1)
 }
 
-function graphemeClusters(text: string): string[] {
+// Segmenter 实例模块级缓存：一次看板渲染会对每列×每行调用 getStringWidth/
+// truncateWidth/padEndWidth 数十至数百次，每次 new Intl.Segmenter 的分配
+// 成本不可忽略；实例无状态可复用（granularity 固定 grapheme）。
+let cachedSegmenter: { segment: (input: string) => Iterable<{ segment: string }> } | undefined
+let segmenterChecked = false
+
+function getSegmenter():
+  | { segment: (input: string) => Iterable<{ segment: string }> }
+  | undefined {
+  if (segmenterChecked) return cachedSegmenter
+  segmenterChecked = true
   const segmenter = (Intl as { Segmenter?: unknown }).Segmenter
   if (typeof segmenter === "function") {
-    const instance = new (segmenter as new (locale: undefined, options: { granularity: "grapheme" }) => {
+    cachedSegmenter = new (segmenter as new (locale: undefined, options: { granularity: "grapheme" }) => {
       segment: (input: string) => Iterable<{ segment: string }>
     })(undefined, { granularity: "grapheme" })
-    return Array.from(instance.segment(text), (seg) => seg.segment)
+  }
+  return cachedSegmenter
+}
+
+function graphemeClusters(text: string): string[] {
+  const segmenter = getSegmenter()
+  if (segmenter) {
+    return Array.from(segmenter.segment(text), (seg) => seg.segment)
   }
   // 退化路径:按 code point 切分(不识别 ZWJ 序列,宽度近似)
   return Array.from(text)

@@ -13,6 +13,16 @@ describe("sanitizeSystemReminder", () => {
     expect(sanitizeSystemReminder("</System-Reminder>")).not.toContain("</System-Reminder>")
   })
 
+  // The close-tag consumer is the parent MODEL, not a parser: whitespace-
+  // fuzzed variants read as the block's end just as well as the canonical
+  // form, so they must be rewritten to the same escaped shape.
+  test("escapes whitespace-fuzzed close tags", () => {
+    expect(sanitizeSystemReminder("</system-reminder >")).toBe("<\\/system-reminder>")
+    expect(sanitizeSystemReminder("</ system-reminder>")).toBe("<\\/system-reminder>")
+    expect(sanitizeSystemReminder("result </system-reminder\t> tail")).toBe("result <\\/system-reminder> tail")
+    expect(sanitizeSystemReminder("</system-reminderS>")).toBe("</system-reminderS>")
+  })
+
   test("leaves the opening tag and unrelated markup untouched", () => {
     expect(sanitizeSystemReminder("<system-reminder>")).toBe("<system-reminder>")
     expect(sanitizeSystemReminder("<p>text</p>")).toBe("<p>text</p>")

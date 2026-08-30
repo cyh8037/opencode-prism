@@ -36,4 +36,11 @@ describe("error classifier", () => {
     expect(shouldRetryError({ statusCode: 503 })).toBe(true)
     expect(shouldRetryError({ message: "invalid api key" })).toBe(false)
   })
+
+  // 回归（0.5.0 审查）：裸 /500/ 会命中 "1500 tokens" 之类的正文数字。
+  test("status-code words are word-boundary anchored", () => {
+    expect(shouldRetryError({ message: "HTTP 500 internal" })).toBe(true)
+    expect(shouldRetryError({ message: "quota of 1500 tokens exceeded" })).toBe(false)
+    expect(shouldRetryError({ message: "429 encountered" })).toBe(true)
+  })
 })
