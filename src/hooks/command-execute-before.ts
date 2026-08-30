@@ -36,10 +36,12 @@ function fence(text: string): string {
   return marker + "text\n" + escaped + "\n" + marker
 }
 
-// 与 tools/bg.ts 的 bg_spawn 回执同一文案（命令原生启动与工具启动的用户
-// 视感一致）。tuiNavigation=false 时换用工具侧等价查看方式。实现收敛在
-// commands/templates.ts，两处共用同一份。
-const navHint = (tuiNavigation: boolean): string => navigationHint(tuiNavigation)
+// 面向人类用户的中文子会话实时查看指引（/bg 命令原生回执使用）。
+// 与面向模型的英文 navigationHint 解耦，保持中文回执的纯粹性与一致性。
+const navHint = (tuiNavigation: boolean): string =>
+  tuiNavigation
+    ? "进度可通过快捷键 Ctrl+X + ↓ 查看子会话实时输出（←/→ 切换，↑ 返回），或输入 /bg status 查询。"
+    : "进度可通过 /bg status 查询。"
 
 function formatTaskOutput(manager: BackgroundManager, taskID: string, fullSession: boolean, serverUrl: string): string {
   const task = manager.getTask(taskID)
@@ -240,7 +242,7 @@ export function createCommandExecuteBeforeHook(args: {
         }
         pushText(
           output,
-          `已交给模型拆分（N=${count}）：${parallelTask}\n\n`
+          `已交给模型拆分为 ${count} 个并发子任务：${parallelTask}\n\n`
             + `【并行启动 N=${count}】请把上述任务拆成 ${count} 个相互独立的子任务，在同一个回合内并行调用 ${count} 次 bg_spawn 工具（绝不串行等待），启动后告知用户每个子任务的 id 与用途。`,
         )
         return
@@ -424,8 +426,8 @@ export function createCommandExecuteBeforeHook(args: {
       pushText(
         output,
         dryRun
-          ? "拆分任务已启动（预览模式）：正在做意图判定与规划（通常需十几秒），拆分计划生成后会自动注入本会话（未执行）；无需拆分或失败也会自动提示。"
-          : "拆分任务已启动：正在做意图判定与规划（通常需十几秒），计划确认后会自动启动子任务并注入本会话；失败会自动提示，进度可经 /split status 查看。",
+          ? "正在分析任务并生成拆分预览（通常需十几秒）…\n拆分计划生成后将自动在此展示（不执行实际任务）。"
+          : "正在分析任务并规划拆分方案（通常需十几秒）…\n方案确认后将自动在此通知并启动子任务，进度可通过 /split status 查看。",
       )
       void args.splitService
         .split({ sessionID: input.sessionID, task, dryRun, sequential, maxSubtasks })

@@ -11,6 +11,7 @@ import { normalizeImageUrl } from "../src/core/vision/image-utils"
 const FAKE_PNG_URL = `data:image/png;base64,${Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString("base64")}`
 import { createVisionLookTool } from "../src/tools/vision-look"
 import { createChatMessageHook } from "../src/hooks/chat-message"
+import { BG_COMMAND_TEMPLATE_MARKER, SPLIT_COMMAND_TEMPLATE_MARKER } from "../src/commands/templates"
 import { VisionPipeline } from "../src/core/vision/pipeline"
 import { BackgroundManager } from "../src/core/background/manager"
 import { CurrentModelTracker } from "../src/core/vision/model-tracker"
@@ -522,7 +523,7 @@ describe("vision_look tool", () => {
     harness.client.session.messages = async () => ({ data: [] })
     const tool = createVisionLookTool(harness.pipeline)
     const result = await tool.execute({ images: ["last"] }, { sessionID: "parent" } as never)
-    expect(result).toContain("没有找到任何图片消息")
+    expect(result).toContain("no image messages found")
   })
 
   // The 2026-08-22 incident (originally via the removed /vision command):
@@ -564,7 +565,7 @@ describe("vision_look tool", () => {
       { sessionID: "parent" } as never,
     )
     expect(result).toContain("图表")
-    expect(result).toContain("已忽略 1 个 [Image N] 占位符")
+    expect(result).toContain("Ignored 1 [Image N] placeholders")
   })
 
   test('supports single string image argument (e.g. images: "last")', async () => {
@@ -629,7 +630,7 @@ describe("vision_look tool", () => {
       { sessionID: "parent" } as never,
     )
     expect(result).toContain("哨兵优先成功")
-    expect(result).toContain("已忽略 1 个显式路径/URL")
+    expect(result).toContain("Ignored 1 explicit paths/URLs")
   })
 
   test('single string real path (non-sentinel) is interpreted directly', async () => {
@@ -675,7 +676,7 @@ describe("vision_look tool", () => {
     const childID = Array.from(harness.childSessions.keys())[0]!
     const before = harness.childSessions.size
     const nested = await tool.execute({ images: "last" }, { sessionID: childID } as never)
-    expect(nested).toContain("嵌套解读")
+    expect(nested).toContain("nested interpretation")
     expect(harness.childSessions.size).toBe(before)
 
     releasePoll()
@@ -700,7 +701,7 @@ describe("vision_look tool", () => {
     const before = harness.childSessions.size
     const tool = createVisionLookTool(harness.pipeline)
     const result = await tool.execute({ images: "last" }, { sessionID: task.sessionId } as never)
-    expect(result).toContain("嵌套解读")
+    expect(result).toContain("nested interpretation")
     expect(harness.childSessions.size).toBe(before) // no nested interpretation child
   })
 
@@ -866,9 +867,10 @@ describe("chat.message hook (pasted-image hint)", () => {
     const harness = createVisionHarness("sync")
     const { hook } = hintHookFor(harness)
     // opencode 注入的 /bg 命令模板是 user 消息的一部分(2026-08-28 会话
-    // ses_fb868779 实测:模板 + 图片 + 提醒 同一条消息)
+    // ses_fb868779 实测:模板 + 图片 + 提醒 同一条消息)。模板首行与
+    // BG_COMMAND_TEMPLATE_MARKER 常量一致,hook 据此识别命令回合。
     const parts: Array<Record<string, unknown>> = [
-      { type: "text", text: "你在处理 Prism 的 /bg 命令。" },
+      { type: "text", text: `${BG_COMMAND_TEMPLATE_MARKER}\n(rest of template)` },
       { type: "text", text: "分析这张图" },
       { type: "file", mime: "image/jpeg", url: FAKE_PNG_URL },
     ]
@@ -884,7 +886,7 @@ describe("chat.message hook (pasted-image hint)", () => {
     const harness = createVisionHarness("sync")
     const { hook } = hintHookFor(harness)
     const parts: Array<Record<string, unknown>> = [
-      { type: "text", text: "你在处理 Prism 的 /split 命令。" },
+      { type: "text", text: `${SPLIT_COMMAND_TEMPLATE_MARKER}\n(rest of template)` },
       { type: "file", mime: "image/png", url: FAKE_PNG_URL },
     ]
     await hook({ sessionID: "parent" }, { parts, message: { id: "msg_1" } } as never)

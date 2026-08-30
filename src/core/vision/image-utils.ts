@@ -64,6 +64,13 @@ function sniffImageMime(bytes: Uint8Array): string | null {
   return null
 }
 
+// Boolean form of the sniff for callers that only need validity. Real files
+// always carry a signature, so a file that fails the sniff is not a supported
+// image regardless of what extension or mime the caller claimed.
+export function isValidImageMagicNumber(bytes: Uint8Array): boolean {
+  return sniffImageMime(bytes) !== null
+}
+
 // Read a local image file into a data URL so every vision provider can
 // consume it. Missing, oversized, and non-image files are dropped with a
 // note so the batch still proceeds. The mime comes from the file itself

@@ -10,9 +10,10 @@ import {
   POLLING_INTERVAL_MS,
   RESUME_ACQUIRE_TIMEOUT_MS,
   STEERING_ACCEPT_TIMEOUT_MS,
+  SHUTDOWN_TIMEOUT_MS,
+  STANDALONE_FLUSH_DELAY_MS,
   STEERING_MAX_DELIVERY_ATTEMPTS,
   STEERING_SETTLE_GRACE_MS,
-  STANDALONE_FLUSH_DELAY_MS,
   TASK_INACTIVITY_TIMEOUT_MS,
   TASK_TTL_MS,
   TERMINAL_TASK_RETENTION_MS,
@@ -252,10 +253,15 @@ export class BackgroundManager {
 
     this.addTask(task)
 
-    // Toast only the first task of a parent session: batches (/split,
-    // --parallel) would otherwise flood the TUI with N "Started" toasts.
-    if (this.getTasksByParentSession(input.parentSessionId).length === 1) {
-      this.showToast("Prism background task", `Started: ${task.description} (${task.id})`, "info", 4000)
+    // Toast only the first active standalone task of a parent session:
+    // grouped runs (/split batches) emit their own unified launch toast from
+    // SplitService, avoiding double toasts or flooding the TUI.
+    // Active tasks check ensures subsequent standalone tasks still toast even
+    // if earlier finished tasks remain in history.
+    const activeStandaloneTasks = this.getTasksByParentSession(input.parentSessionId)
+      .filter((t) => !t.notificationGroup && (t.status === "pending" || t.status === "running"))
+    if (!input.notificationGroup && activeStandaloneTasks.length <= 1) {
+      this.showToast("Prism 后台任务", `后台任务已入队: ${task.description} (${task.id})`, "info", 4000)
     }
 
     const key = this.concurrencyKeyFor(model)
@@ -553,7 +559,7 @@ export class BackgroundManager {
     void this.processKey(key)
 
     this.showToast(
-      "Prism retry",
+      "Prism 任务重试",
       `${task.description}: 同模型重试 (${model.providerID}/${model.modelID})`,
       "warning",
       4000,
@@ -723,7 +729,14 @@ export class BackgroundManager {
       // navigation includes the user's own typed input in the child, and
       // that must never be reported as the task's result.
       if (task) {
-        task.resultText = collectAssistantText(messages, MAX_NOTIFICATION_RESULT_CHARS) ?? undefined
+        // Late-write guard: a cancel/error can land while this messages call
+        // is in flight. The authoritative capture must only overwrite the
+        // event-path text while the task still owns the pinned session —
+        // stamping it onto a terminal task would leak it into the batch
+        // table's result preview.
+        if (task.status === "running" && task.sessionId === sessionID) {
+          task.resultText = collectAssistantText(messages, MAX_NOTIFICATION_RESULT_CHARS) ?? undefined
+        }
       }
 
       return messages.some((message) => {
@@ -921,7 +934,7 @@ export class BackgroundManager {
       lastUpdate: new Date(),
       lastTool: task.progress?.lastTool,
     }
-    this.showToast("Prism background task", `补充指令已投递: ${task.description} (${task.id})`, "info", 4000)
+    this.showToast("Prism 后台任务", `补充指令已投递: ${task.description} (${task.id})`, "info", 4000)
     return true
   }
 
@@ -940,7 +953,7 @@ export class BackgroundManager {
     if ((task.steeringAttempts ?? 0) >= STEERING_MAX_DELIVERY_ATTEMPTS) {
       task.steeringAttempts = 0
       this.showToast(
-        "Prism background task",
+        "Prism 后台任务",
         `补充指令投递失败已放弃（${reason.slice(0, 80)}）: ${task.description} (${task.id})`,
         "error",
         6000,
@@ -948,11 +961,22 @@ export class BackgroundManager {
       return
     }
     task.steeringQueue = [...messages, ...(task.steeringQueue ?? [])]
-    this.showToast("Prism background task", `补充指令投递失败，将重试: ${task.description} (${task.id})`, "warning", 4000)
+    this.showToast("Prism 后台任务", `补充指令投递失败，将重试: ${task.description} (${task.id})`, "warning", 4000)
   }
 
   private finalizeTask(task: BgTask, status: BgTask["status"], error?: string): void {
-    if (TERMINAL_STATUSES.has(task.status)) return
+    if (TERMINAL_STATUSES.has(task.status)) {
+      // State machine is strictly one-way: a cancelled/failed task is never
+      // revived by a completion signal that raced past its status gates (a
+      // late idle event, an in-flight settle, a duplicate cancel). Logged so
+      // such races stay diagnosable instead of vanishing silently.
+      this.logger("[prism] discarding state transition for an already-terminal task", {
+        taskId: task.id,
+        currentStatus: task.status,
+        requestedStatus: status,
+      })
+      return
+    }
     task.status = status
     task.completedAt = new Date()
     if (error) task.error = error
@@ -1282,7 +1306,7 @@ export class BackgroundManager {
       const parts = [`${ok} 成功`, `${bad} 失败`]
       if (cancelled > 0) parts.push(`${cancelled} 取消`)
       this.showToast(
-        "Prism background task",
+        "Prism 后台任务",
         `全部后台任务已结束: ${parts.join(", ")}`,
         bad > 0 ? "error" : cancelled > 0 ? "warning" : "success",
         5000,
@@ -1302,9 +1326,10 @@ export class BackgroundManager {
     const reason = (task.error ?? "").trim()
     const suffix = reason ? `: ${sanitizeTruncate(reason, 80)}` : ""
     const variant = task.status === "completed" ? "success" : task.status === "cancelled" ? "warning" : "error"
+    const statusLabel = task.status === "completed" ? "已完成" : task.status === "cancelled" ? "已取消" : "执行失败"
     this.showToast(
-      "Prism background task",
-      `${task.status.toUpperCase()}: ${task.description} (${task.id})${suffix}`,
+      "Prism 后台任务",
+      `任务${statusLabel}: ${task.description} (${task.id})${suffix}`,
       variant,
       5000,
     )
@@ -1664,15 +1689,31 @@ export class BackgroundManager {
     }
   }
 
-  async shutdown(): Promise<void> {
+  async shutdown(timeoutMs = SHUTDOWN_TIMEOUT_MS): Promise<void> {
     if (this.shutdownTriggered) return
     this.shutdownTriggered = true
     this.stopPolling()
 
-    const aborts = Array.from(this.tasks.values())
-      .filter((task) => task.status === "running" && task.sessionId)
-      .map((task) => this.abortSession(task.sessionId!, "shutdown", task.directory))
-    await Promise.allSettled(aborts)
+    // Parallel aborts raced against a hard cap: shutdown runs on the host's
+    // exit path (Ctrl+C / plugin reload) and must never hang it. Each abort
+    // is individually bounded by ABORT_TIMEOUT_MS, but a large batch or a
+    // wedged server would multiply that wait — the race abandons the WAIT
+    // only (late-landing aborts log their own failures; allSettled swallows
+    // nothing as an unhandled rejection), and cleanup below proceeds either
+    // way.
+    const abortWork = Promise.allSettled(
+      Array.from(this.tasks.values())
+        .filter((task) => task.status === "running" && task.sessionId)
+        .map((task) => this.abortSession(task.sessionId!, "shutdown", task.directory)),
+    )
+    let timeoutGuard: ReturnType<typeof setTimeout> | undefined
+    await Promise.race([
+      abortWork,
+      new Promise<void>((resolve) => {
+        timeoutGuard = setTimeout(resolve, Math.max(0, timeoutMs))
+      }),
+    ])
+    if (timeoutGuard) clearTimeout(timeoutGuard)
 
     this.concurrency.clear()
     this.tasks.clear()

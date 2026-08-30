@@ -98,11 +98,11 @@ describe("renderBgDashboard", () => {
     const dashboard = renderBgDashboard([
       makeTask({ id: "bg_aaaa1111", description: "运行中", status: "running" }),
     ])
-    expect(dashboard).toContain("In TUI, press leader key (default Ctrl+X)")
+    expect(dashboard).toContain("In TUI, press Ctrl+X then ↓")
     const compact = renderCompactDashboard([
       makeTask({ id: "bg_aaaa1111", description: "运行中", status: "running" }),
     ])
-    expect(compact).not.toContain("leader")
+    expect(compact).not.toContain("Ctrl+X")
   })
 
   test("newlines inside fields are flattened to spaces", () => {

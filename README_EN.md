@@ -136,8 +136,9 @@ Pool: anthropic/claude-3-7-sonnet: 2/5 running
 
 #### Live TUI Navigation
 Every background task runs in a real OpenCode session (`[bg_xxxxxxxx] Description (prism)`):
-- In OpenCode TUI, press **leader key (default `Ctrl+X`) then `↓`** to view real-time subtask output streaming.
+- In OpenCode TUI, press **`Ctrl+X` then `↓`** to view real-time subtask output streaming.
 - Use `←` / `→` to switch between active subtasks, and `↑` to return to the parent session.
+- These are the default TUI keybindings (customizable via OpenCode's `keybinds` configuration).
 
 ---
 

@@ -101,9 +101,8 @@ export class SplitService {
         return {
           kind: "skipped-intent",
           message:
-            `意图识别：该任务无需拆分${reason ? `（${reason}）` : ""}。${preview}`
-            + "建议直接执行；确认要拆分可补充任务细节后重试，"
-            + "或设置 split.intentCheck=false（需重启 opencode）。",
+            `该任务较为单一，无需拆分${reason ? `（${reason}）` : ""}。${preview}\n`
+            + "建议直接单会话执行；如确需拆分，可补充具体步骤细节后重试。",
         }
       }
     }
@@ -127,7 +126,7 @@ export class SplitService {
     if (!plans) {
       return {
         kind: "planner-failed",
-        message: "规划器未能产出有效的拆分计划（两次尝试均失败），请把任务描述得更具体，或直接单任务执行",
+        message: "未能生成有效的拆分方案，请补充更具体的任务背景或步骤细节后重试，或直接执行该任务",
       }
     }
 
@@ -244,11 +243,24 @@ export class SplitService {
         this.logger("[prism] split: aggregation failed (swallowed)", { sessionID: request.sessionID, error })
       })
 
+    // 启动即时反馈走 Toast 瞬时气泡（持久留痕由下方返回的 message 经
+    // gate/工具回执承担）。best-effort：非 TUI 环境无 tui 面（可选链跳过），
+    // 失败吞掉不参与 launched 语义。
+    const launchToast = this.deps.client.tui.showToast?.({
+      body: {
+        title: "Prism Split",
+        message: `${plans.length} 个子任务已启动，后台并发执行中...`,
+        variant: "info",
+        duration: 4000,
+      },
+    })
+    if (launchToast) void launchToast.catch(() => {})
+
     return {
       kind: "launched",
       message: this.deps.tuiNavigation === false
-        ? `拆分计划已启动：${plans.length} 个子任务，按依赖分层并发执行。子任务进度可通过 /split status 与 bg_output 查看；全部结束后汇总报告回注主会话。`
-        : `拆分计划已启动：${plans.length} 个子任务，按依赖分层并发执行。子任务进度可通过 TUI 子会话导航（leader 键+↓ 进入）与 /split status 查看；全部结束后汇总报告回注主会话。`,
+        ? `拆分计划已就绪（共 ${plans.length} 个子任务，按依赖并发执行）。\n进度可通过 /split status 查询；任务完成后将自动在此汇总结果。`
+        : `拆分计划已就绪（共 ${plans.length} 个子任务，按依赖并发执行）。\n进度可通过快捷键 Ctrl+X + ↓ 查看子会话，或输入 /split status 查询；任务完成后将自动在此汇总结果。`,
       run,
     }
   }

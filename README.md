@@ -136,8 +136,9 @@ Pool: anthropic/claude-3-7-sonnet: 2/5 running
 
 #### TUI 实时子会话导航
 每个后台任务均运行在真实的 OpenCode 子会话中（命名为 `[bg_xxxxxxxx] Description (prism)`）：
-- 在 OpenCode TUI 中，按下 **Leader 键（默认 `Ctrl+X`）后按 `↓`** 即可实时查看子会话输出流。
+- 在 OpenCode TUI 中，按下 **`Ctrl+X` 后按 `↓`** 即可实时查看子会话输出流。
 - 使用 `←` / `→` 在各运行中子任务间快速切换，按 `↑` 返回主会话。
+- 以上为 TUI 默认键位（可通过 opencode 的 `keybinds` 配置自定义）。
 
 ---
 

@@ -237,7 +237,7 @@ describe("/bg native task launch", () => {
     const { hook } = createHook({ tasks: [], launchResult: { id: "bg_n2", description: "demo" }, tuiNavigation: false })
     const text = await run(hook, "bg", "跑测试")
     expect(text).not.toContain("Ctrl+X")
-    expect(text).toContain("/bg status 或 bg_output")
+    expect(text).toContain("进度可通过 /bg status 查询。")
   })
 
   test("launch failure surfaces the error text instead of crashing the hook", async () => {
@@ -263,7 +263,7 @@ describe("/bg native task launch", () => {
     const text = await run(hook, "bg", "重构三个模块 --parallel 3")
     expect(launches).toHaveLength(0)
     // 用户可见的反馈在前（与原生路径的秒级回执形成一致的起点），模型指令在后
-    expect(text).toContain("已交给模型拆分（N=3）")
+    expect(text).toContain("已交给模型拆分为 3 个并发子任务")
     expect(text).toContain("重构三个模块")
     expect(text).toContain("【并行启动 N=3】")
     expect(text).toContain("3 次 bg_spawn")
@@ -327,10 +327,10 @@ describe("/split native execution", () => {
   test("a task description starts the split asynchronously and injects the outcome via the gate", async () => {
     const { hook, splitCalls, dispatches } = createHook({
       tasks: [],
-      splitOutcome: { kind: "launched", message: "拆分计划已启动：2 个子任务" },
+      splitOutcome: { kind: "launched", message: "拆分任务已启动（共 2 个子任务，按依赖并发执行）" },
     })
     const text = await run(hook, "split", "重构整个模块 --dry-run")
-    expect(text).toContain("拆分任务已启动")
+    expect(text).toContain("正在分析任务并生成拆分预览")
     expect(splitCalls).toEqual([
       { sessionID: "session", task: "重构整个模块", dryRun: true, sequential: false, maxSubtasks: undefined },
     ])
@@ -338,7 +338,7 @@ describe("/split native execution", () => {
     await Bun.sleep(5)
     expect(dispatches).toHaveLength(1)
     expect(dispatches[0]!.source).toBe("split-native-outcome")
-    expect(dispatches[0]!.text).toContain("拆分计划已启动：2 个子任务")
+    expect(dispatches[0]!.text).toContain("拆分任务已启动（共 2 个子任务，按依赖并发执行）")
   })
 
   test("dry-run plans are fenced inside the injected reminder", async () => {

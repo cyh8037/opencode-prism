@@ -261,9 +261,17 @@ export async function Prism(input: PluginInput): Promise<Record<string, unknown>
     ),
     event: guardHook("event", createEventHook(manager, modelTracker, gate)),
     dispose: async () => {
+      // Entry log before any await: synchronous append, so its presence (or
+      // absence) in the log distinguishes "dispose never invoked" from
+      // "dispose interrupted mid-shutdown by host exit".
+      log("[prism] dispose: shutting down")
       try {
         await manager.shutdown()
         gate.clearAll()
+        // Success path observability: aborts log only their failures, so
+        // without this line a clean dispose is indistinguishable from a
+        // dispose that never ran.
+        log("[prism] dispose completed")
       } catch (error) {
         log("[prism] dispose failed (swallowed)", { error })
       }

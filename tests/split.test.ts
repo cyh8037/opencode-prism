@@ -346,7 +346,7 @@ describe("SplitService intent check", () => {
     expect(outcome.message).toContain("无需拆分")
     expect(outcome.message).toContain("单步任务")
     expect(outcome.message).toContain("预览判定")
-    expect(outcome.message).toContain("split.intentCheck=false")
+    expect(outcome.message).toContain("建议直接单会话执行")
     // planner 从未被调用:唯一的 prompt 是意图子会话的
     expect(prompts).toHaveLength(1)
     expect(prompts[0]!.pathId).toBe("intent_session")
@@ -401,6 +401,74 @@ describe("SplitService intent check", () => {
   })
 })
 
+describe("SplitService launch receipt", () => {
+  const plannerText = JSON.stringify([{ id: "s1", title: "only", description: "work", dependsOn: [] }])
+
+  function createPlannerClient(toasts: Array<Record<string, unknown>>): PrismClient {
+    return {
+      session: {
+        get: async () => ({
+          data: { id: "parent", directory: "/work", model: { id: "gpt-5.6-sol", providerID: "openai" } },
+        }),
+        create: async () => ({ data: { id: "planner_session" } }),
+        abort: async () => {},
+        prompt: async () => {},
+        promptAsync: async () => {},
+        messages: async () => ({
+          data: [
+            { info: { role: "assistant" }, parts: [{ type: "text", text: plannerText, state: { status: "completed" } }] },
+          ],
+        }),
+        status: async () => ({ data: {} }),
+      },
+      tui: {
+        showToast: async (params: { body: Record<string, unknown> }) => {
+          toasts.push(params.body)
+        },
+      },
+    }
+  }
+
+  function createService(client: PrismClient, registry: SplitRunRegistry, tuiNavigation?: boolean): SplitService {
+    return new SplitService({
+      client,
+      directory: "/work",
+      manager: createManager().manager,
+      gate: new PromptGate(client, { idlePollMs: 10 }),
+      registry,
+      resolvePlannerModel: async () => ({ providerID: "openai", modelID: "gpt-5.6-sol" }),
+      tuiNavigation,
+    })
+  }
+
+  test("the TUI receipt names the subtask count, the concrete keybind, and fires one toast", async () => {
+    const toasts: Array<Record<string, unknown>> = []
+    const client = createPlannerClient(toasts)
+    const outcome = await createService(client, new SplitRunRegistry()).split({ sessionID: "parent", task: "x" })
+    expect(outcome.kind).toBe("launched")
+    expect(outcome.message).toContain("拆分计划已就绪（共 1 个子任务，按依赖并发执行）")
+    // 键位直接写 Ctrl+X:"leader 键"属极客术语,普通用户无法对应具体按键
+    expect(outcome.message).toContain("Ctrl+X + ↓")
+    expect(outcome.message).not.toContain("leader")
+    // 汇总语义用自然表述,不再暴露"回注主会话"内部实现词
+    expect(outcome.message).not.toContain("回注主会话")
+    expect(outcome.message).toContain("任务完成后将自动在此汇总结果")
+    // 启动即弹一次 Toast 瞬时气泡(与持久回执双通道)
+    expect(toasts).toHaveLength(1)
+    expect(toasts[0]).toMatchObject({ title: "Prism Split", variant: "info" })
+  })
+
+  test("outside TUI the receipt drops the keybind line and keeps the status command", async () => {
+    const toasts: Array<Record<string, unknown>> = []
+    const client = createPlannerClient(toasts)
+    const outcome = await createService(client, new SplitRunRegistry(), false).split({ sessionID: "parent", task: "x" })
+    expect(outcome.kind).toBe("launched")
+    expect(outcome.message).not.toContain("Ctrl+X")
+    expect(outcome.message).toContain("/split status")
+    expect(outcome.message).toContain("任务完成后将自动在此汇总结果")
+  })
+})
+
 describe("split_task tool", () => {
   const ctx = { sessionID: "parent" }
 
@@ -409,7 +477,7 @@ describe("split_task tool", () => {
     const service = {
       split: async (request: Record<string, unknown>) => {
         calls.push(request)
-        return { kind: "launched", message: "拆分计划已启动：3 个子任务" }
+        return { kind: "launched", message: "拆分任务已启动（共 3 个子任务，按依赖并发执行）" }
       },
     } as never
     const definition = createSplitTool(service).split_task!
@@ -417,7 +485,7 @@ describe("split_task tool", () => {
       { task: "重构模块", dry_run: true, sequential: true, max: 5 },
       ctx as never,
     )
-    expect(result).toContain("拆分计划已启动")
+    expect(result).toContain("拆分任务已启动")
     expect(calls[0]).toEqual({
       sessionID: "parent",
       task: "重构模块",
@@ -435,7 +503,7 @@ describe("split_task tool", () => {
     } as never
     const definition = createSplitTool(service).split_task!
     const result = await definition.execute({ task: "x" }, ctx as never)
-    expect(result).toContain("拆分失败")
+    expect(result).toContain("Task splitting failed")
     expect(result).toContain("boom")
   })
 })

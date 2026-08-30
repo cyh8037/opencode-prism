@@ -417,6 +417,79 @@ describe("BackgroundManager", () => {
     expect(childSessions.get(sessionID)?.aborted).toBe(true)
   })
 
+  // Cancellation race: a completion signal (late idle event, in-flight
+  // settle, duplicate cancel) arriving around the abort must never flip a
+  // cancelled task back to "completed" and inject a bogus completion notice.
+  test("a late session.idle event never revives a cancelled task", async () => {
+    const { manager, gate } = createManager()
+    const dispatched = spyOnDispatches(gate)
+    const task = await manager.launch({ description: "c", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(task.status).toBe("running")
+    const sessionID = task.sessionId!
+
+    await manager.cancelTask(task.id)
+    expect(task.status).toBe("cancelled")
+    const dispatchesAfterCancel = dispatched.length
+    expect(dispatchesAfterCancel).toBeGreaterThan(0) // the cancellation notice
+
+    manager.handleEvent({ type: "session.idle", properties: { sessionID } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    expect(task.status).toBe("cancelled")
+    expect(dispatched.length).toBe(dispatchesAfterCancel) // no completion injection
+  })
+
+  test("a late session.idle event never revives an errored task", async () => {
+    const { manager, gate, client } = createManager()
+    const dispatched = spyOnDispatches(gate)
+    const originalPromptAsync = client.session.promptAsync.bind(client.session)
+    client.session.promptAsync = async () => {
+      throw new Error("invalid request") // non-retryable per shouldRetryError
+    }
+
+    const task = await manager.launch({ description: "e", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(task.status).toBe("error")
+    const sessionID = task.sessionId! // retained on the error path
+    const dispatchesAfterError = dispatched.length
+    expect(dispatchesAfterError).toBeGreaterThan(0) // the failure notice
+
+    manager.handleEvent({ type: "session.idle", properties: { sessionID } })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    expect(task.status).toBe("error")
+    expect(dispatched.length).toBe(dispatchesAfterError)
+  })
+
+  test("a cancel during the output check does not stamp late result text onto the task", async () => {
+    const { manager, client } = createManager()
+    let releaseMessages!: () => void
+    const messagesGate = new Promise<void>((resolve) => (releaseMessages = resolve))
+    client.session.messages = async () => {
+      await messagesGate
+      return { data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: "late assistant text" }] }] }
+    }
+
+    const task = await manager.launch({ description: "t", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(task.status).toBe("running")
+
+    // The settle is now parked inside validateSessionHasOutput's messages
+    // call; cancelling mid-flight must keep the authoritative capture from
+    // writing the (later-resolved) assistant text onto the terminal task.
+    manager.handleEvent({ type: "session.idle", properties: { sessionID: task.sessionId } })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    await manager.cancelTask(task.id)
+    expect(task.status).toBe("cancelled")
+
+    releaseMessages()
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    expect(task.status).toBe("cancelled")
+    expect(task.resultText).toBeUndefined()
+  })
+
   test("retryable prompt failure retries once with the SAME model", async () => {
     const { manager, childSessions } = createManager()
     const client = manager["deps"].client
@@ -614,7 +687,7 @@ describe("BackgroundManager", () => {
     manager.handleEvent({ type: "session.idle", properties: { sessionID: taskA.sessionId } })
     await new Promise((resolve) => setTimeout(resolve, 30))
     // A alone finishing must not toast (B still running)
-    expect(toasts.filter((t) => t.message.includes("Started"))).toHaveLength(1)
+    expect(toasts.filter((t) => t.message.includes("后台任务已入队"))).toHaveLength(1)
     expect(toasts.filter((t) => t.message.includes("成功"))).toHaveLength(0)
 
     manager.handleEvent({ type: "session.idle", properties: { sessionID: taskB.sessionId } })
@@ -642,7 +715,7 @@ describe("BackgroundManager", () => {
     expect(taskA.status).toBe("error")
 
     // Mid-batch failure: urgent per-task toast carrying the provider reason
-    const failureToast = toasts.find((t) => t.message.includes("ERROR"))
+    const failureToast = toasts.find((t) => t.message.includes("执行失败"))
     expect(failureToast?.message).toContain("A")
     expect(failureToast?.message).toContain("rate limit exceeded")
     expect(failureToast?.variant).toBe("error")
@@ -655,7 +728,7 @@ describe("BackgroundManager", () => {
     expect(settle?.message).toContain("1 成功")
     expect(settle?.message).toContain("1 失败")
     expect(settle?.variant).toBe("error")
-    expect(toasts.some((t) => t.message.includes("COMPLETED"))).toBe(false)
+    expect(toasts.some((t) => t.message.includes("已完成"))).toBe(false)
   })
 
   test("mid-batch cancellation toasts coalesce inside the window; the summary still counts them", async () => {
@@ -668,7 +741,7 @@ describe("BackgroundManager", () => {
     await manager.cancelTask(taskA.id)
     await manager.cancelTask(taskB.id) // inside the coalesce window: suppressed
     await new Promise((resolve) => setTimeout(resolve, 50))
-    expect(toasts.filter((t) => t.message.includes("CANCELLED"))).toHaveLength(1)
+    expect(toasts.filter((t) => t.message.includes("已取消"))).toHaveLength(1)
 
     manager.handleEvent({ type: "session.idle", properties: { sessionID: taskC.sessionId } })
     await new Promise((resolve) => setTimeout(resolve, 100))
@@ -689,7 +762,7 @@ describe("BackgroundManager", () => {
     }
     await manager.launch({ description: "doomed", prompt: "work", parentSessionId: "parent" })
     await new Promise((resolve) => setTimeout(resolve, 300))
-    const errorToasts = toasts.filter((t) => t.message.includes("ERROR"))
+    const errorToasts = toasts.filter((t) => t.message.includes("执行失败"))
     expect(errorToasts).toHaveLength(1)
     expect(errorToasts[0]!.message).toContain("doomed")
     expect(errorToasts[0]!.message).toContain("quota exhausted")
@@ -703,7 +776,7 @@ describe("BackgroundManager", () => {
     await manager.cancelTask(task.id, { skipNotification: true })
     await new Promise((resolve) => setTimeout(resolve, 50))
     expect(task.status).toBe("cancelled")
-    expect(toasts.filter((t) => t.message.includes("CANCELLED"))).toHaveLength(0)
+    expect(toasts.filter((t) => t.message.includes("已取消"))).toHaveLength(0)
     expect(gate.hasRecentDispatch("parent")).toBe(false)
   })
 
@@ -713,7 +786,7 @@ describe("BackgroundManager", () => {
     await new Promise((resolve) => setTimeout(resolve, 50))
     await manager.cancelTask(task.id)
     await new Promise((resolve) => setTimeout(resolve, 50))
-    const cancelToast = toasts.find((t) => t.message.includes("CANCELLED"))
+    const cancelToast = toasts.find((t) => t.message.includes("已取消"))
     expect(cancelToast?.variant).toBe("warning")
   })
 
@@ -761,6 +834,26 @@ describe("BackgroundManager", () => {
   test("launch rejects after shutdown", async () => {
     const { manager } = createManager()
     await manager.shutdown()
+    await expect(
+      manager.launch({ description: "late", prompt: "work", parentSessionId: "parent" }),
+    ).rejects.toThrow("shutting down")
+  })
+
+  // dispose runs on the host's exit path (Ctrl+C / plugin reload): a hung
+  // session abort (wedged server) must never stall it — the hard cap
+  // abandons the wait and cleanup proceeds regardless.
+  test("shutdown returns within the hard timeout even when aborts hang", async () => {
+    const { manager, client } = createManager()
+    client.session.abort = (async () => new Promise<void>(() => {})) as PrismClient["session"]["abort"]
+    const task = await manager.launch({ description: "hung", prompt: "work", parentSessionId: "parent" })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(task.status).toBe("running")
+
+    const startedAt = Date.now()
+    await manager.shutdown(50)
+    expect(Date.now() - startedAt).toBeLessThan(2_000)
+    // Cleanup happened despite the abandoned aborts: state is hard-cleared.
+    expect(manager.getTask(task.id)).toBeUndefined()
     await expect(
       manager.launch({ description: "late", prompt: "work", parentSessionId: "parent" }),
     ).rejects.toThrow("shutting down")

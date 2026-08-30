@@ -23,7 +23,7 @@ describe("bg_wait", () => {
     const running = { id: "bg_1", parentSessionId: "session", status: "running" } as BgTask
     const definition = toolsWith([running]).bg_wait!
     const result = await definition.execute({ taskIds: [] }, { sessionID: "session" } as never)
-    expect(result).toContain("没有需要等待的后台任务")
+    expect(result).toContain("No background tasks to wait for")
   })
 
   test("unknown and foreign ids are reported without waiting", async () => {
@@ -32,7 +32,7 @@ describe("bg_wait", () => {
       { taskIds: ["bg_ghost", "bg_1"] },
       { sessionID: "session" } as never,
     )
-    expect(result).toContain("不存在或已过期: bg_ghost")
+    expect(result).toContain("not found or expired: bg_ghost")
   })
 })
 
@@ -50,8 +50,9 @@ describe("bg_spawn", () => {
     const definition = createBgTools(manager, { visionEnabled: true, autoTrigger: true }).bg_spawn!
     const result = await definition.execute({ description: "demo", prompt: "work" }, { sessionID: "session" } as never)
     expect(result).toContain("bg_hint1234")
-    // 措辞是"启动后"（返回时任务实为 queued）,键位写"默认"不写死
-    expect(result).toContain("启动后，TUI 中按 leader 键（默认 Ctrl+X）")
-    expect(result).toContain("↑ 返回主会话")
+    // 措辞是"After launch"（返回时任务实为 queued）,键位直接写默认按键
+    // Ctrl+X,不写"leader key"这类极客术语。
+    expect(result).toContain("After launch, In TUI, press Ctrl+X then ↓")
+    expect(result).toContain("↑ to return to parent session")
   })
 })

@@ -40,6 +40,10 @@ export const TASK_INACTIVITY_TIMEOUT_MS = 30 * 60 * 1000
 export const TERMINAL_TASK_RETENTION_MS = 60 * 60 * 1000
 export const POLLING_INTERVAL_MS = 3000
 export const ABORT_TIMEOUT_MS = 10_000
+// dispose（宿主退出/插件重载）并行 abort 所有运行中的子会话；单个 abort 由
+// ABORT_TIMEOUT_MS 兜底，此上限约束整批 abort 的总等待——退出路径绝不能被
+// 挂起的服务端拖住（超时后放弃等待，迟到的 abort 结果自行记录日志）。
+export const SHUTDOWN_TIMEOUT_MS = 3_000
 export const MAX_TOOL_CALLS = 4000
 // Cap for a single task's result injected into the parent notification.
 // Vision interpretations and normal task outputs fit comfortably; the cap
@@ -95,13 +99,14 @@ export const MAX_INTENT_REASON_CHARS = 500
 // 后缀另计）。TUI 子会话导航视图约按 50 列显示标题，前缀放头部才可见。
 export const MAX_SESSION_TITLE_CHARS = 100
 // bg_spawn 返回文本、/bg 与 /split 命令模板、/bg status 看板共用的子会话
-// 实时查看指引。键位为 TUI 默认值（用户可用 keybinds 覆盖），因此文案写
-// "leader 键（默认 Ctrl+X）"而不写死按键本身。
-// 版本行为依赖：leader 键位、session_child_first(<leader>down)/
+// 实时查看指引。键位为 TUI 默认值（用户可用 keybinds 覆盖）；文案直接写
+// 死 Ctrl+X——"leader 键"属 Neovim 极客术语，普通用户无法对应到具体按键
+// （2026-08-30 文案统一改造，权衡后选定具体按键而非键位名）。
+// 版本行为依赖：session_child_first(<leader>down)/
 // session_child_cycle(right,left)/session_parent(up) 及 parentID 子会话
 // 分组行为，经 opencode 1.15.0 与 1.18.25 二进制（strings）验证一致。
 export const BG_SESSION_NAV_HINT =
-  "In TUI, press leader key (default Ctrl+X) then ↓ to view child session output live, ←/→ to cycle, ↑ to return to parent session"
+  "In TUI, press Ctrl+X then ↓ to view child session output live (←/→ to cycle, ↑ to return to parent session)"
 
 // attach hint (/bg output --full) server port
 export const DEFAULT_SERVER_PORT = 4096

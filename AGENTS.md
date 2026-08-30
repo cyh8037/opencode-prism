@@ -103,6 +103,15 @@ Prism officially supports **OpenCode ≥ 1.15.0** (specifically hardened and tes
 - **Pure hierarchical indentation (dry-run plans, run details) must retain ` ```text ` fences** to prevent markdown parsers from collapsing whitespace.
 - **Command templates must not contain `$ARGUMENTS`**: Task descriptions are handled natively in hooks. Leaving `$ARGUMENTS` in templates tempts models to execute tasks directly without calling tools.
 
+### 3.7 Language & Interface Boundary Contract
+Prism strictly enforces a decoupled, two-tier language boundary:
+1. **Human UI Layer (100% Natural Chinese)**:
+   - Covers all user-facing surfaces: TUI toasts (`client.tui.showToast`), native command interception receipts (`command-execute-before`), usage hints (`用法: /bg ...`), status boards, and error diagnostics.
+   - Forbid cryptic mechanical translations or internal jargon (e.g. forbid "leader key" or "inject back to parent"; use explicit shortcut hints like `Ctrl+X + ↓` and natural action descriptions like `在此自动汇总结果`).
+2. **LLM Protocol Layer (100% Standard English)**:
+   - Covers all model-facing surfaces: tool schemas (`description` and `args` in `src/tools/*.ts`), system prompt instruction templates (`src/commands/templates.ts`), and synthetic reminders/tool returns fed into model turns.
+   - Never mix arbitrary Chinese phrases into protocol definitions, ensuring maximum semantic comprehension and tool invocation reliability across global multi-model harnesses.
+
 ---
 
 ## 4. Development & Testing Standards
