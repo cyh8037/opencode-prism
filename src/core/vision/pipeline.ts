@@ -7,6 +7,7 @@ import type { BackgroundManager } from "../background/manager"
 import type { PrismClient } from "../client-types"
 import type { ImageAttachment } from "./detector"
 import { extractImageParts } from "./detector"
+import { normalizeImageBatch } from "./image-utils"
 import {
   makeVisionInstruction,
   runVisionInterpretation,
@@ -113,6 +114,7 @@ export class VisionPipeline {
             model,
             instruction,
             timeoutMs: this.deps.interpretTimeoutMs ?? VISION_SYNC_TIMEOUT_MS,
+            compress: this.deps.config.vision.compress,
             onSessionCreated: (sessionID) => {
               this.interpretationSessions.add(sessionID)
               createdThisCall.push(sessionID)
@@ -242,20 +244,27 @@ export class VisionPipeline {
 
   // Callers gate BEFORE this: without a usable model the task would run
   // text-only (opencode silently drops image parts on non-vision models).
-  private launchBackgroundTask(
+  private async launchBackgroundTask(
     sessionID: string,
-    images: ImageAttachment[],
+    rawImages: ImageAttachment[],
     source: string,
     model: ResolvedModel,
     dropped = 0,
-  ): void {
-    const parts: Array<Record<string, unknown>> = [
-      { type: "text", text: makeVisionInstruction(), synthetic: true },
-      ...images.map((image) => ({ type: "file", mime: image.mime, url: image.url })),
-    ]
-    const dropNote = dropped > 0 ? `（另有 ${dropped} 张图片因超出批量上限未解读）` : ""
-    void this.deps.background
-      .launch({
+  ): Promise<void> {
+    try {
+      const images = await normalizeImageBatch(
+        rawImages,
+        this.deps.directory,
+        this.deps.config.vision.compress,
+      )
+      if (images.length === 0) return
+
+      const parts: Array<Record<string, unknown>> = [
+        { type: "text", text: makeVisionInstruction(), synthetic: true },
+        ...images.map((image) => ({ type: "file", mime: image.mime, url: image.url })),
+      ]
+      const dropNote = dropped > 0 ? `（另有 ${dropped} 张图片因超出批量上限未解读）` : ""
+      await this.deps.background.launch({
         description: `视觉解读 (${images.length} 张图片, ${source})${dropNote}`,
         prompt: makeVisionInstruction(),
         parts,
@@ -270,8 +279,8 @@ export class VisionPipeline {
         // we verified can see images, not a freshly re-resolved one.
         model,
       })
-      .catch((error) => {
-        this.logger("[prism] vision: background task launch failed", { error })
-      })
+    } catch (error) {
+      this.logger("[prism] vision: background task launch failed", { error })
+    }
   }
 }

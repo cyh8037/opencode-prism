@@ -1,4 +1,5 @@
 import { z } from "zod"
+import { VISION_COMPRESS_DEFAULT_MAX_BYTES } from "./constants"
 
 // Explicit vision model reference: "provider/model". Empty string means "not
 // configured": automatic triggers skip interpretation and vision_look reports
@@ -16,6 +17,26 @@ export const visionModelSchema = z
       !/\s/.test(core) && core.includes("/") && !core.startsWith("/") && !core.endsWith("/")
     )
   }, 'vision model must be "provider/model", or empty to disable')
+
+export const visionCompressSchema = z
+  .union([
+    z.boolean(),
+    z.number().int().positive(),
+    z.object({
+      enabled: z.boolean(),
+      maxBytes: z.number().int().positive(),
+    }),
+  ])
+  .default(true)
+  .transform((val) => {
+    if (typeof val === "boolean") {
+      return { enabled: val, maxBytes: VISION_COMPRESS_DEFAULT_MAX_BYTES }
+    }
+    if (typeof val === "number") {
+      return { enabled: true, maxBytes: val }
+    }
+    return val
+  })
 
 export const prismConfigSchema = z.object({
   vision: z
@@ -39,12 +60,16 @@ export const prismConfigSchema = z.object({
         .array(z.string().min(1))
         .optional()
         .describe("限定触发自动解读的工具名；缺省 = 所有工具都检查，[] = 不触发自动解读"),
+      compress: visionCompressSchema.describe(
+        "图片识别前压缩：true(默认 100KB) / false(关闭) / 数值(单图字节上限)",
+      ),
     })
     .default({
       enabled: true,
       model: "",
       mode: "sync",
       chatImages: "hint",
+      compress: { enabled: true, maxBytes: VISION_COMPRESS_DEFAULT_MAX_BYTES },
     }),
   background: z
     .object({

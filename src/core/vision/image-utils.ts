@@ -1,7 +1,8 @@
 import { existsSync, readFileSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { isAbsolute, resolve } from "node:path"
-import { VISION_IMAGE_BATCH_MAX_BYTES, VISION_IMAGE_MAX_BYTES } from "../../config/constants"
+import { VISION_IMAGE_BATCH_MAX_BYTES, VISION_IMAGE_MAX_BYTES, VISION_RAW_IMAGE_MAX_BYTES } from "../../config/constants"
+import { compressImageBuffer, type VisionCompressConfig } from "./image-compress"
 import { log } from "../../shared/log"
 import type { ImageAttachment } from "./detector"
 
@@ -75,16 +76,21 @@ export function isValidImageMagicNumber(bytes: Uint8Array): boolean {
 // consume it. Missing, oversized, and non-image files are dropped with a
 // note so the batch still proceeds. The mime comes from the file itself
 // (magic bytes), never from the caller's guess.
-function normalizeLocalImage(image: ImageAttachment, baseDir: string): ImageAttachment | null {
+async function normalizeLocalImage(
+  image: ImageAttachment,
+  baseDir: string,
+  compressConfig?: VisionCompressConfig,
+): Promise<ImageAttachment | null> {
   const file = expandLocalPath(image.url, baseDir)
   try {
     if (!existsSync(file)) {
       log(`[prism] vision: local image not found, skipping`, { url: image.url })
       return null
     }
+    const cap = compressConfig?.enabled ? VISION_RAW_IMAGE_MAX_BYTES : VISION_IMAGE_MAX_BYTES
     const bytes = statSync(file).size
-    if (bytes > VISION_IMAGE_MAX_BYTES) {
-      log(`[prism] vision: image exceeds ${VISION_IMAGE_MAX_BYTES / 1_048_576}MB, skipping`, { url: image.url, bytes })
+    if (bytes > cap) {
+      log(`[prism] vision: image exceeds ${cap / 1_048_576}MB, skipping`, { url: image.url, bytes })
       return null
     }
     const buffer = readFileSync(file)
@@ -93,7 +99,16 @@ function normalizeLocalImage(image: ImageAttachment, baseDir: string): ImageAtta
       log(`[prism] vision: file is not a supported image, skipping`, { url: image.url })
       return null
     }
-    return { ...image, mime, url: `data:${mime};base64,${buffer.toString("base64")}` }
+
+    let finalBuffer: Uint8Array = buffer
+    let finalMime = mime
+    if (compressConfig?.enabled && buffer.byteLength > compressConfig.maxBytes) {
+      const compressed = await compressImageBuffer(Buffer.from(buffer), mime, compressConfig)
+      finalBuffer = compressed.buffer
+      finalMime = compressed.mime
+    }
+
+    return { ...image, mime: finalMime, url: `data:${finalMime};base64,${Buffer.from(finalBuffer).toString("base64")}` }
   } catch (error) {
     log(`[prism] vision: local image read failed`, { url: image.url, error })
     return null
@@ -102,30 +117,46 @@ function normalizeLocalImage(image: ImageAttachment, baseDir: string): ImageAtta
 
 // data: URLs carry their bytes inline, so the same size cap and magic-byte
 // sniff as file/remote sources apply — a claimed mime is never trusted.
-function normalizeDataUrl(image: ImageAttachment): ImageAttachment | null {
+async function normalizeDataUrl(
+  image: ImageAttachment,
+  compressConfig?: VisionCompressConfig,
+): Promise<ImageAttachment | null> {
   const match = image.url.match(/^data:([^;,]*)(;[^,]*)?,(.*)$/s)
   if (!match) {
     log(`[prism] vision: malformed data URL, skipping`, { url: image.url.slice(0, 64) })
     return null
   }
   const payload = match[3] ?? ""
+  const cap = compressConfig?.enabled ? VISION_RAW_IMAGE_MAX_BYTES : VISION_IMAGE_MAX_BYTES
   // Pre-check on the base64 length (4 chars per 3 bytes) so an oversized
   // payload is rejected before the decode allocates.
-  if (payload.length > Math.ceil((VISION_IMAGE_MAX_BYTES / 3) * 4)) {
-    log(`[prism] vision: data URL exceeds ${VISION_IMAGE_MAX_BYTES / 1_048_576}MB, skipping`, { url: image.url.slice(0, 64) })
+  if (payload.length > Math.ceil((cap / 3) * 4)) {
+    log(`[prism] vision: data URL exceeds ${cap / 1_048_576}MB, skipping`, { url: image.url.slice(0, 64) })
     return null
   }
   try {
-    const bytes = new Uint8Array(Buffer.from(payload, "base64"))
-    if (bytes.byteLength > VISION_IMAGE_MAX_BYTES) {
-      log(`[prism] vision: data URL exceeds ${VISION_IMAGE_MAX_BYTES / 1_048_576}MB, skipping`, { url: image.url.slice(0, 64) })
+    const rawBuffer = Buffer.from(payload, "base64")
+    if (rawBuffer.byteLength > cap) {
+      log(`[prism] vision: data URL exceeds ${cap / 1_048_576}MB, skipping`, { url: image.url.slice(0, 64) })
       return null
     }
-    const mime = sniffImageMime(bytes)
+    const mime = sniffImageMime(rawBuffer)
     if (!mime) {
       log(`[prism] vision: data URL is not a supported image, skipping`, { url: image.url.slice(0, 64) })
       return null
     }
+
+    if (compressConfig?.enabled && rawBuffer.byteLength > compressConfig.maxBytes) {
+      const compressed = await compressImageBuffer(rawBuffer, mime, compressConfig)
+      if (compressed.buffer !== rawBuffer || compressed.mime !== mime) {
+        return {
+          ...image,
+          mime: compressed.mime,
+          url: `data:${compressed.mime};base64,${compressed.buffer.toString("base64")}`,
+        }
+      }
+    }
+
     return { ...image, mime }
   } catch (error) {
     log(`[prism] vision: data URL decode failed`, { url: image.url.slice(0, 64), error })
@@ -159,9 +190,10 @@ function isBlockedRemoteHost(hostname: string): boolean {
 export async function normalizeImageUrl(
   image: ImageAttachment,
   baseDir = process.cwd(),
+  compressConfig?: VisionCompressConfig,
 ): Promise<ImageAttachment | null> {
-  if (image.url.startsWith("data:")) return normalizeDataUrl(image)
-  if (isLocalPath(image.url)) return normalizeLocalImage(image, baseDir)
+  if (image.url.startsWith("data:")) return normalizeDataUrl(image, compressConfig)
+  if (isLocalPath(image.url)) return normalizeLocalImage(image, baseDir, compressConfig)
 
   let parsed: URL
   try {
@@ -204,7 +236,14 @@ export async function normalizeImageUrl(
       log(`[prism] vision: remote response is not a supported image, skipping`, { url: image.url, bytes: bytes.byteLength })
       return null
     }
-    return { ...image, mime, url: `data:${mime};base64,${Buffer.from(bytes).toString("base64")}` }
+    let finalBuffer: Uint8Array = bytes
+    let finalMime = mime
+    if (compressConfig?.enabled && finalBuffer.byteLength > compressConfig.maxBytes) {
+      const compressed = await compressImageBuffer(Buffer.from(finalBuffer), finalMime, compressConfig)
+      finalBuffer = compressed.buffer
+      finalMime = compressed.mime
+    }
+    return { ...image, mime: finalMime, url: `data:${finalMime};base64,${Buffer.from(finalBuffer).toString("base64")}` }
   } catch (error) {
     log(`[prism] vision: image fetch failed`, { url: image.url, error })
     return null
@@ -254,8 +293,12 @@ async function readBodyBounded(response: Response, url: string): Promise<Uint8Ar
   return bytes
 }
 
-export async function normalizeImageBatch(images: ImageAttachment[], baseDir?: string): Promise<ImageAttachment[]> {
-  const normalized = await Promise.all(images.map((image) => normalizeImageUrl(image, baseDir)))
+export async function normalizeImageBatch(
+  images: ImageAttachment[],
+  baseDir?: string,
+  compressConfig?: VisionCompressConfig,
+): Promise<ImageAttachment[]> {
+  const normalized = await Promise.all(images.map((image) => normalizeImageUrl(image, baseDir, compressConfig)))
   // Providers cap the WHOLE inline request (Gemini at 20MB), and base64
   // inflates payloads ~33% — four per-image-maximum images would exceed it.
   // Measure the encoded payload (what actually goes on the wire) and keep

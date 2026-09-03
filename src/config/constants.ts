@@ -19,6 +19,8 @@ export const VISION_INTERPRET_POLL_MS = 250
 // keeps every request inside those bounds.
 export const VISION_IMAGE_MAX_BYTES = 4 * 1024 * 1024
 export const VISION_IMAGE_BATCH_MAX_BYTES = 16 * 1024 * 1024
+export const VISION_COMPRESS_DEFAULT_MAX_BYTES = 100 * 1024
+export const VISION_RAW_IMAGE_MAX_BYTES = 20 * 1024 * 1024
 export const SUPPORTED_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"])
 
 // background

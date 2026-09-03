@@ -175,6 +175,7 @@ Pool: anthropic/claude-3-7-sonnet: 2/5 running
 
 1. **自动拦截解读**：当工具输出包含图片附件（如浏览器截图）时，Prism 在 `messages.transform` / `tool-execute-after` 中自动拦截并追加 `[prism vision]` 视觉解读结论。
 2. **主动调用解读 (`vision_look`)**：
+3. **识别前智能保真压缩**：在投递给视觉模型前自动将大图压缩至 100KB 以内（优先采用 WebP/JPEG 高效编码保全分辨率，支持 `compress: true/false/数值`），兼顾极低网络开销与最优 OCR/细节识别率。
    - 对话贴图与截图：`vision_look(images: "last", goal: "提取表单字段与校验规则")`
    - 本地文件：`vision_look(images: ["./docs/arch.png"], goal: "检查组件布局与走线")`
    - 远程 URL：`vision_look(images: ["https://example.com/mockup.png"])`
@@ -195,7 +196,8 @@ Pool: anthropic/claude-3-7-sonnet: 2/5 running
     "enabled": true,                             // 视觉主开关（false 时注销 vision_look 工具）
     "model": "",                                 // 指定视觉模型（如 "openai/gpt-4o"）；留空继承主会话模型
     "mode": "sync",                              // "sync"（阻塞等待解读） | "async"（后台子任务解读）
-    "tools": ["read"]                            // 拦截的工具列表；缺省全量拦截；[] 禁用自动拦截
+    "tools": ["read"],                           // 拦截的工具列表；缺省全量拦截；[] 禁用自动拦截
+    "compress": true                             // 识别前图片压缩：true(默认 100KB) / false(关闭) / 数值(如 51200 字节上限)
   },
   "background": {
     "concurrency": 5,                            // 每个 provider/model 的最大并发子任务数

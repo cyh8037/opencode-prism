@@ -7,6 +7,7 @@ import { lastAssistantText } from "../assistant-text"
 import type { PrismClient } from "../client-types"
 import type { ImageAttachment } from "./detector"
 import { normalizeImageBatch } from "./image-utils"
+import type { VisionCompressConfig } from "./image-compress"
 
 // Global system prompt for every vision interpretation. Stable structure is
 // what makes downstream consumption by the main agent reliable; per-call
@@ -110,6 +111,7 @@ export async function runVisionInterpretation(args: {
   model: ResolvedModel
   instruction?: string
   timeoutMs?: number
+  compress?: VisionCompressConfig
   /** Fired with the child session id right after creation — the caller uses
    *  it to guard against the child's own tool output re-triggering an
    *  interpretation (which would recurse unboundedly). */
@@ -123,9 +125,10 @@ export async function runVisionInterpretation(args: {
     model,
     instruction = VISION_INSTRUCTION,
     timeoutMs = VISION_SYNC_TIMEOUT_MS,
+    compress,
   } = args
 
-  const normalized = await normalizeImageBatch(images, directory)
+  const normalized = await normalizeImageBatch(images, directory, compress)
   if (normalized.length === 0) {
     log("[prism] vision: no usable images after normalization")
     return { text: null, reason: "invalid-images" }
