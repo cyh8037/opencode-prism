@@ -1,3 +1,4 @@
+import { makePartID } from "../core/vision/part-id"
 import { BG_SESSION_NAV_HINT, MAX_IMAGES_PER_BATCH, MAX_SUBTASKS } from "../config/constants"
 import { log } from "../shared/log"
 import type { BgTask } from "../core/background/types"
@@ -16,8 +17,14 @@ import { navigationHint } from "../commands/templates"
 type CommandInput = { command: string; sessionID: string; arguments: string }
 type CommandOutput = { parts: Array<{ type: string; text?: string; [key: string]: unknown }> }
 
-function pushText(output: CommandOutput, text: string): void {
-  output.parts.push({ type: "text", text, synthetic: true })
+function pushText(output: CommandOutput, text: string, sessionID?: string): void {
+  output.parts.push({
+    id: makePartID(),
+    ...(sessionID ? { sessionID } : {}),
+    type: "text",
+    text,
+    synthetic: true,
+  })
 }
 
 // 看板已是 markdown 管道表格(方案 a):web 端 GFM 解析器渲染为 HTML 表格,
@@ -107,6 +114,15 @@ export function createCommandExecuteBeforeHook(args: {
   tuiNavigation: boolean
 }) {
   return async (input: CommandInput, output: CommandOutput): Promise<void> => {
+    const pushText = (out: CommandOutput, text: string) => {
+      out.parts.push({
+        id: makePartID(),
+        sessionID: input.sessionID,
+        type: "text",
+        text,
+        synthetic: true,
+      })
+    }
     const argumentsText = input.arguments.trim()
 
     // Prism 子会话（bg 任务/视觉任务）里拒绝 /bg、/split：任务以子会话为

@@ -34,6 +34,26 @@ describe("bg_wait", () => {
     )
     expect(result).toContain("not found or expired: bg_ghost")
   })
+
+  test("clamps timeout to max cap and uses default", async () => {
+    let waitedTimeout: number | undefined
+    const running = { id: "bg_1", parentSessionId: "session", status: "running" } as BgTask
+    const manager = {
+      getTask: (id: string) => (id === "bg_1" ? running : undefined),
+      getTasksByParentSession: () => [running],
+      waitForTasks: async (_ids: string[], timeout: number) => {
+        waitedTimeout = timeout
+        return { tasks: [running], timedOut: false }
+      },
+    } as unknown as BackgroundManager
+    const definition = createBgTools(manager).bg_wait!
+
+    await definition.execute({ taskIds: ["bg_1"] }, { sessionID: "session" } as never)
+    expect(waitedTimeout).toBe(30_000)
+
+    await definition.execute({ taskIds: ["bg_1"], timeoutMs: 999_999 }, { sessionID: "session" } as never)
+    expect(waitedTimeout).toBe(120_000)
+  })
 })
 
 describe("bg_spawn", () => {

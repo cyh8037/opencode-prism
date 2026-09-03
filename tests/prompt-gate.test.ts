@@ -233,4 +233,32 @@ describe("PromptGate", () => {
     expect(result.status).toBe("dispatched")
     expect(state.dispatched).toHaveLength(1)
   })
+
+  test("clear() aborts dispatchWithRetry immediately without completing backoff ladder or creating orphan state", async () => {
+    const { client, state } = createMockClient()
+    let calls = 0
+    client.session.promptAsync = async () => {
+      calls++
+      return { error: { message: "session busy" }, response: { status: 503 } }
+    }
+    const gate = new PromptGate(client, { idlePollMs: 10, dispatchRetryDelayMs: 20 })
+    const promise = gate.dispatchWithRetry(
+      { sessionID: "parent", source: "test", text: "wake" },
+      [500, 500, 500],
+    )
+    // Wait for first inner retry attempt to fail and enter backoff
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(calls).toBeGreaterThanOrEqual(1)
+    gate.clear("parent")
+    const result = await promise
+    expect(result.status).toBe("failed")
+    // Subsequent calls were cut short by clear() rather than waiting all 3x500ms
+    expect(calls).toBeLessThan(12)
+
+    // A later dispatch to the cleared session fails immediately without promptAsync
+    const beforeLaterCalls = calls
+    const later = await gate.dispatch({ sessionID: "parent", source: "test", text: "wake2" })
+    expect(later.status).toBe("failed")
+    expect(calls).toBe(beforeLaterCalls)
+  })
 })

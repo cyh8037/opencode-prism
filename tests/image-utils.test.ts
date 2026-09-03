@@ -52,6 +52,14 @@ describe("normalizeImageUrl protocol safety", () => {
     expect(await normalizeImageUrl({ mime: "image/png", url: "not a url" })).toBeNull()
     expect(fetchCalls).toHaveLength(0)
   })
+
+  test("rejects cloud metadata endpoints without fetching (SSRF protection)", async () => {
+    stubFetch(() => new Response(PNG_BYTES))
+    expect(await normalizeImageUrl({ mime: "image/png", url: "http://169.254.169.254/latest/meta-data/image.png" })).toBeNull()
+    expect(await normalizeImageUrl({ mime: "image/png", url: "http://metadata.google.internal/computeMetadata/v1/image.png" })).toBeNull()
+    expect(await normalizeImageUrl({ mime: "image/png", url: "http://instance-data/latest/meta-data/" })).toBeNull()
+    expect(fetchCalls).toHaveLength(0)
+  })
 })
 
 describe("normalizeImageUrl data URLs", () => {

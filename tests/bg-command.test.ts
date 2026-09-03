@@ -424,4 +424,14 @@ describe("/split command routing (boards)", () => {
     expect(splitCalls).toHaveLength(0)
     expect(launches).toHaveLength(0)
   })
+  test("command receipts satisfy part integrity with id and sessionID", async () => {
+    const { hook } = createHook({ tasks: [] })
+    const output: { parts: Array<{ type: string; id?: string; sessionID?: string; text?: string }> } = { parts: [] }
+    await hook({ command: "bg", sessionID: "ses_parent_123", arguments: "status" }, output)
+    expect(output.parts.length).toBeGreaterThan(0)
+    for (const part of output.parts) {
+      expect(part.id).toMatch(/^prt_/)
+      expect(part.sessionID).toBe("ses_parent_123")
+    }
+  })
 })

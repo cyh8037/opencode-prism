@@ -139,6 +139,23 @@ function normalizeDataUrl(image: ImageAttachment): ImageAttachment | null {
 // (file:, ftp:, ...) are rejected — fetch on Bun would happily read local
 // files via file://, which is an arbitrary-local-file-read hole when the URL
 // comes from tool output.
+function isBlockedRemoteHost(hostname: string): boolean {
+  const host = hostname.toLowerCase()
+  // Block cloud metadata services & link-local addresses to prevent SSRF / metadata exfiltration
+  if (
+    host === "169.254.169.254" ||
+    host === "metadata.google.internal" ||
+    host === "instance-data" ||
+    host.endsWith(".internal")
+  ) {
+    return true
+  }
+  if (host === "[::1]" || host === "fe80::" || host.startsWith("fe80:") || host.startsWith("[fe80:")) {
+    return true
+  }
+  return false
+}
+
 export async function normalizeImageUrl(
   image: ImageAttachment,
   baseDir = process.cwd(),
@@ -155,6 +172,10 @@ export async function normalizeImageUrl(
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     log(`[prism] vision: unsupported image URL protocol, skipping`, { url: image.url, protocol: parsed.protocol })
+    return null
+  }
+  if (isBlockedRemoteHost(parsed.hostname)) {
+    log(`[prism] vision: remote host blocked for security reasons, skipping`, { url: image.url, host: parsed.hostname })
     return null
   }
 

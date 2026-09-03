@@ -64,16 +64,26 @@ function isBusyStatus(status: string | undefined): boolean {
 // EVERY internal prompt Prism sends to a parent session goes through here.
 export class PromptGate {
   private state = new Map<string, SessionState>()
+  private clearedSessions = new Set<string>()
+  private clearedAll = false
 
   constructor(
     private client: PrismClient,
     private options: PromptGateOptions = {},
   ) {}
 
+  isCleared(sessionID: string): boolean {
+    return this.clearedAll || this.clearedSessions.has(sessionID)
+  }
+
   private getState(sessionID: string): SessionState {
     let state = this.state.get(sessionID)
     if (!state) {
-      state = { dispatchChain: Promise.resolve(), abortController: new AbortController() }
+      const abortController = new AbortController()
+      if (this.isCleared(sessionID)) {
+        abortController.abort()
+      }
+      state = { dispatchChain: Promise.resolve(), abortController }
       this.state.set(sessionID, state)
     }
     return state
@@ -131,9 +141,9 @@ export class PromptGate {
     const pollMs = this.options.idlePollMs ?? 500
     const deadline = Date.now() + settleMs
     while (Date.now() < deadline) {
-      if (abortSignal.aborted) return false
+      if (abortSignal.aborted || this.isCleared(sessionID)) return false
       if (!(await this.isSessionBusy(sessionID))) return true
-      await sleep(pollMs)
+      await sleep(pollMs, abortSignal)
     }
     return !(await this.isSessionBusy(sessionID))
   }
@@ -149,7 +159,7 @@ export class PromptGate {
     while (Date.now() < deadline) {
       if (abortSignal.aborted) return false
       if (!state.reservation) return true
-      await sleep(pollMs)
+      await sleep(pollMs, abortSignal)
     }
     return !state.reservation
   }
@@ -219,7 +229,7 @@ export class PromptGate {
 
         // The session was cleared while we waited for idle — dispatching now
         // would target a deleted session.
-        if (state.abortController.signal.aborted) {
+        if (state.abortController.signal.aborted || this.isCleared(sessionID)) {
           return { status: "failed", error: new Error("gate state cleared (session gone)") }
         }
 
@@ -234,7 +244,13 @@ export class PromptGate {
           lastError = resultError
           log(`[prism] gate: prompt dispatch failed`, { sessionID, source, attempt, error: resultError })
           if (attempt < GATE_DISPATCH_ATTEMPTS) {
-            await sleep(retryDelayMs)
+            if (state.abortController.signal.aborted || this.isCleared(sessionID)) {
+              return { status: "failed", error: new Error("gate state cleared (session gone)") }
+            }
+            await sleep(retryDelayMs, state.abortController.signal)
+            if (state.abortController.signal.aborted || this.isCleared(sessionID)) {
+              return { status: "failed", error: new Error("gate state cleared (session gone)") }
+            }
             continue
           }
           return { status: "failed", error: resultError }
@@ -264,7 +280,13 @@ export class PromptGate {
     text: string
   }): Promise<GateDispatchResult> {
     const { sessionID, source, text } = args
+    if (this.isCleared(sessionID)) {
+      return { status: "failed", error: new Error("gate state cleared (session gone)") }
+    }
     const state = this.getState(sessionID)
+    if (state.abortController.signal.aborted) {
+      return { status: "failed", error: new Error("gate state cleared (session gone)") }
+    }
     const dedupeKey = hashText(text)
     const dedupeMs = this.options.semanticDedupeMs ?? PARENT_WAKE_DEDUPE_MS
 
@@ -298,6 +320,9 @@ export class PromptGate {
   ): Promise<GateDispatchResult> {
     let result = await this.dispatch(args)
     for (let attempt = 0; result.status === "failed" && attempt < retryDelays.length; attempt++) {
+      if (this.isCleared(args.sessionID)) {
+        break
+      }
       const delay = retryDelays[attempt]!
       log(`[prism] gate: dispatch failed, retrying with backoff`, {
         sessionID: args.sessionID,
@@ -306,7 +331,11 @@ export class PromptGate {
         delay,
         error: result.error,
       })
-      await sleep(delay)
+      const state = this.state.get(args.sessionID)
+      await sleep(delay, state?.abortController.signal)
+      if (this.isCleared(args.sessionID)) {
+        break
+      }
       result = await this.dispatch(args)
     }
     return result
@@ -315,13 +344,18 @@ export class PromptGate {
   clear(sessionID: string): void {
     // Abort first: in-flight waits (waitForIdle / waitForReservation) and the
     // dispatch retry chain listen on the signal and must not keep polling a
-    // session that is gone. The state entry itself is then dropped; a later
-    // dispatch gets a fresh state with a fresh controller.
+    // session that is gone. The state entry itself is then dropped.
+    if (this.clearedSessions.size >= 5000) {
+      const first = this.clearedSessions.keys().next().value
+      if (first) this.clearedSessions.delete(first)
+    }
+    this.clearedSessions.add(sessionID)
     this.state.get(sessionID)?.abortController.abort()
     this.state.delete(sessionID)
   }
 
   clearAll(): void {
+    this.clearedAll = true
     for (const state of this.state.values()) {
       state.abortController.abort()
     }

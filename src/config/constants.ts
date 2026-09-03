@@ -69,8 +69,8 @@ export const STEERING_SETTLE_GRACE_MS = 8_000
 export const MAX_STEERING_QUEUE_LEN = 10
 export const MAX_STEERING_MSG_BYTES = 32 * 1024
 // bg_wait: default block time and hard cap for one tool call.
-export const BG_WAIT_DEFAULT_MS = 120_000
-export const BG_WAIT_MAX_MS = 600_000
+export const BG_WAIT_DEFAULT_MS = 30_000
+export const BG_WAIT_MAX_MS = 120_000
 // resume (bg_send on a terminal task) waits for the model group's concurrency
 // slot. Running tasks past the TTL are only warned, never killed, so a
 // saturated group could park the wait forever — and a terminal task cannot be
